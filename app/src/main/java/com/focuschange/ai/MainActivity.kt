@@ -1,9 +1,14 @@
 package com.focuschange.ai
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -28,6 +33,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -55,8 +62,21 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+/**
+ * Điểm mốc khuôn mặt dạng mảng phẳng [x0, y0, z0, x1, y1, z1, ...].
+ * Tránh tạo ~1.400 đối tượng Pair/Float mỗi khung hình (giảm GC, mượt hơn).
+ */
+private class Landmarks(val data: FloatArray, val count: Int) {
+    fun x(i: Int): Float = data[i * 3]
+    fun y(i: Int): Float = data[i * 3 + 1]
+    fun z(i: Int): Float = data[i * 3 + 2]
+}
+
+private val EMPTY_LANDMARKS = Landmarks(FloatArray(0), 0)
 
 /**
  * Ảnh chụp toàn bộ trạng thái HUD sau mỗi khung hình.
@@ -64,7 +84,7 @@ import kotlin.math.sqrt
  */
 private data class HudSnapshot(
     val faceDetected: Boolean,
-    val points: List<Pair<Float, Float>>,
+    val points: Landmarks,
     val frameWidth: Int,
     val frameHeight: Int,
     val ear1: Float?,
@@ -85,20 +105,180 @@ private data class HudSnapshot(
     val sessionSeconds: Long,
     val averageSei: Int?,
     val fps: Float,
-    val distanceScale: Float
+    val distanceScale: Float,
+    val yawDeg: Float?,
+    val pitchDeg: Float?,
+    val rollDeg: Float?,
+    val gazeStatus: String,
+    val expressionStatus: String,
+    val bfr: Float?,
+    val mar: Float?,
+    val yawnCount: Int,
+    val chronicLevel: Int,
+    val inattentionPercent: Float?,
+    val violationScore: Float,
+    val anomaly: String?,
+    val avgBlinkMs: Float?,
+    val fatigueIndex: Int?,
+    val signalQuality: Int,
+    val signalNote: String,
+    val minSei: Int?,
+    val violationsTotal: Int,
+    val chronicEpisodes: Int,
+    val yawnTotal: Int
 )
+
+/** Một mẫu tư thế đầu trong cửa sổ trượt thời gian (góc thô, chưa lọc). */
+private data class PoseSample(
+    val timeMs: Long,
+    val yawDeg: Float,
+    val pitchDeg: Float,
+    val rollDeg: Float,
+    val ear: Float
+)
+
+/** Một lần vi phạm chú ý (có trọng số) trong cửa sổ tích lũy. */
+private data class ViolationEvent(
+    val timeMs: Long,
+    val weight: Float
+)
+
+/**
+ * Bộ lọc One Euro: làm mượt tín hiệu nhiễu nhưng vẫn bám nhanh khi chuyển động nhanh.
+ */
+private class OneEuroFilter(
+    private val minCutoff: Float,
+    private val beta: Float,
+    private val dCutoff: Float = 1f
+) {
+    private var initialized = false
+    private var prevRaw = 0f
+    private var prevFiltered = 0f
+    private var prevDeriv = 0f
+    private var prevTimeMs = 0L
+
+    fun reset() {
+        initialized = false
+    }
+
+    private fun alpha(cutoff: Float, dtSeconds: Float): Float {
+        val tau = 1f / (2f * PI.toFloat() * cutoff)
+        return 1f / (1f + tau / dtSeconds)
+    }
+
+    fun filter(value: Float, nowMs: Long): Float {
+        if (!initialized) {
+            initialized = true
+            prevRaw = value
+            prevFiltered = value
+            prevDeriv = 0f
+            prevTimeMs = nowMs
+            return value
+        }
+
+        val dt = (nowMs - prevTimeMs).coerceAtLeast(1L) / 1000f
+        prevTimeMs = nowMs
+
+        val deriv = (value - prevRaw) / dt
+        val aD = alpha(dCutoff, dt)
+        val derivHat = aD * deriv + (1f - aD) * prevDeriv
+
+        val cutoff = minCutoff + beta * abs(derivHat)
+        val a = alpha(cutoff, dt)
+        val filtered = a * value + (1f - a) * prevFiltered
+
+        prevRaw = value
+        prevDeriv = derivHat
+        prevFiltered = filtered
+        return filtered
+    }
+}
+
+/**
+ * Bộ đếm tỉ lệ thời gian một cờ đúng trong 60 giây gần nhất
+ * (60 bucket, mỗi bucket 1 giây). Dùng cho PERCLOS và tỉ lệ mất tập trung.
+ */
+private class WindowRatio(
+    private val buckets: Int,
+    private val minSampleMs: Long
+) {
+    private val flaggedMs = LongArray(buckets)
+    private val totalMs = LongArray(buckets)
+    private val bucketSecond = LongArray(buckets) { -1L }
+    private var lastFrameMs = 0L
+
+    fun reset() {
+        flaggedMs.fill(0L)
+        totalMs.fill(0L)
+        bucketSecond.fill(-1L)
+        lastFrameMs = 0L
+    }
+
+    /** Gọi khi mất khuôn mặt để không cộng dồn khoảng trống thời gian. */
+    fun pause() {
+        lastFrameMs = 0L
+    }
+
+    fun record(nowMs: Long, flagged: Boolean) {
+        val dt = if (lastFrameMs == 0L) {
+            0L
+        } else {
+            (nowMs - lastFrameMs).coerceIn(0L, 200L)
+        }
+        lastFrameMs = nowMs
+        if (dt == 0L) return
+
+        val sec = nowMs / 1000L
+        val idx = (sec % buckets).toInt()
+
+        if (bucketSecond[idx] != sec) {
+            bucketSecond[idx] = sec
+            flaggedMs[idx] = 0L
+            totalMs[idx] = 0L
+        }
+
+        totalMs[idx] += dt
+        if (flagged) {
+            flaggedMs[idx] += dt
+        }
+    }
+
+    fun percent(nowMs: Long): Float {
+        val nowSec = nowMs / 1000L
+        var flagged = 0L
+        var total = 0L
+
+        for (i in 0 until buckets) {
+            val sec = bucketSecond[i]
+            if (sec < 0L) continue
+
+            val age = nowSec - sec
+            if (age in 0L until buckets.toLong()) {
+                flagged += flaggedMs[i]
+                total += totalMs[i]
+            }
+        }
+
+        return if (total < minSampleMs) {
+            0f
+        } else {
+            flagged * 100f / total.toFloat()
+        }
+    }
+}
 
 class MainActivity : ComponentActivity() {
 
     private companion object {
         const val TAG = "FocusChangeAI"
         const val PREFS_NAME = "focus_change_prefs"
-        const val KEY_DISTANCE_SCALE = "distance_scale"
+        // Đổi key: bỏ hệ số cũ đã được hiệu chuẩn theo công thức sai.
+        const val KEY_DISTANCE_SCALE = "distance_scale_v2"
+        const val KEY_SOUND = "sound_enabled"
 
         // Chỉ số điểm mốc mắt (giữ nguyên theo code gốc).
-        val RIGHT_EYE = listOf(33, 160, 158, 133, 153, 144)
-        val LEFT_EYE = listOf(362, 385, 387, 263, 373, 380)
-        val EYE_DRAW_INDICES: Set<Int> = (RIGHT_EYE + LEFT_EYE).toSet()
+        val RIGHT_EYE = intArrayOf(33, 160, 158, 133, 153, 144)
+        val LEFT_EYE = intArrayOf(362, 385, 387, 263, 373, 380)
 
         // Điểm mốc dùng cho khoảng cách và tư thế đầu.
         const val LM_OUTER_RIGHT_EYE = 33
@@ -109,19 +289,59 @@ class MainActivity : ComponentActivity() {
         const val LM_FACE_RIGHT = 234
         const val LM_FACE_LEFT = 454
         const val MIN_LANDMARKS = 468
+        const val IRIS_LANDMARKS = 478
 
-        // Mô hình lỗ kim (Pinhole): D = (W_real * f) / W_pixel
-        const val REAL_EYE_CORNER_DISTANCE_CM = 6.3f
-        const val FOCAL_LENGTH_PX = 500f
-        const val FOCAL_REFERENCE_LONG_SIDE = 640f
+        // Mặt nạ vẽ mắt (tra cứu O(1), không tạo đối tượng khi vẽ).
+        val EYE_MASK = BooleanArray(IRIS_LANDMARKS).also { mask ->
+            for (i in RIGHT_EYE) mask[i] = true
+            for (i in LEFT_EYE) mask[i] = true
+        }
+
+        // Mống mắt (Iris): 468-472 mắt phải, 473-477 mắt trái.
+        const val LM_RIGHT_IRIS = 468
+        const val LM_LEFT_IRIS = 473
+        const val LM_R_EYE_OUTER = 33
+        const val LM_R_EYE_INNER = 133
+        const val LM_L_EYE_INNER = 362
+        const val LM_L_EYE_OUTER = 263
+        const val LM_R_LID_UP = 159
+        const val LM_R_LID_LOW = 145
+        const val LM_L_LID_UP = 386
+        const val LM_L_LID_LOW = 374
+
+        // Hai điểm ngang của mống mắt (đo đường kính).
+        const val LM_R_IRIS_H1 = 469
+        const val LM_R_IRIS_H2 = 471
+        const val LM_L_IRIS_H1 = 474
+        const val LM_L_IRIS_H2 = 476
+
+        // Chân mày và miệng.
+        const val LM_BROW_INNER_R = 55
+        const val LM_BROW_INNER_L = 285
+        const val LM_MOUTH_UP = 13
+        const val LM_MOUTH_LOW = 14
+        const val LM_MOUTH_R = 78
+        const val LM_MOUTH_L = 308
+
+        const val RAD_TO_DEG = 57.29578f
+
+        // Mô hình lỗ kim (Pinhole): D = (W_real * f_px) / W_pixel
+        const val EYE_OUTER_WIDTH_CM = 8.9f        // khóe mắt ngoài - khóe mắt ngoài (không phải IPD 6.3)
+        const val IRIS_DIAMETER_CM = 1.17f         // đường kính mống mắt người, rất ổn định
+        const val FALLBACK_FOCAL_PX_AT_640 = 500f  // chỉ dùng nếu không đọc được Camera2
         const val MIN_SAFE_DISTANCE_CM = 30f
         const val DISTANCE_RECOVER_CM = 32f
-        const val DISTANCE_SMOOTHING = 0.3f
         const val REFERENCE_DISTANCE_CM = 50f
+        const val DIST_CAL_SAMPLES = 20
+        const val DIST_MEDIAN_SIZE = 5
 
         // Hiệu chuẩn EAR thích nghi.
         const val CALIBRATION_FRAMES = 60
         const val CALIBRATION_MIN_EAR = 0.20f
+        // Mắt nhỏ hoặc đeo kính: nếu sau 6 giây vẫn chưa gom được 10 khung hợp lệ thì hạ ngưỡng.
+        const val CAL_RELAX_AFTER_MS = 6_000L
+        const val CAL_RELAX_MIN_FRAMES = 10
+        const val CAL_RELAXED_MIN_EAR = 0.12f
         const val CLOSE_RATIO = 0.68f
         const val OPEN_RATIO = 0.80f
         const val MIN_CLOSED_FRAMES = 1
@@ -133,28 +353,89 @@ class MainActivity : ComponentActivity() {
         const val MAX_BLINK_DURATION_MS = 1_000L
         const val DROWSY_CLOSURE_MS = 1_500L
         const val LOW_BLINK_BPM = 8f
+        const val HIGH_BLINK_BPM = 30f
 
-        // PERCLOS (tỉ lệ thời gian nhắm mắt trong 60 giây).
-        const val PERCLOS_BUCKETS = 60
-        const val PERCLOS_MIN_SAMPLE_MS = 3_000L
+        // PERCLOS và tỉ lệ mất tập trung (60 giây).
+        const val RATIO_BUCKETS = 60
+        const val RATIO_MIN_SAMPLE_MS = 3_000L
         const val PERCLOS_ALERT = 15f
 
-        // Mất tập trung / nghỉ giải lao.
-        const val LOOK_AWAY_YAW = 0.15f
-        const val LOOK_AWAY_PITCH = 0.18f
+        // Tư thế đầu 3D.
+        const val LOOK_AWAY_YAW_DEG = 18f
+        const val LOOK_AWAY_PITCH_DEG = 18f
         const val LOOK_AWAY_MS = 2_000L
+        const val HEAD_FRONTAL_YAW_DEG = 20f
+
+        // Phát hiện đóng băng / giật bất thường (Anti-Spoofing).
+        const val POSE_WINDOW_MS = 10_000L
+        const val FREEZE_MIN_SAMPLES = 60
+        const val FREEZE_POSE_STD_DEG = 0.15f
+        const val FREEZE_EAR_STD = 0.006f
+        const val FREEZE_NO_BLINK_MS = 10_000L
+        const val JERK_SPEED_DEG_PER_S = 200f
+        const val JERK_MIN_GAP_MS = 300L
+        const val JERK_WINDOW_MS = 10_000L
+        const val JERK_COUNT_ALERT = 3
+
+        // Hướng nhìn (Gaze) và Visual Drift.
+        const val GAZE_H_DRIFT = 0.16f
+        const val GAZE_V_DRIFT = 0.22f
+        const val VISUAL_DRIFT_MS = 3_000L
+
+        // Vi biểu cảm.
+        const val BFR_FURROW_RATIO = 0.88f
+        const val BFR_SUSTAIN_MS = 2_000L
+        const val MAR_YAWN = 0.55f
+        const val YAWN_MIN_MS = 1_200L
+        const val YAWN_WINDOW_MS = 5L * 60L * 1000L
+
+        // Chất lượng tín hiệu.
+        const val LUMA_VERY_LOW = 35f
+        const val LUMA_LOW = 60f
+        const val LUMA_HIGH = 220f
+        const val MIN_FACE_PX = 40f
+        const val VERY_SMALL_FACE_PX = 25f
+        const val QUALITY_OK = 50
+        const val LUMA_SAMPLE_STEP = 8
+
+        // Động cơ mất tập trung tích lũy.
+        const val VIOLATION_WINDOW_MS = 5L * 60L * 1000L
+        const val V_HEAD_AWAY = 1.0f
+        const val V_VISUAL_DRIFT = 1.0f
+        const val V_YAWN = 1.5f
+        const val V_DROWSY = 2.0f
+        const val V_TOO_CLOSE = 1.0f
+        const val V_CONFUSED = 0.5f
+        const val CHRONIC_WATCH = 3f
+        const val CHRONIC_ON = 6f
+        const val CHRONIC_OFF = 4f
+        const val INATTENTION_RATIO_ALERT = 40f
+
+        // Nghỉ giải lao 20-20-20.
         const val BREAK_REMINDER_MS = 20L * 60L * 1000L
         const val BREAK_REMINDER_SHOW_MS = 30_000L
         const val BREAK_DETECT_MS = 20_000L
 
-        // SEI.
+        // SEI 2.0.
         const val SEI_SMOOTHING = 0.12f
         const val SEI_NO_FACE_DECAY = 0.08f
         const val SEI_TOO_CLOSE_PENALTY = 15f
-        const val W_HEAD = 0.30f
-        const val W_DISTANCE = 0.25f
-        const val W_EYES = 0.25f
-        const val W_BPM = 0.20f
+        const val SEI_CHRONIC_PENALTY = 15f
+        const val SEI_WATCH_PENALTY = 5f
+        const val SEI_ANOMALY_CAP = 30f
+        const val W_POSTURE = 0.20f
+        const val W_DISTANCE = 0.15f
+        const val W_GAZE = 0.20f
+        const val W_EYES = 0.20f
+        const val W_BPM = 0.10f
+        const val W_EXPRESSION = 0.15f
+
+        // Chỉ số mệt mỏi.
+        const val FATIGUE_SMOOTHING = 0.10f
+
+        // Giao diện.
+        const val HISTORY_SIZE = 120
+        const val BEEP_MIN_GAP_MS = 10_000L
 
         const val LOG_EVERY_N_FRAMES = 30
     }
@@ -175,9 +456,7 @@ class MainActivity : ComponentActivity() {
     private var faceCount by mutableIntStateOf(0)
     private var blinkCount by mutableIntStateOf(0)
 
-    private var landmarkPoints by mutableStateOf(
-        emptyList<Pair<Float, Float>>()
-    )
+    private var landmarkPoints by mutableStateOf(EMPTY_LANDMARKS)
     private var frameWidth by mutableIntStateOf(1)
     private var frameHeight by mutableIntStateOf(1)
 
@@ -198,6 +477,28 @@ class MainActivity : ComponentActivity() {
     private var sessionText by mutableStateOf("--")
     private var fpsText by mutableStateOf("--")
 
+    private var headPoseText by mutableStateOf("--")
+    private var gazeText by mutableStateOf("--")
+    private var expressionText by mutableStateOf("--")
+    private var expressionMetricsText by mutableStateOf("--")
+    private var inattentionText by mutableStateOf("--")
+    private var chronicLevel by mutableIntStateOf(0)
+    private var chronicText by mutableStateOf("")
+    private var anomalyText by mutableStateOf("")
+
+    private var fatigueText by mutableStateOf("--")
+    private var signalText by mutableStateOf("--")
+    private var seiHistory by mutableStateOf(emptyList<Int>())
+    private var soundEnabled by mutableStateOf(true)
+
+    // Trạng thái chỉ dùng trên UI thread
+    private var lastSnapshot: HudSnapshot? = null
+    private var lastHistorySecond = 0L
+    private var lastChronicLevelUi = 0
+    private var lastTooCloseUi = false
+    private var lastBeepMs = 0L
+    private var toneGenerator: ToneGenerator? = null
+
     // ---------------- Trạng thái xử lý (chỉ dùng trên cameraExecutor) ----------------
     @Volatile
     private var recalibrationRequested = false
@@ -208,34 +509,69 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var distanceScale = 1f
 
-    // Hiệu chuẩn EAR
+    // Hiệu chuẩn EAR + đường cơ sở cá nhân
     private var calibrated = false
     private var calFrames = 0
+    private var calWaitStartMs = 0L
     private var calSumEar1 = 0f
     private var calSumEar2 = 0f
-    private var calSumYaw = 0f
-    private var calSumPitch = 0f
+    private var calSumYawDeg = 0f
+    private var calSumPitchDeg = 0f
+    private var calSumGazeH = 0f
+    private var calSumGazeV = 0f
+    private var calSumBfr = 0f
     private var baselineEar1 = 0f
     private var baselineEar2 = 0f
     private var closeThreshold1 = 0f
     private var closeThreshold2 = 0f
     private var openThreshold1 = 0f
     private var openThreshold2 = 0f
-    private var baselineYaw = 0.5f
-    private var baselinePitch = 0.5f
+    private var baselineYawDeg = 0f
+    private var baselinePitchDeg = 0f
+    private var baselineGazeH = 0.5f
+    private var baselineGazeV = 0.5f
+    private var baselineBfr = 0.5f
+
+    // Góc tư thế tuyệt đối (độ) tính từ điểm mốc 3D
+    private var poseYawAbs = 0f
+    private var posePitchAbs = 0f
+    private var poseRollAbs = 0f
+
+    // Bộ lọc One Euro
+    private val yawFilter = OneEuroFilter(1.0f, 0.05f)
+    private val pitchFilter = OneEuroFilter(1.0f, 0.05f)
+    private val rollFilter = OneEuroFilter(1.0f, 0.05f)
+    private val gazeHFilter = OneEuroFilter(1.5f, 5.0f)
+    private val gazeVFilter = OneEuroFilter(1.5f, 5.0f)
+    private val distanceFilter = OneEuroFilter(1.0f, 0.05f)
+
+    // Thông số camera thật (để tính tiêu cự pixel chính xác)
+    private var sensorFocalMm = 0f
+    private var sensorPhysWmm = 0f
+    private var sensorPhysHmm = 0f
+
+    @Volatile
+    private var streamW = 640
+
+    @Volatile
+    private var streamH = 480
+
+    // Cửa sổ trung vị khoảng cách + mẫu hiệu chuẩn khoảng cách
+    private val distWindow = ArrayDeque<Float>()
+    private val distCalSamples = ArrayList<Float>()
 
     // Máy trạng thái chớp mắt
     private var eyesClosed = false
     private var closedFrameCount = 0
     private var closedStartMs = 0L
+    private var lastBlinkMs = 0L
     private val blinkTimestamps = mutableListOf<Long>()
+    private val blinkDurations = mutableListOf<Long>()
     private var monitoringStartMs = 0L
 
-    // PERCLOS (60 bucket x 1 giây)
-    private val perclosClosedMs = LongArray(PERCLOS_BUCKETS)
-    private val perclosTotalMs = LongArray(PERCLOS_BUCKETS)
-    private val perclosBucketSecond = LongArray(PERCLOS_BUCKETS) { -1L }
-    private var perclosLastFrameMs = 0L
+    // PERCLOS và tỉ lệ mất tập trung
+    private val perclos = WindowRatio(RATIO_BUCKETS, RATIO_MIN_SAMPLE_MS)
+    private val inattention = WindowRatio(RATIO_BUCKETS, RATIO_MIN_SAMPLE_MS)
 
     // Khoảng cách
     private var smoothedDistanceCm: Float? = null
@@ -246,6 +582,44 @@ class MainActivity : ComponentActivity() {
     private var prevNoseY = Float.NaN
     private var jitterEma = 0f
     private var lookAwayStartMs = 0L
+
+    // Cửa sổ trượt tư thế đầu (Anti-Spoofing)
+    private val poseWindow = ArrayDeque<PoseSample>()
+    private val jerkTimestamps = mutableListOf<Long>()
+    private var lastJerkMs = 0L
+
+    // Visual Drift
+    private var driftStartMs = 0L
+
+    // Vi biểu cảm
+    private var furrowStartMs = 0L
+    private var yawnStartMs = 0L
+    private var yawnCounted = false
+    private val yawnTimestamps = mutableListOf<Long>()
+
+    // Động cơ mất tập trung tích lũy
+    private val violationEvents = ArrayDeque<ViolationEvent>()
+    private var prevHeadAway = false
+    private var prevDrift = false
+    private var prevDrowsy = false
+    private var prevTooClose = false
+    private var prevConfused = false
+    private var chronicActive = false
+    private var chronicLevelValue = 0
+
+    // Thống kê phiên
+    private var violationsTotal = 0
+    private var chronicEpisodes = 0
+    private var yawnTotal = 0
+    private var minSeiValue = Int.MAX_VALUE
+
+    // Chất lượng tín hiệu
+    private var lumaMean = 128f
+    private var signalNote = "Tốt"
+    private var signalReliable = true
+
+    // Chỉ số mệt mỏi
+    private var fatigueEma = 0f
 
     // Nghỉ giải lao 20-20-20
     private var workStartMs = 0L
@@ -289,8 +663,10 @@ class MainActivity : ComponentActivity() {
 
         distanceScale = prefs.getFloat(KEY_DISTANCE_SCALE, 1f).coerceIn(0.3f, 3f)
         distanceScaleText = String.format(Locale.US, "x%.2f", distanceScale)
+        soundEnabled = prefs.getBoolean(KEY_SOUND, true)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
+        loadCameraIntrinsics()
 
         try {
             faceLandmarker =
@@ -307,6 +683,8 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize()
                 ) { innerPadding ->
 
+                    val statsScroll = rememberScrollState()
+
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
@@ -319,46 +697,77 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.headlineSmall
                         )
 
-                        Spacer(Modifier.height(6.dp))
                         Text(text = status)
 
+                        val seiLabel = seiLabelOf(seiValue)
                         Text(
-                            text = "Số khuôn mặt: $faceCount",
-                            style = MaterialTheme.typography.titleMedium
+                            text = if (seiValue >= 0) {
+                                "SEI 2.0: $seiValue / 100 ($seiLabel)"
+                            } else {
+                                "SEI 2.0: -- / 100"
+                            },
+                            style = MaterialTheme.typography.titleLarge,
+                            color = seiColorOf(seiValue)
                         )
 
-                        Text(text = "Số điểm mốc: ${landmarkPoints.size}")
+                        // Biểu đồ SEI 2 phút gần nhất.
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                        ) {
+                            val history = seiHistory
+                            if (history.size < 2) return@Canvas
 
-                        Text(
-                            text = "Số lần chớp mắt: $blinkCount",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                            val stepX = size.width / (HISTORY_SIZE - 1).toFloat()
+                            val y60 = size.height * (1f - 60f / 100f)
 
-                        Text(text = "Nhịp chớp mắt (BPM): $bpmText")
+                            drawLine(
+                                color = Color.Gray.copy(alpha = 0.4f),
+                                start = Offset(0f, y60),
+                                end = Offset(size.width, y60),
+                                strokeWidth = 1f
+                            )
 
-                        Text(text = "EAR mắt 1: $ear1Text")
-                        Text(text = "EAR mắt 2: $ear2Text")
-                        Text(text = "Trạng thái mắt: $eyeStatus")
-                        Text(text = "Thời gian nhận diện: $processingText ($fpsText FPS)")
+                            val lineColor = seiColorOf(history.last())
+                            for (i in 1 until history.size) {
+                                val x0 = (i - 1) * stepX
+                                val x1 = i * stepX
+                                val y0 = size.height * (1f - history[i - 1] / 100f)
+                                val y1 = size.height * (1f - history[i] / 100f)
 
-                        Text(
-                            text = "Khoảng cách: $distanceText (hệ số $distanceScaleText)",
-                            color = if (distanceAlert) Color.Red
-                            else MaterialTheme.colorScheme.onSurface
-                        )
+                                drawLine(
+                                    color = lineColor,
+                                    start = Offset(x0, y0),
+                                    end = Offset(x1, y1),
+                                    strokeWidth = 3f
+                                )
+                            }
+                        }
+
+                        if (chronicText.isNotEmpty()) {
+                            Text(
+                                text = chronicText,
+                                color = if (chronicLevel >= 2) Color.Red else Color(0xFFEF6C00),
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                        }
+
+                        if (anomalyText.isNotEmpty()) {
+                            Text(
+                                text = anomalyText,
+                                color = Color.Red,
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                        }
 
                         if (distanceAlert) {
                             Text(
                                 text = "⚠ Cảnh báo: bạn đang ngồi quá gần màn hình (< 30 cm)!",
                                 color = Color.Red,
-                                style = MaterialTheme.typography.titleMedium
+                                style = MaterialTheme.typography.titleSmall
                             )
                         }
-
-                        Text(text = "Hiệu chuẩn: $calibrationText")
-                        Text(text = "Mệt mỏi (PERCLOS): $perclosText")
-                        Text(text = "Phiên làm việc: $sessionText")
 
                         if (alertText.isNotEmpty()) {
                             Text(
@@ -368,16 +777,59 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                        val seiLabel = seiLabelOf(seiValue)
-                        Text(
-                            text = if (seiValue >= 0) {
-                                "SEI: $seiValue / 100 ($seiLabel)"
-                            } else {
-                                "SEI: -- / 100"
-                            },
-                            style = MaterialTheme.typography.titleMedium,
-                            color = seiColorOf(seiValue)
-                        )
+                        Spacer(Modifier.height(4.dp))
+
+                        // Khu vực thông số có thể cuộn để khung camera luôn đủ lớn.
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(0.8f)
+                                .verticalScroll(statsScroll)
+                        ) {
+                            Text(
+                                text = "Số khuôn mặt: $faceCount",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+
+                            Text(text = "Số điểm mốc: ${landmarkPoints.count}")
+
+                            Text(
+                                text = "Số lần chớp mắt: $blinkCount",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+
+                            Text(text = "Nhịp chớp mắt (BPM): $bpmText")
+
+                            Text(text = "EAR mắt 1: $ear1Text")
+                            Text(text = "EAR mắt 2: $ear2Text")
+                            Text(text = "Trạng thái mắt: $eyeStatus")
+
+                            Text(
+                                text = "Khoảng cách: $distanceText (hệ số $distanceScaleText)",
+                                color = if (distanceAlert) Color.Red
+                                else MaterialTheme.colorScheme.onSurface
+                            )
+
+                            Text(text = "Tư thế đầu: $headPoseText")
+                            Text(text = "Hướng nhìn: $gazeText")
+                            Text(text = "Vi biểu cảm: $expressionText")
+                            Text(text = "Chỉ số: $expressionMetricsText")
+                            Text(text = "Mất tập trung: $inattentionText")
+
+                            Text(text = "Mệt mỏi (PERCLOS): $perclosText")
+                            Text(text = "Chỉ số mệt mỏi: $fatigueText")
+                            Text(text = "Chất lượng tín hiệu: $signalText")
+                            Text(text = "Hiệu chuẩn: $calibrationText")
+                            Text(text = "Phiên làm việc: $sessionText")
+                            Text(text = "Thời gian nhận diện: $processingText ($fpsText FPS)")
+                            Text(
+                                text = "Dữ liệu được xử lý ngay trên thiết bị, không gửi ra ngoài.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+
+                        Spacer(Modifier.height(6.dp))
 
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -387,6 +839,7 @@ class MainActivity : ComponentActivity() {
                                     recalibrationRequested = true
                                     calibrationText = "Đang hiệu chuẩn lại..."
                                     seiValue = -1
+                                    seiHistory = emptyList()
                                 }
                             ) {
                                 Text("Hiệu chuẩn lại")
@@ -397,11 +850,32 @@ class MainActivity : ComponentActivity() {
                                     distanceCalibrationRequested = true
                                 }
                             ) {
-                                Text("Chỉnh khoảng cách 50 cm")
+                                Text("Chỉnh 50 cm")
                             }
                         }
 
-                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    soundEnabled = !soundEnabled
+                                    prefs.edit().putBoolean(KEY_SOUND, soundEnabled).apply()
+                                }
+                            ) {
+                                Text(if (soundEnabled) "Âm thanh: Bật" else "Âm thanh: Tắt")
+                            }
+
+                            Button(
+                                onClick = {
+                                    shareReport()
+                                }
+                            ) {
+                                Text("Chia sẻ báo cáo")
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
 
                         Box(
                             modifier = Modifier
@@ -426,8 +900,8 @@ class MainActivity : ComponentActivity() {
                             )
 
                             Canvas(Modifier.fillMaxSize()) {
-                                val points = landmarkPoints
-                                if (points.isEmpty()) return@Canvas
+                                val lm = landmarkPoints
+                                if (lm.count == 0) return@Canvas
 
                                 // Ánh xạ khớp với FILL_CENTER (phóng to + cắt giữa).
                                 val fw = frameWidth.toFloat().coerceAtLeast(1f)
@@ -436,16 +910,25 @@ class MainActivity : ComponentActivity() {
                                 val offsetX = (size.width - fw * scale) / 2f
                                 val offsetY = (size.height - fh * scale) / 2f
 
-                                points.forEachIndexed { index, point ->
-                                    val isEye = index in EYE_DRAW_INDICES
+                                for (index in 0 until lm.count) {
+                                    val isIris = index >= LM_RIGHT_IRIS
+                                    val isEye = index < EYE_MASK.size && EYE_MASK[index]
 
                                     drawCircle(
-                                        color = if (isEye) Color.Yellow else Color.Green,
-                                        radius = if (isEye) 4f else 2f,
+                                        color = when {
+                                            isIris -> Color.Cyan
+                                            isEye -> Color.Yellow
+                                            else -> Color.Green
+                                        },
+                                        radius = when {
+                                            isIris -> 3f
+                                            isEye -> 4f
+                                            else -> 2f
+                                        },
                                         center = Offset(
                                             // Camera trước: lật gương theo trục X.
-                                            (1f - point.first) * fw * scale + offsetX,
-                                            point.second * fh * scale + offsetY
+                                            (1f - lm.x(index)) * fw * scale + offsetX,
+                                            lm.y(index) * fh * scale + offsetY
                                         )
                                     )
                                 }
@@ -471,6 +954,13 @@ class MainActivity : ComponentActivity() {
         sei >= 60 -> Color(0xFFF9A825)
         sei >= 40 -> Color(0xFFEF6C00)
         else -> Color.Red
+    }
+
+    private fun fatigueLabelOf(index: Int): String = when {
+        index < 25 -> "Tỉnh táo"
+        index < 50 -> "Hơi mệt"
+        index < 75 -> "Mệt"
+        else -> "Rất mệt"
     }
 
     private fun checkCameraPermission(view: PreviewView) {
@@ -541,43 +1031,132 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ======================= THÔNG SỐ CAMERA THẬT =======================
+
+    private fun loadCameraIntrinsics() {
+        try {
+            val cm = getSystemService(CAMERA_SERVICE) as CameraManager
+            for (id in cm.cameraIdList) {
+                val c = cm.getCameraCharacteristics(id)
+                if (c.get(CameraCharacteristics.LENS_FACING) !=
+                    CameraCharacteristics.LENS_FACING_FRONT
+                ) continue
+
+                val f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?.firstOrNull() ?: continue
+                val size = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: continue
+
+                sensorFocalMm = f
+                sensorPhysWmm = max(size.width, size.height)
+                sensorPhysHmm = min(size.width, size.height)
+                Log.d(TAG, "Camera trước: f=${f}mm sensor=${size.width}x${size.height}mm")
+                return
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Không đọc được thông số camera", e)
+        }
+    }
+
+    /** Tiêu cự theo pixel của khung đang phân tích (đã tính phần sensor bị crop). */
+    private fun focalPx(): Float {
+        val longPx = max(streamW, streamH).toFloat()
+        val shortPx = min(streamW, streamH).toFloat()
+
+        if (sensorFocalMm <= 0f || sensorPhysWmm <= 0f || sensorPhysHmm <= 0f) {
+            return FALLBACK_FOCAL_PX_AT_640 * (longPx / 640f)
+        }
+
+        val sensorAspect = sensorPhysWmm / sensorPhysHmm
+        val streamAspect = longPx / shortPx
+        val pxPerMm = if (sensorAspect >= streamAspect) {
+            shortPx / sensorPhysHmm   // sensor rộng hơn: bị cắt hai bên
+        } else {
+            longPx / sensorPhysWmm    // sensor hẹp hơn: bị cắt trên dưới
+        }
+        return sensorFocalMm * pxPerMm
+    }
+
+    // ======================= BÁO CÁO & ÂM BÁO (UI thread) =======================
+
+    private fun buildReport(): String {
+        val s = lastSnapshot ?: return "Chưa có dữ liệu phiên làm việc."
+
+        val minutes = s.sessionSeconds / 60L
+        val seconds = s.sessionSeconds % 60L
+
+        return buildString {
+            append("BÁO CÁO PHIÊN - FocusChangeAI\n")
+            append(String.format(Locale.US, "Thời lượng theo dõi: %02d:%02d\n", minutes, seconds))
+            append("SEI hiện tại: ${s.sei ?: "--"} / 100\n")
+            append("SEI trung bình: ${s.averageSei ?: "--"} | thấp nhất: ${s.minSei ?: "--"}\n")
+            append("Số lần chớp mắt: $blinkCount\n")
+            append("BPM hiện tại: ${s.bpm?.let { String.format(Locale.US, "%.1f", it) } ?: "--"}\n")
+            append(
+                "Thời lượng chớp trung bình: " +
+                        (s.avgBlinkMs?.let { String.format(Locale.US, "%.0f ms", it) } ?: "--") + "\n"
+            )
+            append("Chỉ số mệt mỏi: ${s.fatigueIndex ?: "--"} / 100\n")
+            append("Số lần ngáp: ${s.yawnTotal}\n")
+            append("Số lần mất tập trung được ghi nhận: ${s.violationsTotal}\n")
+            append("Số đợt mất tập trung kéo dài: ${s.chronicEpisodes}\n")
+            append("Lưu ý: các chỉ số chỉ mang tính tham khảo, không phải chẩn đoán y tế.")
+        }
+    }
+
+    private fun shareReport() {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Báo cáo FocusChangeAI")
+            putExtra(Intent.EXTRA_TEXT, buildReport())
+        }
+
+        try {
+            startActivity(Intent.createChooser(intent, "Chia sẻ báo cáo"))
+        } catch (e: Exception) {
+            Log.w(TAG, "Không mở được hộp thoại chia sẻ", e)
+            status = "Không thể chia sẻ báo cáo."
+        }
+    }
+
+    private fun beep(nowMs: Long) {
+        if (nowMs - lastBeepMs < BEEP_MIN_GAP_MS) return
+        lastBeepMs = nowMs
+
+        try {
+            val generator = toneGenerator
+                ?: ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70).also {
+                    toneGenerator = it
+                }
+            generator.startTone(ToneGenerator.TONE_PROP_BEEP, 250)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Không phát được âm báo", e)
+        }
+    }
+
     // ======================= TOÁN HỌC HÌNH HỌC =======================
 
     /** Khoảng cách Euclid trong không gian pixel (tránh méo do ảnh không vuông). */
     private fun pixelDistance(
-        a: Pair<Float, Float>,
-        b: Pair<Float, Float>,
+        lm: Landmarks,
+        a: Int,
+        b: Int,
         width: Int,
         height: Int
     ): Float {
-        val dx = (a.first - b.first) * width
-        val dy = (a.second - b.second) * height
+        val dx = (lm.x(a) - lm.x(b)) * width
+        val dy = (lm.y(a) - lm.y(b)) * height
         return sqrt(dx * dx + dy * dy)
     }
 
     private fun calculateEAR(
-        points: List<Pair<Float, Float>>,
-        indices: List<Int>,
+        lm: Landmarks,
+        e: IntArray,
         width: Int,
         height: Int
     ): Float {
-        if (
-            indices.size != 6 ||
-            indices.any { it !in points.indices }
-        ) {
-            return 1f
-        }
-
-        val p1 = points[indices[0]]
-        val p2 = points[indices[1]]
-        val p3 = points[indices[2]]
-        val p4 = points[indices[3]]
-        val p5 = points[indices[4]]
-        val p6 = points[indices[5]]
-
-        val vertical1 = pixelDistance(p2, p6, width, height)
-        val vertical2 = pixelDistance(p3, p5, width, height)
-        val horizontal = pixelDistance(p1, p4, width, height)
+        val vertical1 = pixelDistance(lm, e[1], e[5], width, height)
+        val vertical2 = pixelDistance(lm, e[2], e[4], width, height)
+        val horizontal = pixelDistance(lm, e[0], e[3], width, height)
 
         if (horizontal < 0.001f) return 1f
 
@@ -585,101 +1164,373 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Mô hình lỗ kim: Distance(cm) = (W_real * f) / W_pixel.
-     * f được quy đổi theo cạnh dài của ảnh so với ảnh tham chiếu 640 px.
-     * Giá trị trả về CHƯA nhân hệ số hiệu chuẩn người dùng.
+     * Khoảng cách (cm), CHƯA nhân hệ số người dùng.
+     * Gộp 2 nguồn: mống mắt (bền khi quay đầu) + khoảng cách hai khóe mắt
+     * (chính xác về pixel nhưng co lại khi quay đầu nên giảm trọng số).
      */
     private fun estimateDistanceCm(
-        points: List<Pair<Float, Float>>,
+        lm: Landmarks,
+        imgW: Int,
+        imgH: Int,
+        yawDevDeg: Float,
+        eyesOpen: Boolean
+    ): Float? {
+        val f = focalPx()
+
+        var dCorner: Float? = null
+        var wCorner = 0f
+        val cornerPx = pixelDistance(lm, LM_OUTER_RIGHT_EYE, LM_OUTER_LEFT_EYE, imgW, imgH)
+        if (cornerPx >= 1f) {
+            dCorner = EYE_OUTER_WIDTH_CM * f / cornerPx
+            wCorner = 1f - clamp01((abs(yawDevDeg) - 8f) / 25f) * 0.85f
+        }
+
+        var dIris: Float? = null
+        if (lm.count >= IRIS_LANDMARKS && eyesOpen) {
+            val r = pixelDistance(lm, LM_R_IRIS_H1, LM_R_IRIS_H2, imgW, imgH)
+            val l = pixelDistance(lm, LM_L_IRIS_H1, LM_L_IRIS_H2, imgW, imgH)
+            val avg = (r + l) / 2f
+            // Hai mắt phải cho kích thước gần nhau, nếu không thì landmark đang nhiễu.
+            if (avg >= 3f && abs(r - l) / avg < 0.35f) {
+                dIris = IRIS_DIAMETER_CM * f / avg
+            }
+        }
+
+        return when {
+            dIris != null && dCorner != null -> {
+                val ratio = dCorner / dIris
+                if (ratio < 0.7f || ratio > 1.4f) {
+                    dIris                      // lệch quá nhiều: tin mống mắt
+                } else {
+                    (dIris * 1.0f + dCorner * wCorner) / (1.0f + wCorner)
+                }
+            }
+            dIris != null -> dIris
+            else -> dCorner
+        }
+    }
+
+    private fun medianOf(window: ArrayDeque<Float>): Float {
+        val s = window.sorted()
+        return s[s.size / 2]
+    }
+
+    /**
+     * Chiếu điểm p lên trục a->b trong không gian pixel.
+     * Trả về 0 tại a, 1 tại b (dùng cho vị trí mống mắt trong hốc mắt).
+     */
+    private fun axisRatio(
+        lm: Landmarks,
+        p: Int,
+        a: Int,
+        b: Int,
         width: Int,
         height: Int
-    ): Float? {
-        val wPixel = pixelDistance(
-            points[LM_OUTER_RIGHT_EYE],
-            points[LM_OUTER_LEFT_EYE],
-            width,
-            height
-        )
-        if (wPixel < 1f) return null
+    ): Float {
+        val abx = (lm.x(b) - lm.x(a)) * width
+        val aby = (lm.y(b) - lm.y(a)) * height
+        val apx = (lm.x(p) - lm.x(a)) * width
+        val apy = (lm.y(p) - lm.y(a)) * height
+        val len2 = abx * abx + aby * aby
+        if (len2 < 0.000001f) return 0.5f
+        return (apx * abx + apy * aby) / len2
+    }
 
-        val focalPx = FOCAL_LENGTH_PX *
-                (max(width, height).toFloat() / FOCAL_REFERENCE_LONG_SIDE)
+    /**
+     * Góc Euler từ pháp tuyến mặt phẳng khuôn mặt (dùng cả toạ độ z của MediaPipe).
+     * R = vector ngang (má trái-phải), U = vector dọc (cằm-trán), N = R x U hướng về camera.
+     * Quy ước: yaw dương = quay sang trái của người dùng, pitch dương = cúi xuống.
+     * Giá trị được dùng chủ yếu dưới dạng độ lệch so với đường cơ sở hiệu chuẩn.
+     */
+    private fun computeHeadPose(lm: Landmarks, width: Int, height: Int) {
+        val wf = width.toFloat()
+        val hf = height.toFloat()
 
-        return (REAL_EYE_CORNER_DISTANCE_CM * focalPx) / wPixel
+        val rx = (lm.x(LM_FACE_LEFT) - lm.x(LM_FACE_RIGHT)) * wf
+        val ry = (lm.y(LM_FACE_LEFT) - lm.y(LM_FACE_RIGHT)) * hf
+        val rz = (lm.z(LM_FACE_LEFT) - lm.z(LM_FACE_RIGHT)) * wf
+
+        val ux = (lm.x(LM_FOREHEAD) - lm.x(LM_CHIN)) * wf
+        val uy = (lm.y(LM_FOREHEAD) - lm.y(LM_CHIN)) * hf
+        val uz = (lm.z(LM_FOREHEAD) - lm.z(LM_CHIN)) * wf
+
+        val nx = ry * uz - rz * uy
+        val ny = rz * ux - rx * uz
+        val nz = rx * uy - ry * ux
+
+        val len = sqrt(nx * nx + ny * ny + nz * nz)
+        if (len < 0.000001f) return
+
+        val fx = nx / len
+        val fy = ny / len
+        val fz = nz / len
+
+        poseYawAbs = atan2(fx, -fz) * RAD_TO_DEG
+        posePitchAbs = atan2(fy, sqrt(fx * fx + fz * fz)) * RAD_TO_DEG
+        poseRollAbs = atan2(ry, abs(rx).coerceAtLeast(0.0001f)) * RAD_TO_DEG
     }
 
     private fun clamp01(v: Float): Float = v.coerceIn(0f, 1f)
 
-    // ======================= PERCLOS =======================
+    // ======================= CHẤT LƯỢNG TÍN HIỆU =======================
 
-    private fun resetPerclos() {
-        perclosClosedMs.fill(0L)
-        perclosTotalMs.fill(0L)
-        perclosBucketSecond.fill(-1L)
-        perclosLastFrameMs = 0L
+    /** Độ sáng trung bình của kênh Y (lấy mẫu thưa, rất nhẹ). */
+    private fun sampleLuma(
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int,
+        lastIndex: Int
+    ): Float {
+        var sum = 0L
+        var n = 0
+        var row = 0
+
+        while (row < height) {
+            val base = row * rowStride
+            var col = 0
+            while (col < width) {
+                val idx = (base + col * pixelStride).coerceAtMost(lastIndex)
+                sum += (yBytes[idx].toInt() and 0xFF).toLong()
+                n++
+                col += LUMA_SAMPLE_STEP
+            }
+            row += LUMA_SAMPLE_STEP
+        }
+
+        return if (n > 0) sum.toFloat() / n.toFloat() else 128f
     }
 
-    private fun recordPerclos(nowMs: Long, closed: Boolean) {
-        val dt = if (perclosLastFrameMs == 0L) {
-            0L
-        } else {
-            (nowMs - perclosLastFrameMs).coerceIn(0L, 200L)
-        }
-        perclosLastFrameMs = nowMs
-        if (dt == 0L) return
+    /**
+     * Chất lượng tín hiệu 0-100. Cập nhật signalReliable (ánh sáng + kích thước mặt)
+     * dùng để chặn các cảnh báo kém tin cậy, và signalNote (lý do chính).
+     */
+    private fun computeSignalQuality(
+        faceWidthPx: Float,
+        yawAbs: Float,
+        pitchAbs: Float,
+        irisOk: Boolean
+    ): Int {
+        var q = 100f
+        var note = "Tốt"
 
-        val sec = nowMs / 1000L
-        val idx = (sec % PERCLOS_BUCKETS).toInt()
-
-        if (perclosBucketSecond[idx] != sec) {
-            perclosBucketSecond[idx] = sec
-            perclosClosedMs[idx] = 0L
-            perclosTotalMs[idx] = 0L
+        if (lumaMean < LUMA_VERY_LOW) {
+            q -= 60f
+            note = "Ánh sáng quá yếu"
+        } else if (lumaMean < LUMA_LOW) {
+            q -= 35f
+            note = "Ánh sáng yếu"
+        } else if (lumaMean > LUMA_HIGH) {
+            q -= 20f
+            note = "Ảnh quá sáng hoặc ngược sáng"
         }
 
-        perclosTotalMs[idx] += dt
-        if (closed) {
-            perclosClosedMs[idx] += dt
+        if (faceWidthPx < VERY_SMALL_FACE_PX) {
+            q -= 50f
+            note = "Khuôn mặt quá xa"
+        } else if (faceWidthPx < MIN_FACE_PX) {
+            q -= 30f
+            if (note == "Tốt") note = "Khuôn mặt hơi xa"
         }
+
+        signalReliable = q >= QUALITY_OK
+
+        if (yawAbs > 35f || pitchAbs > 30f) {
+            q -= 20f
+            if (note == "Tốt") note = "Mặt quay nghiêng nhiều"
+        }
+
+        if (!irisOk) {
+            q -= 10f
+        }
+
+        signalNote = note
+        return q.coerceIn(0f, 100f).roundToInt()
     }
 
-    /** Phần trăm thời gian nhắm mắt trong 60 giây gần nhất. */
-    private fun perclosPercent(nowMs: Long): Float {
-        val nowSec = nowMs / 1000L
-        var closed = 0L
-        var total = 0L
+    // ======================= TƯ THẾ ĐẦU: CỬA SỔ TRƯỢT & BẤT THƯỜNG =======================
 
-        for (i in 0 until PERCLOS_BUCKETS) {
-            val bucketSec = perclosBucketSecond[i]
-            if (bucketSec < 0L) continue
+    private fun clearPoseState() {
+        poseWindow.clear()
+        jerkTimestamps.clear()
+        lastJerkMs = 0L
+    }
 
-            val age = nowSec - bucketSec
-            if (age in 0L until PERCLOS_BUCKETS.toLong()) {
-                closed += perclosClosedMs[i]
-                total += perclosTotalMs[i]
+    private fun resetFilters() {
+        yawFilter.reset()
+        pitchFilter.reset()
+        rollFilter.reset()
+        gazeHFilter.reset()
+        gazeVFilter.reset()
+        distanceFilter.reset()
+        distWindow.clear()
+    }
+
+    private fun updatePoseWindow(
+        nowMs: Long,
+        yawDeg: Float,
+        pitchDeg: Float,
+        rollDeg: Float,
+        ear: Float
+    ) {
+        val last = poseWindow.lastOrNull()
+        if (last != null) {
+            val dt = nowMs - last.timeMs
+            if (dt in 1L..500L) {
+                val dMax = max(
+                    abs(yawDeg - last.yawDeg),
+                    max(abs(pitchDeg - last.pitchDeg), abs(rollDeg - last.rollDeg))
+                )
+                val speed = dMax * 1000f / dt.toFloat()
+                if (speed > JERK_SPEED_DEG_PER_S && nowMs - lastJerkMs >= JERK_MIN_GAP_MS) {
+                    jerkTimestamps.add(nowMs)
+                    lastJerkMs = nowMs
+                }
             }
         }
 
-        return if (total < PERCLOS_MIN_SAMPLE_MS) {
-            0f
-        } else {
-            closed * 100f / total.toFloat()
+        poseWindow.addLast(PoseSample(nowMs, yawDeg, pitchDeg, rollDeg, ear))
+
+        while (poseWindow.isNotEmpty() &&
+            nowMs - poseWindow.first().timeMs > POSE_WINDOW_MS
+        ) {
+            poseWindow.removeFirst()
+        }
+
+        while (jerkTimestamps.isNotEmpty() &&
+            nowMs - jerkTimestamps[0] > JERK_WINDOW_MS
+        ) {
+            jerkTimestamps.removeAt(0)
         }
     }
 
-    // ======================= HIỆU CHUẨN & SEI =======================
+    /**
+     * Độ lệch chuẩn của tư thế đầu (độ) và của EAR trên cửa sổ trượt.
+     * Trả về null nếu chưa đủ dữ liệu.
+     */
+    private fun poseWindowStats(): Pair<Float, Float>? {
+        val n = poseWindow.size
+        if (n < FREEZE_MIN_SAMPLES) return null
+
+        val span = poseWindow.last().timeMs - poseWindow.first().timeMs
+        if (span < POSE_WINDOW_MS * 9L / 10L) return null
+
+        var sumYaw = 0f
+        var sumPitch = 0f
+        var sumRoll = 0f
+        var sumEar = 0f
+        for (s in poseWindow) {
+            sumYaw += s.yawDeg
+            sumPitch += s.pitchDeg
+            sumRoll += s.rollDeg
+            sumEar += s.ear
+        }
+
+        val inv = 1f / n.toFloat()
+        val meanYaw = sumYaw * inv
+        val meanPitch = sumPitch * inv
+        val meanRoll = sumRoll * inv
+        val meanEar = sumEar * inv
+
+        var varYaw = 0f
+        var varPitch = 0f
+        var varRoll = 0f
+        var varEar = 0f
+        for (s in poseWindow) {
+            val dy = s.yawDeg - meanYaw
+            val dp = s.pitchDeg - meanPitch
+            val dr = s.rollDeg - meanRoll
+            val de = s.ear - meanEar
+            varYaw += dy * dy
+            varPitch += dp * dp
+            varRoll += dr * dr
+            varEar += de * de
+        }
+
+        val poseStd = max(
+            sqrt(varYaw * inv),
+            max(sqrt(varPitch * inv), sqrt(varRoll * inv))
+        )
+        val earStd = sqrt(varEar * inv)
+
+        return poseStd to earStd
+    }
+
+    // ======================= ĐỘNG CƠ MẤT TẬP TRUNG TÍCH LŨY =======================
+
+    private fun registerViolation(nowMs: Long, weight: Float) {
+        violationEvents.addLast(ViolationEvent(nowMs, weight))
+        violationsTotal++
+    }
+
+    private fun violationScore(nowMs: Long): Float {
+        while (violationEvents.isNotEmpty() &&
+            nowMs - violationEvents.first().timeMs > VIOLATION_WINDOW_MS
+        ) {
+            violationEvents.removeFirst()
+        }
+
+        var total = 0f
+        for (e in violationEvents) {
+            total += e.weight
+        }
+        return total
+    }
+
+    private fun yawnCountRecent(nowMs: Long): Int {
+        while (yawnTimestamps.isNotEmpty() &&
+            nowMs - yawnTimestamps[0] > YAWN_WINDOW_MS
+        ) {
+            yawnTimestamps.removeAt(0)
+        }
+        return yawnTimestamps.size
+    }
+
+    private fun pruneBlinks(nowMs: Long) {
+        while (blinkTimestamps.isNotEmpty() &&
+            nowMs - blinkTimestamps[0] > BPM_WINDOW_MS
+        ) {
+            blinkTimestamps.removeAt(0)
+            if (blinkDurations.isNotEmpty()) {
+                blinkDurations.removeAt(0)
+            }
+        }
+    }
+
+    private fun averageBlinkMs(): Float? {
+        if (blinkDurations.isEmpty()) return null
+
+        var total = 0L
+        for (d in blinkDurations) {
+            total += d
+        }
+        return total.toFloat() / blinkDurations.size.toFloat()
+    }
+
+    // ======================= HIỆU CHUẨN & SEI 2.0 =======================
 
     private fun resetCalibration() {
         calibrated = false
         calFrames = 0
+        calWaitStartMs = 0L
         calSumEar1 = 0f
         calSumEar2 = 0f
-        calSumYaw = 0f
-        calSumPitch = 0f
+        calSumYawDeg = 0f
+        calSumPitchDeg = 0f
+        calSumGazeH = 0f
+        calSumGazeV = 0f
+        calSumBfr = 0f
+        baselineYawDeg = 0f
+        baselinePitchDeg = 0f
+        baselineGazeH = 0.5f
+        baselineGazeV = 0.5f
+        baselineBfr = 0.5f
         eyesClosed = false
         closedFrameCount = 0
         closedStartMs = 0L
+        lastBlinkMs = 0L
         blinkTimestamps.clear()
+        blinkDurations.clear()
         monitoringStartMs = 0L
         smoothedDistanceCm = null
         distanceAlertActive = false
@@ -687,13 +1538,34 @@ class MainActivity : ComponentActivity() {
         prevNoseY = Float.NaN
         jitterEma = 0f
         lookAwayStartMs = 0L
+        driftStartMs = 0L
+        furrowStartMs = 0L
+        yawnStartMs = 0L
+        yawnCounted = false
+        yawnTimestamps.clear()
+        violationEvents.clear()
+        prevHeadAway = false
+        prevDrift = false
+        prevDrowsy = false
+        prevTooClose = false
+        prevConfused = false
+        chronicActive = false
+        chronicLevelValue = 0
+        violationsTotal = 0
+        chronicEpisodes = 0
+        yawnTotal = 0
+        minSeiValue = Int.MAX_VALUE
+        fatigueEma = 0f
         workStartMs = 0L
         faceLostSinceMs = 0L
         seiInitialized = false
         seiEma = 0f
         seiSum = 0L
         seiCount = 0L
-        resetPerclos()
+        clearPoseState()
+        resetFilters()
+        perclos.reset()
+        inattention.reset()
     }
 
     private fun finishCalibration(nowMs: Long) {
@@ -706,21 +1578,30 @@ class MainActivity : ComponentActivity() {
         openThreshold1 = baselineEar1 * OPEN_RATIO
         openThreshold2 = baselineEar2 * OPEN_RATIO
 
-        baselineYaw = calSumYaw / n
-        baselinePitch = calSumPitch / n
+        baselineYawDeg = calSumYawDeg / n
+        baselinePitchDeg = calSumPitchDeg / n
+        baselineGazeH = calSumGazeH / n
+        baselineGazeV = calSumGazeV / n
+        baselineBfr = (calSumBfr / n).coerceAtLeast(0.01f)
 
         calibrated = true
         monitoringStartMs = nowMs
         workStartMs = nowMs
         blinkTimestamps.clear()
+        blinkDurations.clear()
         eyesClosed = false
         closedFrameCount = 0
-        resetPerclos()
+        clearPoseState()
+        resetFilters()
+        perclos.reset()
+        inattention.reset()
 
         Log.d(
             TAG,
             "Hiệu chuẩn xong: baseline1=$baselineEar1 baseline2=$baselineEar2 " +
-                    "close1=$closeThreshold1 close2=$closeThreshold2"
+                    "close1=$closeThreshold1 close2=$closeThreshold2 " +
+                    "yaw0=$baselineYawDeg pitch0=$baselinePitchDeg " +
+                    "gazeH=$baselineGazeH gazeV=$baselineGazeV bfr=$baselineBfr"
         )
     }
 
@@ -754,17 +1635,83 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun headScore(
-        yawDev: Float,
-        pitchDev: Float,
+        yawDeg: Float,
+        pitchDeg: Float,
         rollDeg: Float,
         jitter: Float
     ): Float {
         val orientation = 100f -
-                clamp01(yawDev / 0.20f) * 50f -
-                clamp01(pitchDev / 0.20f) * 30f -
+                clamp01(abs(yawDeg) / 25f) * 50f -
+                clamp01(abs(pitchDeg) / 25f) * 30f -
                 clamp01(abs(rollDeg) / 25f) * 20f
         val stability = 100f * (1f - clamp01(jitter / 0.05f))
         return (orientation * 0.7f + stability * 0.3f).coerceIn(0f, 100f)
+    }
+
+    private fun gazeScore(
+        available: Boolean,
+        eyesOpen: Boolean,
+        offH: Float,
+        offV: Float,
+        driftLong: Boolean
+    ): Float {
+        if (!available || !eyesOpen) return 85f
+
+        val base = 100f -
+                clamp01(abs(offH) / (GAZE_H_DRIFT * 1.5f)) * 60f -
+                clamp01(abs(offV) / (GAZE_V_DRIFT * 1.5f)) * 40f
+
+        return if (driftLong) min(base, 30f) else base.coerceIn(0f, 100f)
+    }
+
+    private fun expressionScore(
+        yawnConfirmed: Boolean,
+        yawnsRecent: Int,
+        bfr: Float,
+        baseline: Float,
+        confused: Boolean
+    ): Float {
+        val mouthPenalty = if (yawnConfirmed) {
+            60f
+        } else {
+            min(30f, yawnsRecent * 10f)
+        }
+
+        val deficit = 1f - bfr / baseline
+        val furrowMax = if (confused) 30f else 20f
+        val furrowPenalty = clamp01((deficit - 0.05f) / 0.20f) * furrowMax
+
+        return (100f - mouthPenalty - furrowPenalty).coerceIn(0f, 100f)
+    }
+
+    /** Chỉ số mệt mỏi tổng hợp 0-100 (PERCLOS, thời lượng chớp, ngáp, BPM, nhắm lâu). */
+    private fun updateFatigue(
+        perclosValue: Float,
+        avgBlink: Float?,
+        yawnsRecent: Int,
+        bpmValue: Float,
+        bpmReliable: Boolean,
+        drowsyNow: Boolean
+    ): Int {
+        var raw = clamp01((perclosValue - 3f) / 17f) * 35f
+
+        if (avgBlink != null) {
+            raw += clamp01((avgBlink - 150f) / 250f) * 20f
+        }
+
+        raw += min(25f, yawnsRecent * 8f)
+
+        if (bpmReliable && (bpmValue < LOW_BLINK_BPM || bpmValue > HIGH_BLINK_BPM)) {
+            raw += 10f
+        }
+
+        if (drowsyNow) {
+            raw += 10f
+        }
+
+        val target = min(100f, raw)
+        fatigueEma += (target - fatigueEma) * FATIGUE_SMOOTHING
+        return fatigueEma.roundToInt().coerceIn(0, 100)
     }
 
     private fun updateSei(raw: Float): Int {
@@ -779,6 +1726,9 @@ class MainActivity : ComponentActivity() {
         val value = seiEma.roundToInt().coerceIn(0, 100)
         seiSum += value.toLong()
         seiCount++
+        if (value < minSeiValue) {
+            minSeiValue = value
+        }
         return value
     }
 
@@ -788,6 +1738,10 @@ class MainActivity : ComponentActivity() {
         } else {
             null
         }
+    }
+
+    private fun minSei(): Int? {
+        return if (minSeiValue == Int.MAX_VALUE) null else minSeiValue
     }
 
     private fun sessionSeconds(nowMs: Long): Long {
@@ -815,19 +1769,37 @@ class MainActivity : ComponentActivity() {
 
     // ======================= XỬ LÝ KHUNG HÌNH =======================
 
-    private fun noFaceSnapshot(
-        imgW: Int,
-        imgH: Int,
-        nowMs: Long,
-        processingMs: Float
-    ): HudSnapshot {
+    /** Xóa các bộ đếm tức thời khi mất khuôn mặt (tránh sự kiện giả khi quay lại). */
+    private fun clearTransientState() {
         eyesClosed = false
         closedFrameCount = 0
         prevNoseX = Float.NaN
         prevNoseY = Float.NaN
         jitterEma = 0f
         lookAwayStartMs = 0L
-        perclosLastFrameMs = 0L
+        driftStartMs = 0L
+        furrowStartMs = 0L
+        yawnStartMs = 0L
+        yawnCounted = false
+        prevHeadAway = false
+        prevDrift = false
+        prevDrowsy = false
+        prevConfused = false
+        smoothedDistanceCm = null
+        calWaitStartMs = 0L
+        clearPoseState()
+        resetFilters()
+        perclos.pause()
+        inattention.pause()
+    }
+
+    private fun noFaceSnapshot(
+        imgW: Int,
+        imgH: Int,
+        nowMs: Long,
+        processingMs: Float
+    ): HudSnapshot {
+        clearTransientState()
 
         // Rời khỏi màn hình đủ lâu được tính là đã nghỉ giải lao.
         if (faceLostSinceMs == 0L) {
@@ -845,7 +1817,7 @@ class MainActivity : ComponentActivity() {
 
         return HudSnapshot(
             faceDetected = false,
-            points = emptyList(),
+            points = EMPTY_LANDMARKS,
             frameWidth = imgW,
             frameHeight = imgH,
             ear1 = null,
@@ -866,12 +1838,32 @@ class MainActivity : ComponentActivity() {
             sessionSeconds = sessionSeconds(nowMs),
             averageSei = averageSei(),
             fps = fpsEma,
-            distanceScale = distanceScale
+            distanceScale = distanceScale,
+            yawDeg = null,
+            pitchDeg = null,
+            rollDeg = null,
+            gazeStatus = "--",
+            expressionStatus = "--",
+            bfr = null,
+            mar = null,
+            yawnCount = yawnCountRecent(nowMs),
+            chronicLevel = chronicLevelValue,
+            inattentionPercent = null,
+            violationScore = violationScore(nowMs),
+            anomaly = null,
+            avgBlinkMs = averageBlinkMs(),
+            fatigueIndex = if (calibrated) fatigueEma.roundToInt().coerceIn(0, 100) else null,
+            signalQuality = 0,
+            signalNote = "Không thấy khuôn mặt",
+            minSei = minSei(),
+            violationsTotal = violationsTotal,
+            chronicEpisodes = chronicEpisodes,
+            yawnTotal = yawnTotal
         )
     }
 
     private fun buildSnapshot(
-        points: List<Pair<Float, Float>>,
+        lm: Landmarks,
         imgW: Int,
         imgH: Int,
         nowMs: Long,
@@ -884,7 +1876,7 @@ class MainActivity : ComponentActivity() {
 
         updateFps(nowMs)
 
-        if (points.size < MIN_LANDMARKS) {
+        if (lm.count < MIN_LANDMARKS) {
             return noFaceSnapshot(imgW, imgH, nowMs, processingMs)
         }
 
@@ -895,29 +1887,49 @@ class MainActivity : ComponentActivity() {
         }
 
         // ---- EAR ----
-        val ear1 = calculateEAR(points, RIGHT_EYE, imgW, imgH)
-        val ear2 = calculateEAR(points, LEFT_EYE, imgW, imgH)
+        val ear1 = calculateEAR(lm, RIGHT_EYE, imgW, imgH)
+        val ear2 = calculateEAR(lm, LEFT_EYE, imgW, imgH)
 
-        // ---- Khoảng cách (mô hình lỗ kim + hệ số hiệu chuẩn) ----
-        val rawUnscaled = estimateDistanceCm(points, imgW, imgH)
+        // ---- Tư thế đầu 3D (đưa lên trước để hiệu chỉnh khoảng cách theo góc quay) ----
+        computeHeadPose(lm, imgW, imgH)
+        val yawRawDev = poseYawAbs - baselineYawDeg
+        val pitchRawDev = posePitchAbs - baselinePitchDeg
 
+        // ---- Khoảng cách (tiêu cự thật + mống mắt + khóe mắt, trung vị rồi One Euro) ----
+        val faceWidthPx = pixelDistance(lm, LM_OUTER_RIGHT_EYE, LM_OUTER_LEFT_EYE, imgW, imgH)
+        val eyesOpenForDist = ear1 > 0.16f && ear2 > 0.16f
+        val rawUnscaled = estimateDistanceCm(
+            lm,
+            imgW,
+            imgH,
+            if (calibrated) yawRawDev else 0f,
+            eyesOpenForDist
+        )
+
+        // Hiệu chuẩn: lấy trung vị của nhiều khung thay vì 1 khung nhiễu.
         if (rawUnscaled != null && distanceCalibrationRequested) {
-            distanceCalibrationRequested = false
-            val newScale = (REFERENCE_DISTANCE_CM / rawUnscaled).coerceIn(0.3f, 3f)
-            distanceScale = newScale
-            smoothedDistanceCm = null
-            prefs.edit().putFloat(KEY_DISTANCE_SCALE, newScale).apply()
-            Log.d(TAG, "Hiệu chuẩn khoảng cách: hệ số = $newScale")
+            distCalSamples.add(rawUnscaled)
+            if (distCalSamples.size >= DIST_CAL_SAMPLES) {
+                val sorted = distCalSamples.sorted()
+                val med = sorted[sorted.size / 2]
+                val newScale = (REFERENCE_DISTANCE_CM / med).coerceIn(0.3f, 3f)
+                distanceScale = newScale
+                distanceCalibrationRequested = false
+                distCalSamples.clear()
+                distWindow.clear()
+                smoothedDistanceCm = null
+                distanceFilter.reset()
+                prefs.edit().putFloat(KEY_DISTANCE_SCALE, newScale).apply()
+                Log.d(TAG, "Hiệu chuẩn khoảng cách: hệ số = $newScale")
+            }
+        } else if (!distanceCalibrationRequested) {
+            distCalSamples.clear()
         }
 
-        val rawDistance = rawUnscaled?.let { it * distanceScale }
-        if (rawDistance != null) {
-            val prev = smoothedDistanceCm
-            smoothedDistanceCm = if (prev == null) {
-                rawDistance
-            } else {
-                prev + (rawDistance - prev) * DISTANCE_SMOOTHING
-            }
+        if (rawUnscaled != null) {
+            distWindow.addLast(rawUnscaled * distanceScale)
+            if (distWindow.size > DIST_MEDIAN_SIZE) distWindow.removeFirst()
+            smoothedDistanceCm = distanceFilter.filter(medianOf(distWindow), nowMs)
         }
         val distance = smoothedDistanceCm
 
@@ -929,50 +1941,89 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // ---- Tư thế đầu ----
-        val nose = points[LM_NOSE_TIP]
-        val faceLeft = points[LM_FACE_RIGHT]
-        val faceRight = points[LM_FACE_LEFT]
-        val forehead = points[LM_FOREHEAD]
-        val chin = points[LM_CHIN]
+        // ---- Góc tư thế đã lọc cho điểm số ----
+        val yawDeg = yawFilter.filter(yawRawDev, nowMs)
+        val pitchDeg = pitchFilter.filter(pitchRawDev, nowMs)
+        val rollDeg = rollFilter.filter(poseRollAbs, nowMs)
 
-        val faceWidthNorm = abs(faceRight.first - faceLeft.first).coerceAtLeast(0.0001f)
-        val faceHeightNorm = abs(chin.second - forehead.second).coerceAtLeast(0.0001f)
-
-        val yawRatio = (nose.first - faceLeft.first) /
-                (faceRight.first - faceLeft.first).let { if (abs(it) < 0.0001f) 0.0001f else it }
-        val pitchRatio = (nose.second - forehead.second) /
-                (chin.second - forehead.second).let { if (abs(it) < 0.0001f) 0.0001f else it }
-
-        val eyeA = points[LM_OUTER_RIGHT_EYE]
-        val eyeB = points[LM_OUTER_LEFT_EYE]
-        val rollDx = abs((eyeB.first - eyeA.first) * imgW)
-        val rollDy = (eyeB.second - eyeA.second) * imgH
-        val rollDeg = atan2(rollDy, rollDx.coerceAtLeast(0.0001f)) * 180f / PI.toFloat()
+        val faceWidthNorm = abs(lm.x(LM_FACE_LEFT) - lm.x(LM_FACE_RIGHT)).coerceAtLeast(0.0001f)
+        val faceHeightNorm = abs(lm.y(LM_CHIN) - lm.y(LM_FOREHEAD)).coerceAtLeast(0.0001f)
+        val noseX = lm.x(LM_NOSE_TIP)
+        val noseY = lm.y(LM_NOSE_TIP)
 
         if (!prevNoseX.isNaN()) {
-            val mx = (nose.first - prevNoseX) / faceWidthNorm
-            val my = (nose.second - prevNoseY) / faceHeightNorm
+            val mx = (noseX - prevNoseX) / faceWidthNorm
+            val my = (noseY - prevNoseY) / faceHeightNorm
             val movement = sqrt(mx * mx + my * my)
             jitterEma = jitterEma * 0.8f + movement * 0.2f
         }
-        prevNoseX = nose.first
-        prevNoseY = nose.second
+        prevNoseX = noseX
+        prevNoseY = noseY
+
+        // ---- Hướng nhìn thô từ mống mắt (468-477), lọc One Euro ----
+        val irisAvailable = lm.count >= IRIS_LANDMARKS
+        var gazeHRaw = 0.5f
+        var gazeVRaw = 0.5f
+        if (irisAvailable) {
+            val hRight = axisRatio(lm, LM_RIGHT_IRIS, LM_R_EYE_OUTER, LM_R_EYE_INNER, imgW, imgH)
+            val hLeft = axisRatio(lm, LM_LEFT_IRIS, LM_L_EYE_INNER, LM_L_EYE_OUTER, imgW, imgH)
+            val vRight = axisRatio(lm, LM_RIGHT_IRIS, LM_R_LID_UP, LM_R_LID_LOW, imgW, imgH)
+            val vLeft = axisRatio(lm, LM_LEFT_IRIS, LM_L_LID_UP, LM_L_LID_LOW, imgW, imgH)
+            gazeHRaw = (hRight + hLeft) / 2f
+            gazeVRaw = (vRight + vLeft) / 2f
+        }
+        val gazeH = gazeHFilter.filter(gazeHRaw, nowMs)
+        val gazeV = gazeVFilter.filter(gazeVRaw, nowMs)
+
+        // ---- Vi biểu cảm thô: BFR và MAR ----
+        val bfr = pixelDistance(lm, LM_BROW_INNER_R, LM_BROW_INNER_L, imgW, imgH) /
+                faceWidthPx.coerceAtLeast(1f)
+
+        val mouthWidthPx = pixelDistance(lm, LM_MOUTH_R, LM_MOUTH_L, imgW, imgH)
+        val mar = if (mouthWidthPx < 1f) {
+            0f
+        } else {
+            pixelDistance(lm, LM_MOUTH_UP, LM_MOUTH_LOW, imgW, imgH) / mouthWidthPx
+        }
+
+        // ---- Chất lượng tín hiệu ----
+        val signalQuality = computeSignalQuality(
+            faceWidthPx,
+            if (calibrated) abs(yawDeg) else 0f,
+            if (calibrated) abs(pitchDeg) else 0f,
+            irisAvailable
+        )
+        val reliable = signalReliable
 
         var blinkDetected = false
         var currentEyeStatus: String
         var bpm: Float? = null
         var sei: Int? = null
-        var perclos: Float? = null
+        var perclosOut: Float? = null
         var alert: String? = null
+        var anomaly: String? = null
+        var gazeStatus = "Đang hiệu chuẩn"
+        var expressionStatus = "Đang hiệu chuẩn"
+        var inattentionPct: Float? = null
+        var fatigueOut: Int? = null
 
         if (!calibrated) {
-            // ---- Pha hiệu chuẩn: chỉ nhận khung hợp lệ (EAR > 0.20 cả hai mắt) ----
-            if (ear1 > CALIBRATION_MIN_EAR && ear2 > CALIBRATION_MIN_EAR) {
+            // ---- Pha hiệu chuẩn: chỉ nhận khung hợp lệ và tín hiệu đủ tốt ----
+            if (calWaitStartMs == 0L) {
+                calWaitStartMs = nowMs
+            }
+            val relaxed = calFrames < CAL_RELAX_MIN_FRAMES &&
+                    nowMs - calWaitStartMs >= CAL_RELAX_AFTER_MS
+            val minEar = if (relaxed) CAL_RELAXED_MIN_EAR else CALIBRATION_MIN_EAR
+
+            if (reliable && ear1 > minEar && ear2 > minEar) {
                 calSumEar1 += ear1
                 calSumEar2 += ear2
-                calSumYaw += yawRatio
-                calSumPitch += pitchRatio
+                calSumYawDeg += poseYawAbs
+                calSumPitchDeg += posePitchAbs
+                calSumGazeH += gazeH
+                calSumGazeV += gazeV
+                calSumBfr += bfr
                 calFrames++
 
                 if (calFrames >= CALIBRATION_FRAMES) {
@@ -1000,6 +2051,8 @@ class MainActivity : ComponentActivity() {
                     if (duration <= MAX_BLINK_DURATION_MS) {
                         blinkDetected = true
                         blinkTimestamps.add(nowMs)
+                        blinkDurations.add(duration)
+                        lastBlinkMs = nowMs
                     }
                 }
 
@@ -1008,16 +2061,12 @@ class MainActivity : ComponentActivity() {
             }
 
             // ---- PERCLOS ----
-            recordPerclos(nowMs, eyesClosed)
-            val perclosValue = perclosPercent(nowMs)
-            perclos = perclosValue
+            perclos.record(nowMs, eyesClosed)
+            val perclosValue = perclos.percent(nowMs)
+            perclosOut = perclosValue
 
-            // ---- Cửa sổ trượt 60 giây ----
-            while (blinkTimestamps.isNotEmpty() &&
-                nowMs - blinkTimestamps[0] > BPM_WINDOW_MS
-            ) {
-                blinkTimestamps.removeAt(0)
-            }
+            // ---- Cửa sổ trượt 60 giây (BPM) ----
+            pruneBlinks(nowMs)
 
             val elapsed = nowMs - monitoringStartMs
             val windowMs = elapsed.coerceIn(BPM_MIN_WINDOW_MS, BPM_WINDOW_MS)
@@ -1026,21 +2075,18 @@ class MainActivity : ComponentActivity() {
             val bpmReliable = elapsed >= BPM_RELIABLE_AFTER_MS
 
             val closedDuration = if (eyesClosed) nowMs - closedStartMs else 0L
+            val drowsyNow = eyesClosed && closedDuration >= DROWSY_CLOSURE_MS
 
             currentEyeStatus = when {
-                eyesClosed && closedDuration >= DROWSY_CLOSURE_MS ->
-                    "Nhắm lâu - có thể buồn ngủ"
+                drowsyNow -> "Nhắm lâu - có thể buồn ngủ"
                 eyesClosed -> "Đang nhắm"
                 else -> "Đang mở hoặc chuyển trạng thái"
             }
 
-            // ---- Mất tập trung (nhìn ra ngoài màn hình) ----
-            val yawDev = abs(yawRatio - baselineYaw)
-            val pitchDev = abs(pitchRatio - baselinePitch)
-
-            val lookingAwayNow =
-                yawDev > LOOK_AWAY_YAW || pitchDev > LOOK_AWAY_PITCH
-            if (lookingAwayNow) {
+            // ---- Đầu quay lệch khỏi màn hình ----
+            val headAwayNow =
+                abs(yawDeg) > LOOK_AWAY_YAW_DEG || abs(pitchDeg) > LOOK_AWAY_PITCH_DEG
+            if (headAwayNow) {
                 if (lookAwayStartMs == 0L) {
                     lookAwayStartMs = nowMs
                 }
@@ -1049,6 +2095,150 @@ class MainActivity : ComponentActivity() {
             }
             val lookAwayLong =
                 lookAwayStartMs != 0L && nowMs - lookAwayStartMs >= LOOK_AWAY_MS
+
+            // ---- Cửa sổ trượt tư thế (góc thô): đóng băng / giật bất thường ----
+            updatePoseWindow(nowMs, yawRawDev, pitchRawDev, poseRollAbs, (ear1 + ear2) / 2f)
+            val stats = poseWindowStats()
+            val noBlinkMs = nowMs - max(lastBlinkMs, monitoringStartMs)
+            val frozen = reliable && stats != null &&
+                    stats.first < FREEZE_POSE_STD_DEG &&
+                    stats.second < FREEZE_EAR_STD &&
+                    noBlinkMs >= FREEZE_NO_BLINK_MS
+            val jerky = jerkTimestamps.size >= JERK_COUNT_ALERT
+
+            anomaly = when {
+                frozen -> "⚠ Tư thế bất động bất thường, không chớp mắt (nghi ảnh in / hình tĩnh)."
+                jerky -> "⚠ Chuyển động đầu giật bất thường."
+                else -> null
+            }
+
+            // ---- Hướng nhìn và Visual Drift ----
+            val eyesOpenForGaze = ear1 >= closeThreshold1 && ear2 >= closeThreshold2
+            val offH = gazeH - baselineGazeH
+            val offV = gazeV - baselineGazeV
+            val driftNow = irisAvailable && reliable && eyesOpenForGaze &&
+                    (abs(offH) > GAZE_H_DRIFT || abs(offV) > GAZE_V_DRIFT)
+
+            if (driftNow) {
+                if (driftStartMs == 0L) {
+                    driftStartMs = nowMs
+                }
+            } else {
+                driftStartMs = 0L
+            }
+            val driftMs = if (driftStartMs == 0L) 0L else nowMs - driftStartMs
+            val driftLong = driftMs >= VISUAL_DRIFT_MS
+
+            val gazeDir = if (abs(offH) / GAZE_H_DRIFT >= abs(offV) / GAZE_V_DRIFT) {
+                if (offH > 0f) "trái" else "phải"
+            } else {
+                if (offV > 0f) "xuống" else "lên"
+            }
+
+            gazeStatus = when {
+                !irisAvailable -> "Không có dữ liệu mống mắt"
+                !reliable -> "Tín hiệu kém, tạm bỏ qua"
+                !eyesOpenForGaze -> "Mắt đang nhắm"
+                driftLong -> String.format(
+                    Locale.US,
+                    "Visual Drift: lệch sang %s %.1f giây",
+                    gazeDir,
+                    driftMs / 1000f
+                )
+                driftNow -> "Đang liếc sang $gazeDir"
+                else -> "Nhìn vào màn hình"
+            }
+
+            // ---- Vi biểu cảm: nhíu mày (BFR) và ngáp (MAR) ----
+            val furrowNow = abs(yawDeg) < HEAD_FRONTAL_YAW_DEG &&
+                    bfr < baselineBfr * BFR_FURROW_RATIO
+            if (furrowNow) {
+                if (furrowStartMs == 0L) {
+                    furrowStartMs = nowMs
+                }
+            } else {
+                furrowStartMs = 0L
+            }
+            val confusedSustained =
+                furrowStartMs != 0L && nowMs - furrowStartMs >= BFR_SUSTAIN_MS
+
+            val yawnNow = mar > MAR_YAWN
+            if (yawnNow) {
+                if (yawnStartMs == 0L) {
+                    yawnStartMs = nowMs
+                    yawnCounted = false
+                }
+            } else {
+                yawnStartMs = 0L
+                yawnCounted = false
+            }
+            val yawnConfirmed = yawnNow && nowMs - yawnStartMs >= YAWN_MIN_MS
+            if (yawnConfirmed && !yawnCounted) {
+                yawnCounted = true
+                yawnTimestamps.add(nowMs)
+                yawnTotal++
+                registerViolation(nowMs, V_YAWN)
+            }
+            val yawnsRecent = yawnCountRecent(nowMs)
+
+            expressionStatus = when {
+                yawnConfirmed -> "Ngáp (dấu hiệu mệt mỏi)"
+                confusedSustained -> "Nhíu mày kéo dài (bối rối / căng thẳng)"
+                furrowNow -> "Hơi nhíu mày"
+                else -> "Bình thường"
+            }
+
+            // ---- Ghi nhận vi phạm theo sườn lên (mỗi đợt tính một lần) ----
+            if (lookAwayLong && !prevHeadAway) registerViolation(nowMs, V_HEAD_AWAY)
+            prevHeadAway = lookAwayLong
+
+            if (driftLong && !prevDrift) registerViolation(nowMs, V_VISUAL_DRIFT)
+            prevDrift = driftLong
+
+            if (drowsyNow && !prevDrowsy) registerViolation(nowMs, V_DROWSY)
+            prevDrowsy = drowsyNow
+
+            if (distanceAlertActive && !prevTooClose) registerViolation(nowMs, V_TOO_CLOSE)
+            prevTooClose = distanceAlertActive
+
+            if (confusedSustained && !prevConfused) registerViolation(nowMs, V_CONFUSED)
+            prevConfused = confusedSustained
+
+            // ---- Động cơ mất tập trung tích lũy ----
+            val inattentiveNow = headAwayNow || driftNow || yawnConfirmed ||
+                    (eyesClosed && closedDuration >= 500L)
+            inattention.record(nowMs, inattentiveNow)
+            val inattentionRatio = inattention.percent(nowMs)
+            inattentionPct = inattentionRatio
+
+            val vScore = violationScore(nowMs)
+
+            val wasChronic = chronicActive
+            chronicActive = if (chronicActive) {
+                !(vScore < CHRONIC_OFF &&
+                        inattentionRatio < INATTENTION_RATIO_ALERT * 0.75f)
+            } else {
+                vScore >= CHRONIC_ON || inattentionRatio >= INATTENTION_RATIO_ALERT
+            }
+            if (!wasChronic && chronicActive) {
+                chronicEpisodes++
+            }
+
+            chronicLevelValue = when {
+                chronicActive -> 2
+                vScore >= CHRONIC_WATCH -> 1
+                else -> 0
+            }
+
+            // ---- Chỉ số mệt mỏi tổng hợp ----
+            fatigueOut = updateFatigue(
+                perclosValue,
+                averageBlinkMs(),
+                yawnsRecent,
+                bpmValue,
+                bpmReliable,
+                drowsyNow
+            )
 
             // ---- Nhắc nghỉ 20-20-20 ----
             val workMs = if (workStartMs == 0L) 0L else nowMs - workStartMs
@@ -1061,36 +2251,63 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // ---- Chỉ số SEI ----
-            val head = headScore(yawDev, pitchDev, rollDeg, jitterEma)
+            // ---- Chỉ số SEI 2.0 ----
+            val posture = headScore(yawDeg, pitchDeg, rollDeg, jitterEma)
             val dist = distanceScore(distance)
+            val gaze = gazeScore(irisAvailable && reliable, eyesOpenForGaze, offH, offV, driftLong)
             val eyes = (
                     eyeScore(closedDuration, eyesClosed) -
                             clamp01((perclosValue - 5f) / 25f) * 50f
                     ).coerceAtLeast(0f)
             val blinkRate = bpmScore(bpmValue, bpmReliable)
+            val expression = expressionScore(
+                yawnConfirmed,
+                yawnsRecent,
+                bfr,
+                baselineBfr,
+                confusedSustained
+            )
 
-            var raw = head * W_HEAD +
+            var raw = posture * W_POSTURE +
                     dist * W_DISTANCE +
+                    gaze * W_GAZE +
                     eyes * W_EYES +
-                    blinkRate * W_BPM
+                    blinkRate * W_BPM +
+                    expression * W_EXPRESSION
 
             if (distanceAlertActive) {
                 raw -= SEI_TOO_CLOSE_PENALTY
             }
 
+            when (chronicLevelValue) {
+                2 -> raw -= SEI_CHRONIC_PENALTY
+                1 -> raw -= SEI_WATCH_PENALTY
+            }
+
+            if (frozen) {
+                raw = min(raw, SEI_ANOMALY_CAP)
+            }
+
             sei = updateSei(raw)
 
-            // ---- Cảnh báo ưu tiên (khoảng cách có banner riêng) ----
+            // ---- Cảnh báo ưu tiên (khoảng cách / mãn tính / bất thường có dòng riêng) ----
             alert = when {
-                eyesClosed && closedDuration >= DROWSY_CLOSURE_MS ->
+                !reliable ->
+                    "⚠ Tín hiệu kém ($signalNote) - kết quả có thể không chính xác."
+                drowsyNow ->
                     "⚠ Nhắm mắt quá lâu - bạn có thể đang buồn ngủ!"
                 perclosValue >= PERCLOS_ALERT ->
                     "⚠ Dấu hiệu mệt mỏi (PERCLOS cao) - hãy nghỉ ngơi."
+                driftLong ->
+                    "⚠ Visual Drift: ánh mắt rời màn hình quá 3 giây."
                 lookAwayLong ->
-                    "⚠ Bạn đang nhìn ra ngoài màn hình."
+                    "⚠ Đầu bạn đang quay lệch khỏi màn hình."
+                yawnConfirmed ->
+                    "⚠ Bạn đang ngáp - dấu hiệu mệt mỏi."
                 bpmReliable && bpmValue < LOW_BLINK_BPM ->
                     "⚠ Chớp mắt quá ít - hãy chớp mắt thường xuyên hơn."
+                confusedSustained ->
+                    "ℹ Bạn có vẻ đang căng thẳng hoặc bối rối với nội dung."
                 breakReminder ->
                     "⏰ Đã 20 phút: hãy nhìn xa 6 m trong 20 giây (quy tắc 20-20-20)."
                 else -> null
@@ -1102,7 +2319,18 @@ class MainActivity : ComponentActivity() {
             Log.d(
                 "BlinkDebug",
                 "EAR1=$ear1, EAR2=$ear2, closed=$eyesClosed, " +
-                        "dist=$distance, bpm=$bpm, perclos=$perclos, sei=$sei"
+                        "dist=$distance, bpm=$bpm, perclos=$perclosOut, sei=$sei"
+            )
+            Log.d(
+                "PoseDebug",
+                "yaw=$yawDeg pitch=$pitchDeg roll=$rollDeg gaze=($gazeH,$gazeV) " +
+                        "bfr=$bfr mar=$mar chronic=$chronicLevelValue anomaly=$anomaly " +
+                        "quality=$signalQuality luma=$lumaMean"
+            )
+            Log.d(
+                "DistDebug",
+                "raw=$rawUnscaled scale=$distanceScale focalPx=${focalPx()} " +
+                        "stream=${streamW}x$streamH smoothed=$distance"
             )
             Log.d(
                 "FaceSpeed",
@@ -1113,7 +2341,7 @@ class MainActivity : ComponentActivity() {
 
         return HudSnapshot(
             faceDetected = true,
-            points = points,
+            points = lm,
             frameWidth = imgW,
             frameHeight = imgH,
             ear1 = ear1,
@@ -1129,17 +2357,39 @@ class MainActivity : ComponentActivity() {
             blinkDetected = blinkDetected,
             sei = sei,
             processingMs = processingMs,
-            perclosPercent = perclos,
+            perclosPercent = perclosOut,
             alertMessage = alert,
             sessionSeconds = sessionSeconds(nowMs),
             averageSei = averageSei(),
             fps = fpsEma,
-            distanceScale = distanceScale
+            distanceScale = distanceScale,
+            yawDeg = yawDeg,
+            pitchDeg = pitchDeg,
+            rollDeg = rollDeg,
+            gazeStatus = gazeStatus,
+            expressionStatus = expressionStatus,
+            bfr = bfr,
+            mar = mar,
+            yawnCount = yawnCountRecent(nowMs),
+            chronicLevel = chronicLevelValue,
+            inattentionPercent = inattentionPct,
+            violationScore = violationScore(nowMs),
+            anomaly = anomaly,
+            avgBlinkMs = averageBlinkMs(),
+            fatigueIndex = fatigueOut,
+            signalQuality = signalQuality,
+            signalNote = signalNote,
+            minSei = minSei(),
+            violationsTotal = violationsTotal,
+            chronicEpisodes = chronicEpisodes,
+            yawnTotal = yawnTotal
         )
     }
 
     /** Chạy trên UI thread: áp dụng ảnh chụp trạng thái lên giao diện. */
     private fun applySnapshot(s: HudSnapshot) {
+        lastSnapshot = s
+
         faceCount = if (s.faceDetected) 1 else 0
         landmarkPoints = s.points
         frameWidth = s.frameWidth
@@ -1180,6 +2430,67 @@ class MainActivity : ComponentActivity() {
             String.format(Locale.US, "%.1f %%", it)
         } ?: "--"
 
+        headPoseText = if (s.yawDeg != null && s.pitchDeg != null && s.rollDeg != null) {
+            String.format(
+                Locale.US,
+                "Yaw %+.1f° (+ = trái) | Pitch %+.1f° (+ = cúi) | Roll %+.1f°",
+                s.yawDeg,
+                s.pitchDeg,
+                s.rollDeg
+            )
+        } else {
+            "--"
+        }
+
+        gazeText = s.gazeStatus
+        expressionText = s.expressionStatus
+
+        expressionMetricsText = if (s.bfr != null && s.mar != null) {
+            String.format(
+                Locale.US,
+                "BFR %.2f | MAR %.2f | Ngáp (5 phút): %d",
+                s.bfr,
+                s.mar,
+                s.yawnCount
+            )
+        } else {
+            "--"
+        }
+
+        inattentionText = if (s.inattentionPercent != null) {
+            String.format(
+                Locale.US,
+                "%.0f%% trong 60 giây | Vi phạm tích lũy: %.1f",
+                s.inattentionPercent,
+                s.violationScore
+            )
+        } else {
+            "--"
+        }
+
+        fatigueText = if (s.fatigueIndex != null) {
+            val blinkPart = s.avgBlinkMs?.let {
+                String.format(Locale.US, " | Chớp TB %.0f ms", it)
+            } ?: ""
+            "${s.fatigueIndex} / 100 (${fatigueLabelOf(s.fatigueIndex)})$blinkPart"
+        } else {
+            "--"
+        }
+
+        signalText = if (s.faceDetected) {
+            "${s.signalQuality} / 100 (${s.signalNote})"
+        } else {
+            "--"
+        }
+
+        chronicLevel = s.chronicLevel
+        chronicText = when (s.chronicLevel) {
+            2 -> "⛔ CẢNH BÁO MẤT TẬP TRUNG KÉO DÀI - hãy nghỉ ngơi hoặc tập trung lại."
+            1 -> "⚠ Cần chú ý: các lần mất tập trung đang tăng lên."
+            else -> ""
+        }
+        anomalyText = s.anomaly ?: ""
+
         calibrationText = calibrationLabelFrom(s)
         seiValue = s.sei ?: -1
         alertText = s.alertMessage ?: ""
@@ -1198,6 +2509,30 @@ class MainActivity : ComponentActivity() {
         } else {
             "Chưa phát hiện khuôn mặt."
         }
+
+        // Lịch sử SEI: mỗi giây một mẫu, giữ HISTORY_SIZE mẫu gần nhất.
+        val nowUi = SystemClock.elapsedRealtime()
+        val seiNow = s.sei
+        val currentSecond = nowUi / 1000L
+        if (seiNow != null && currentSecond != lastHistorySecond) {
+            lastHistorySecond = currentSecond
+            val old = seiHistory
+            val trimmed = if (old.size >= HISTORY_SIZE) {
+                old.drop(old.size - HISTORY_SIZE + 1)
+            } else {
+                old
+            }
+            seiHistory = trimmed + seiNow
+        }
+
+        // Âm báo khi vừa bước vào trạng thái nghiêm trọng.
+        val chronicRising = s.chronicLevel == 2 && lastChronicLevelUi != 2
+        val tooCloseRising = s.tooClose && !lastTooCloseUi
+        if (soundEnabled && (chronicRising || tooCloseRising)) {
+            beep(nowUi)
+        }
+        lastChronicLevelUi = s.chronicLevel
+        lastTooCloseUi = s.tooClose
     }
 
     /** Dựng chuỗi hiệu chuẩn chỉ từ snapshot (an toàn khi chạy trên UI thread). */
@@ -1210,9 +2545,30 @@ class MainActivity : ComponentActivity() {
                 s.closeThreshold
             )
         } else {
+            val hint = if (s.faceDetected && s.signalQuality < QUALITY_OK) {
+                " - ${s.signalNote}"
+            } else {
+                ""
+            }
             "Đang hiệu chuẩn ${s.calibrationProgress}/$CALIBRATION_FRAMES - " +
-                    "hãy nhìn thẳng, mở mắt tự nhiên"
+                    "hãy nhìn thẳng, mở mắt tự nhiên$hint"
         }
+    }
+
+    /** Chuyển danh sách điểm mốc của MediaPipe sang mảng phẳng tái sử dụng bộ đệm. */
+    private fun toLandmarks(
+        list: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>
+    ): Landmarks {
+        val needed = list.size * 3
+        // Mảng mới mỗi khung (UI thread đọc song song); chỉ một lần cấp phát phẳng thay cho ~1.400 đối tượng.
+        val data = FloatArray(needed)
+        for (i in list.indices) {
+            val p = list[i]
+            data[i * 3] = p.x()
+            data[i * 3 + 1] = p.y()
+            data[i * 3 + 2] = p.z()
+        }
+        return Landmarks(data, list.size)
     }
 
     private fun analyzeFrame(imageProxy: ImageProxy) {
@@ -1271,15 +2627,16 @@ class MainActivity : ComponentActivity() {
                 (SystemClock.elapsedRealtimeNanos() - startNs) /
                         1_000_000f
 
-            val landmarks = result.faceLandmarks().firstOrNull()
+            val faceList = result.faceLandmarks().firstOrNull()
+            val landmarks = if (faceList != null) {
+                toLandmarks(faceList)
+            } else {
+                EMPTY_LANDMARKS
+            }
 
-            val points = landmarks?.map { point ->
-                point.x() to point.y()
-            } ?: emptyList()
-
-            // Toàn bộ phép toán khoảng cách / EAR / SEI chạy tại đây (cameraExecutor).
+            // Toàn bộ phép toán khoảng cách / EAR / tư thế / gaze / SEI chạy tại đây (cameraExecutor).
             val snapshot = buildSnapshot(
-                points = points,
+                lm = landmarks,
                 imgW = imgW,
                 imgH = imgH,
                 nowMs = SystemClock.elapsedRealtime(),
@@ -1294,7 +2651,7 @@ class MainActivity : ComponentActivity() {
 
             runOnUiThread {
                 status = "Lỗi nhận diện: ${e.message}"
-                landmarkPoints = emptyList()
+                landmarkPoints = EMPTY_LANDMARKS
                 faceCount = 0
                 eyeStatus = "Không xác định"
                 distanceText = "--"
@@ -1334,6 +2691,10 @@ class MainActivity : ComponentActivity() {
         val width = image.width
         val height = image.height
 
+        // Ghi kích thước khung gốc để tính tiêu cự pixel.
+        streamW = width
+        streamH = height
+
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
@@ -1353,6 +2714,9 @@ class MainActivity : ComponentActivity() {
         val uPixelStride = uPlane.pixelStride
         val vRowStride = vPlane.rowStride
         val vPixelStride = vPlane.pixelStride
+
+        // Độ sáng trung bình để đánh giá chất lượng tín hiệu.
+        lumaMean = sampleLuma(width, height, yRowStride, yPixelStride, yLast)
 
         if (pixelBuffer.size != width * height) {
             pixelBuffer = IntArray(width * height)
@@ -1417,6 +2781,13 @@ class MainActivity : ComponentActivity() {
 
         faceLandmarker?.close()
         faceLandmarker = null
+
+        try {
+            toneGenerator?.release()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Không giải phóng được ToneGenerator", e)
+        }
+        toneGenerator = null
 
         super.onDestroy()
     }
