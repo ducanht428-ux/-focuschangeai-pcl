@@ -555,6 +555,12 @@ class MainActivity : ComponentActivity() {
 
     // Trạng thái chỉ dùng trên UI thread
     private var lastSnapshot: HudSnapshot? = null
+
+    // Lưu trữ cục bộ các phiên theo dõi (không gửi dữ liệu ra mạng).
+    private lateinit var sessionStorage: SessionStorage
+    private var sessionArchiveId: String? = null
+    private var sessionArchiveStartedAtMs = 0L
+    private var lastSessionArchiveSaveMs = 0L
     private var lastHistorySecond = 0L
     private var lastUiTextMs = 0L
 
@@ -761,6 +767,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        sessionStorage = SessionStorage(this)
         enableEdgeToEdge()
 
         // Giữ màn hình sáng khi đang theo dõi.
@@ -1600,6 +1607,55 @@ class MainActivity : ComponentActivity() {
 
     // ======================= BÁO CÁO & ÂM BÁO (UI thread) =======================
 
+    /** Lưu các chỉ số tổng hợp của phiên vào bộ nhớ riêng của ứng dụng. */
+    private fun saveCurrentSessionArchive(
+        snapshot: HudSnapshot? = lastSnapshot,
+        completed: Boolean
+    ) {
+        val id = sessionArchiveId ?: return
+        val s = snapshot ?: return
+        if (!::sessionStorage.isInitialized) return
+
+        try {
+            val now = System.currentTimeMillis()
+            val data = JSONObject().apply {
+                put("startedAt", sessionArchiveStartedAtMs)
+                put("updatedAt", now)
+                put("endedAt", if (completed) now else JSONObject.NULL)
+                put("completed", completed)
+                put("studentName", studentName)
+                put("durationSeconds", s.sessionSeconds)
+                put("sei", s.sei ?: JSONObject.NULL)
+                put("averageSei", s.averageSei ?: JSONObject.NULL)
+                put("minSei", s.minSei ?: JSONObject.NULL)
+                put("blinkCount", blinkCount)
+                put("bpm", s.bpm ?: JSONObject.NULL)
+                put("perclosPercent", s.perclosPercent ?: JSONObject.NULL)
+                put("yawDeg", s.yawDeg ?: JSONObject.NULL)
+                put("pitchDeg", s.pitchDeg ?: JSONObject.NULL)
+                put("rollDeg", s.rollDeg ?: JSONObject.NULL)
+                put("gazeStatus", s.gazeStatus)
+                put("yawnTotal", s.yawnTotal)
+                put("violationsTotal", s.violationsTotal)
+                put("chronicEpisodes", s.chronicEpisodes)
+                put("inattentionPercent", s.inattentionPercent ?: JSONObject.NULL)
+                put("violationScore", s.violationScore)
+                put("avgBlinkMs", s.avgBlinkMs ?: JSONObject.NULL)
+                put("fatigueIndex", s.fatigueIndex ?: JSONObject.NULL)
+                put("signalQuality", s.signalQuality)
+                put("signalNote", s.signalNote)
+                put("eyeDetail", s.eyeDetail)
+                put("faceDetected", s.faceDetected)
+                put("calibrated", s.calibrated)
+            }
+            if (!sessionStorage.saveSession(id, data)) {
+                Log.w(TAG, "Không lưu được dữ liệu phiên theo dõi cục bộ")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Lỗi lưu dữ liệu phiên theo dõi cục bộ", e)
+        }
+    }
+
     private fun buildReport(): String {
         val s = lastSnapshot ?: return "Chưa có dữ liệu phiên làm việc."
 
@@ -2214,6 +2270,10 @@ class MainActivity : ComponentActivity() {
 
         calibrated = true
         monitoringStartMs = nowMs
+        // Mỗi lần hiệu chuẩn hoàn tất là bắt đầu một phiên theo dõi mới.
+        sessionArchiveStartedAtMs = System.currentTimeMillis()
+        sessionArchiveId = "session_${sessionArchiveStartedAtMs}"
+        lastSessionArchiveSaveMs = 0L
         workStartMs = nowMs
         blinkTimestamps.clear()
         blinkDurations.clear()
@@ -3271,6 +3331,15 @@ class MainActivity : ComponentActivity() {
     private fun applySnapshot(s: HudSnapshot) {
         lastSnapshot = s
 
+        // Ghi checkpoint mỗi 5 giây để hạn chế ghi file liên tục trên UI thread.
+        val archiveNow = SystemClock.elapsedRealtime()
+        if (s.calibrated && sessionArchiveId != null &&
+            archiveNow - lastSessionArchiveSaveMs >= 5_000L
+        ) {
+            lastSessionArchiveSaveMs = archiveNow
+            saveCurrentSessionArchive(s, completed = false)
+        }
+
         faceCount = if (s.faceDetected) 1 else 0
         landmarkPoints = s.points
         frameWidth = s.frameWidth
@@ -3605,6 +3674,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // Chốt bản ghi cuối cùng khi Activity thực sự bị huỷ.
+        saveCurrentSessionArchive(lastSnapshot, completed = true)
         previewView = null
 
         cameraProvider?.unbindAll()
