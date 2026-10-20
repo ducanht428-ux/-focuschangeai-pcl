@@ -2,6 +2,7 @@ package com.focuschange.ai
 
 import android.Manifest
 import android.content.Intent
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
@@ -35,7 +36,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -54,6 +58,9 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import java.nio.ByteBuffer
+import java.io.File
+import org.json.JSONObject
+import org.json.JSONArray
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -61,8 +68,12 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -125,7 +136,12 @@ private data class HudSnapshot(
     val minSei: Int?,
     val violationsTotal: Int,
     val chronicEpisodes: Int,
-    val yawnTotal: Int
+    val yawnTotal: Int,
+    val habitStatus: String,
+    val habitDetail: String,
+    val habitHistory: String,
+    val alertCode: Int,
+    val eyeDetail: String
 )
 
 /** Một mẫu tư thế đầu trong cửa sổ trượt thời gian (góc thô, chưa lọc). */
@@ -275,6 +291,43 @@ class MainActivity : ComponentActivity() {
         // Đổi key: bỏ hệ số cũ đã được hiệu chuẩn theo công thức sai.
         const val KEY_DISTANCE_SCALE = "distance_scale_v2"
         const val KEY_SOUND = "sound_enabled"
+        const val KEY_SOUND_MODE = "sound_mode"
+        const val KEY_SENSITIVITY = "sensitivity_level"
+        const val KEY_HABIT_LEARN = "habit_learn_enabled"
+        const val HABIT_AUTOSAVE_MS = 30_000L
+        const val HABIT_STATUS_REFRESH_MS = 1_000L
+
+        // SEI thấp hơn mức thường ngày của chính học sinh (độ lệch 1.5 lần dao động riêng) trong 45 giây.
+        const val LOW_VS_PERSONAL_MS = 45_000L
+        const val LOW_VS_PERSONAL_K = 1.5f
+        const val PERSONAL_SEI_MIN_SPREAD = 8f
+
+        // Loại cảnh báo (dùng để đếm số lần xuất hiện trước khi kêu).
+        const val KIND_DROWSY = 1
+        const val KIND_PERCLOS = 2
+        const val KIND_DRIFT = 3
+        const val KIND_LOOK_AWAY = 4
+        const val KIND_YAWN = 5
+        const val KIND_LOW_BLINK = 6
+        const val KIND_LOW_PERSONAL = 7
+        const val KIND_BREAK = 8
+        const val KIND_CHRONIC = 9
+        const val KIND_TOO_CLOSE = 10
+        const val KIND_SQUINT = 11
+        const val KIND_ASYMMETRY = 12
+        const val KIND_INCOMPLETE_BLINK = 13
+        const val KIND_HIGH_BLINK = 14
+
+        // Chỉ phân tích mắt khi góc đầu đủ nhỏ (ngoài ngưỡng này landmark mắt kém tin cậy).
+        const val EYE_MAX_YAW_DEG = 45f
+        const val EYE_MAX_PITCH_DEG = 35f
+
+        // Chỉ kêu khi cảnh báo đã xuất hiện đủ số lần trong khung thời gian.
+        const val ALERT_SOUND_AFTER_NORMAL = 2          // cảnh báo thường: kêu từ lần thứ 2
+        const val ALERT_SOUND_AFTER_HABIT = 4           // cảnh báo so với thói quen: kêu từ lần thứ 4
+        const val ALERT_COUNT_WINDOW_MS = 10L * 60L * 1000L
+        const val ALERT_COUNT_WINDOW_HABIT_MS = 30L * 60L * 1000L
+        const val ALERT_REARM_MS = 5_000L               // tắt quá 5 giây rồi hiện lại mới tính là lần mới
 
         // Chỉ số điểm mốc mắt (giữ nguyên theo code gốc).
         val RIGHT_EYE = intArrayOf(33, 160, 158, 133, 153, 144)
@@ -343,14 +396,11 @@ class MainActivity : ComponentActivity() {
         const val CAL_RELAX_MIN_FRAMES = 10
         const val CAL_RELAXED_MIN_EAR = 0.12f
         const val CLOSE_RATIO = 0.68f
-        const val OPEN_RATIO = 0.80f
-        const val MIN_CLOSED_FRAMES = 1
 
         // Chớp mắt / BPM.
         const val BPM_WINDOW_MS = 60_000L
         const val BPM_MIN_WINDOW_MS = 10_000L
         const val BPM_RELIABLE_AFTER_MS = 15_000L
-        const val MAX_BLINK_DURATION_MS = 1_000L
         const val DROWSY_CLOSURE_MS = 1_500L
         const val LOW_BLINK_BPM = 8f
         const val HIGH_BLINK_BPM = 30f
@@ -435,7 +485,7 @@ class MainActivity : ComponentActivity() {
 
         // Giao diện.
         const val HISTORY_SIZE = 120
-        const val BEEP_MIN_GAP_MS = 10_000L
+        const val UI_TEXT_REFRESH_MS = 120L
 
         const val LOG_EVERY_N_FRAMES = 30
     }
@@ -489,14 +539,34 @@ class MainActivity : ComponentActivity() {
     private var fatigueText by mutableStateOf("--")
     private var signalText by mutableStateOf("--")
     private var seiHistory by mutableStateOf(emptyList<Int>())
-    private var soundEnabled by mutableStateOf(true)
+    private var soundMode by mutableStateOf(2) // 0 tắt, 1 chỉ cảnh báo quan trọng, 2 đầy đủ
+
+    private var studentName by mutableStateOf("")
+    private var habitText by mutableStateOf("--")
+    private var habitDetailText by mutableStateOf("")
+    private var habitHistoryText by mutableStateOf("")
+    private var eyeDetailText by mutableStateOf("--")
+    private var sensitivityUi by mutableStateOf(1)
+    private var habitLearnUi by mutableStateOf(true)
+    private var showAddStudent by mutableStateOf(false)
+    private var showResetHabit by mutableStateOf(false)
+    private var newStudentName by mutableStateOf("")
+    private var activeStudentId = ""
 
     // Trạng thái chỉ dùng trên UI thread
     private var lastSnapshot: HudSnapshot? = null
     private var lastHistorySecond = 0L
+    private var lastUiTextMs = 0L
+
+    // Độ nhạy: 0 thấp, 1 vừa, 2 cao. Ghi từ UI thread, đọc từ cameraExecutor.
+    @Volatile
+    private var sensLevel = 1
     private var lastChronicLevelUi = 0
     private var lastTooCloseUi = false
-    private var lastBeepMs = 0L
+    private var lastAnyToneMs = -1_000_000L
+    private val alertOccurrences = Array(15) { ArrayList<Long>() }
+    private val lastKindActiveMs = LongArray(15) { -1_000_000L }
+    private val lastToneMs = LongArray(5) { -1_000_000L }
     private var toneGenerator: ToneGenerator? = null
 
     // ---------------- Trạng thái xử lý (chỉ dùng trên cameraExecutor) ----------------
@@ -513,6 +583,7 @@ class MainActivity : ComponentActivity() {
     private var calibrated = false
     private var calFrames = 0
     private var calWaitStartMs = 0L
+    private var calRejected = 0
     private var calSumEar1 = 0f
     private var calSumEar2 = 0f
     private var calSumYawDeg = 0f
@@ -524,8 +595,6 @@ class MainActivity : ComponentActivity() {
     private var baselineEar2 = 0f
     private var closeThreshold1 = 0f
     private var closeThreshold2 = 0f
-    private var openThreshold1 = 0f
-    private var openThreshold2 = 0f
     private var baselineYawDeg = 0f
     private var baselinePitchDeg = 0f
     private var baselineGazeH = 0.5f
@@ -538,9 +607,9 @@ class MainActivity : ComponentActivity() {
     private var poseRollAbs = 0f
 
     // Bộ lọc One Euro
-    private val yawFilter = OneEuroFilter(1.0f, 0.05f)
-    private val pitchFilter = OneEuroFilter(1.0f, 0.05f)
-    private val rollFilter = OneEuroFilter(1.0f, 0.05f)
+    private val yawFilter = OneEuroFilter(1.5f, 0.30f)
+    private val pitchFilter = OneEuroFilter(1.5f, 0.30f)
+    private val rollFilter = OneEuroFilter(1.5f, 0.30f)
     private val gazeHFilter = OneEuroFilter(1.5f, 5.0f)
     private val gazeVFilter = OneEuroFilter(1.5f, 5.0f)
     private val distanceFilter = OneEuroFilter(1.0f, 0.05f)
@@ -560,9 +629,44 @@ class MainActivity : ComponentActivity() {
     private val distWindow = ArrayDeque<Float>()
     private val distCalSamples = ArrayList<Float>()
 
+    // Công cụ phân tích mắt nâng cấp (kính, góc nghiêng, nheo mắt, lệch hai mắt, chớp không hoàn toàn).
+    private val eyeEngine = EyeEngine()
+
+    // ---------------- Học thói quen từng học sinh (chỉ dùng trên cameraExecutor) ----------------
+    private lateinit var habitStore: HabitStore
+    private var habitProfile: HabitProfile? = null
+    private var habitSession: HabitSession? = null
+    private var lastHabitSaveMs = 0L
+    private var lastHabitStatusMs = 0L
+    private var habitStatus = "Đang nạp hồ sơ học sinh..."
+    private var habitDetail = ""
+    private var habitHistory = ""
+    private var personalSeiMean = Float.NaN
+    private var personalSeiSpread = 0f
+    private var lowVsPersonalStartMs = 0L
+    private var lastSeiValue = -1
+
+    @Volatile
+    private var habitLearnEnabled = true
+
+    @Volatile
+    private var studentSwitchRequest: String? = null
+
+    @Volatile
+    private var habitResetRequested = false
+
+    // Ngưỡng hiện hành: mặc định, sẽ được thay bằng ngưỡng cá nhân khi hồ sơ đã đủ dữ liệu.
+    private var thrLookYaw = LOOK_AWAY_YAW_DEG
+    private var thrLookPitch = LOOK_AWAY_PITCH_DEG
+    private var thrGazeH = GAZE_H_DRIFT
+    private var thrGazeV = GAZE_V_DRIFT
+    private var thrBlinkLow = LOW_BLINK_BPM
+    private var thrBlinkHigh = HIGH_BLINK_BPM
+    private var thrPerclos = PERCLOS_ALERT
+    private var thrMar = MAR_YAWN
+
     // Máy trạng thái chớp mắt
     private var eyesClosed = false
-    private var closedFrameCount = 0
     private var closedStartMs = 0L
     private var lastBlinkMs = 0L
     private val blinkTimestamps = mutableListOf<Long>()
@@ -634,6 +738,7 @@ class MainActivity : ComponentActivity() {
     // FPS
     private var prevFrameTimeMs = 0L
     private var fpsEma = 0f
+    private var frameDtMs = 33f
 
     private var frameCounter = 0L
 
@@ -663,7 +768,20 @@ class MainActivity : ComponentActivity() {
 
         distanceScale = prefs.getFloat(KEY_DISTANCE_SCALE, 1f).coerceIn(0.3f, 3f)
         distanceScaleText = String.format(Locale.US, "x%.2f", distanceScale)
-        soundEnabled = prefs.getBoolean(KEY_SOUND, true)
+        soundMode = prefs.getInt(
+            KEY_SOUND_MODE,
+            if (prefs.getBoolean(KEY_SOUND, true)) 2 else 0
+        )
+
+        sensLevel = prefs.getInt(KEY_SENSITIVITY, 1).coerceIn(0, 2)
+        sensitivityUi = sensLevel
+
+        habitStore = HabitStore(this)
+        habitLearnEnabled = prefs.getBoolean(KEY_HABIT_LEARN, true)
+        habitLearnUi = habitLearnEnabled
+        activeStudentId = habitStore.currentId()
+        studentName = habitStore.nameOf(activeStudentId)
+        studentSwitchRequest = activeStudentId
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         loadCameraIntrinsics()
@@ -787,6 +905,122 @@ class MainActivity : ComponentActivity() {
                                 .verticalScroll(statsScroll)
                         ) {
                             Text(
+                                text = "Học sinh: $studentName",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(text = habitText)
+                            if (habitDetailText.isNotEmpty()) {
+                                Text(
+                                    text = habitDetailText,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            if (habitHistoryText.isNotEmpty()) {
+                                Text(
+                                    text = "Các phiên gần đây:\n$habitHistoryText",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { switchStudent() }) {
+                                    Text("Đổi HS")
+                                }
+                                Button(
+                                    onClick = {
+                                        newStudentName = ""
+                                        showAddStudent = true
+                                    }
+                                ) {
+                                    Text("Thêm HS")
+                                }
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { toggleHabitLearn() }) {
+                                    Text(
+                                        if (habitLearnUi) "Học thói quen: Bật"
+                                        else "Học thói quen: Tắt"
+                                    )
+                                }
+                                Button(onClick = { showResetHabit = true }) {
+                                    Text("Xóa hồ sơ")
+                                }
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { cycleSensitivity() }) {
+                                    Text(
+                                        when (sensitivityUi) {
+                                            0 -> "Độ nhạy: Thấp"
+                                            2 -> "Độ nhạy: Cao"
+                                            else -> "Độ nhạy: Vừa"
+                                        }
+                                    )
+                                }
+                            }
+
+                            if (showAddStudent) {
+                                AlertDialog(
+                                    onDismissRequest = { showAddStudent = false },
+                                    title = { Text("Thêm học sinh") },
+                                    text = {
+                                        OutlinedTextField(
+                                            value = newStudentName,
+                                            onValueChange = { newStudentName = it.take(24) },
+                                            singleLine = true,
+                                            label = { Text("Tên hoặc mã học sinh") }
+                                        )
+                                    },
+                                    confirmButton = {
+                                        TextButton(
+                                            onClick = {
+                                                addStudent(newStudentName)
+                                                showAddStudent = false
+                                            }
+                                        ) {
+                                            Text("Thêm")
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showAddStudent = false }) {
+                                            Text("Hủy")
+                                        }
+                                    }
+                                )
+                            }
+
+                            if (showResetHabit) {
+                                AlertDialog(
+                                    onDismissRequest = { showResetHabit = false },
+                                    title = { Text("Xóa hồ sơ thói quen?") },
+                                    text = {
+                                        Text("Toàn bộ dữ liệu đã học của $studentName sẽ bị xóa và không khôi phục được.")
+                                    },
+                                    confirmButton = {
+                                        TextButton(
+                                            onClick = {
+                                                habitResetRequested = true
+                                                showResetHabit = false
+                                                seiValue = -1
+                                                seiHistory = emptyList()
+                                                calibrationText = "Đang hiệu chuẩn lại..."
+                                            }
+                                        ) {
+                                            Text("Xóa")
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showResetHabit = false }) {
+                                            Text("Hủy")
+                                        }
+                                    }
+                                )
+                            }
+
+                            Spacer(Modifier.height(6.dp))
+
+                            Text(
                                 text = "Số khuôn mặt: $faceCount",
                                 style = MaterialTheme.typography.titleMedium
                             )
@@ -804,6 +1038,7 @@ class MainActivity : ComponentActivity() {
                             Text(text = "EAR mắt 1: $ear1Text")
                             Text(text = "EAR mắt 2: $ear2Text")
                             Text(text = "Trạng thái mắt: $eyeStatus")
+                            Text(text = "Phân tích mắt: $eyeDetailText")
 
                             Text(
                                 text = "Khoảng cách: $distanceText (hệ số $distanceScaleText)",
@@ -824,7 +1059,7 @@ class MainActivity : ComponentActivity() {
                             Text(text = "Phiên làm việc: $sessionText")
                             Text(text = "Thời gian nhận diện: $processingText ($fpsText FPS)")
                             Text(
-                                text = "Dữ liệu được xử lý ngay trên thiết bị, không gửi ra ngoài.",
+                                text = "Dữ liệu và hồ sơ thói quen chỉ xử lý và lưu trên thiết bị, không gửi ra ngoài.",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
@@ -837,6 +1072,7 @@ class MainActivity : ComponentActivity() {
                             Button(
                                 onClick = {
                                     recalibrationRequested = true
+                                    resetAlertCounters()
                                     calibrationText = "Đang hiệu chuẩn lại..."
                                     seiValue = -1
                                     seiHistory = emptyList()
@@ -859,11 +1095,22 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Button(
                                 onClick = {
-                                    soundEnabled = !soundEnabled
-                                    prefs.edit().putBoolean(KEY_SOUND, soundEnabled).apply()
+                                    // Đầy đủ -> Chỉ quan trọng -> Tắt -> Đầy đủ
+                                    soundMode = if (soundMode == 0) 2 else soundMode - 1
+                                    prefs.edit().putInt(KEY_SOUND_MODE, soundMode).apply()
+                                    if (soundMode > 0) {
+                                        // Phát thử để học sinh nghe mức âm lượng.
+                                        playAlertSound(2, SystemClock.elapsedRealtime(), true)
+                                    }
                                 }
                             ) {
-                                Text(if (soundEnabled) "Âm thanh: Bật" else "Âm thanh: Tắt")
+                                Text(
+                                    when (soundMode) {
+                                        2 -> "Âm thanh: Đầy đủ"
+                                        1 -> "Âm thanh: Quan trọng"
+                                        else -> "Âm thanh: Tắt"
+                                    }
+                                )
                             }
 
                             Button(
@@ -1076,6 +1323,281 @@ class MainActivity : ComponentActivity() {
         return sensorFocalMm * pxPerMm
     }
 
+    // ======================= HỌC THÓI QUEN THEO TỪNG HỌC SINH =======================
+
+    // ---- Chạy trên UI thread ----
+
+    private fun selectStudent(st: HabitStudent) {
+        activeStudentId = st.id
+        habitStore.setCurrent(st.id)
+        studentName = st.name
+        studentSwitchRequest = st.id
+        resetAlertCounters()
+        blinkCount = 0
+        seiValue = -1
+        seiHistory = emptyList()
+        calibrationText = "Đang hiệu chuẩn lại..."
+    }
+
+    private fun switchStudent() {
+        val list = habitStore.students()
+        if (list.size < 2) {
+            status = "Mới có 1 hồ sơ học sinh, hãy bấm Thêm HS."
+            return
+        }
+        val idx = list.indexOfFirst { it.id == activeStudentId }
+        selectStudent(list[(idx + 1).mod(list.size)])
+    }
+
+    private fun addStudent(name: String) {
+        selectStudent(habitStore.addStudent(name))
+    }
+
+    private fun toggleHabitLearn() {
+        habitLearnEnabled = !habitLearnEnabled
+        habitLearnUi = habitLearnEnabled
+        prefs.edit().putBoolean(KEY_HABIT_LEARN, habitLearnEnabled).apply()
+    }
+
+    private fun cycleSensitivity() {
+        sensLevel = (sensLevel + 1) % 3
+        sensitivityUi = sensLevel
+        prefs.edit().putInt(KEY_SENSITIVITY, sensLevel).apply()
+    }
+
+    // ---- Chạy trên cameraExecutor ----
+
+    /** Xử lý yêu cầu đổi học sinh / xóa hồ sơ do UI gửi sang. */
+    private fun processHabitRequests() {
+        val switchTo = studentSwitchRequest
+        if (switchTo != null) {
+            studentSwitchRequest = null
+            endHabitSession()
+            habitProfile = habitStore.load(switchTo)
+            resetPersonalParams()
+            lastHabitStatusMs = 0L
+            recalibrationRequested = false
+            resetCalibration()
+        }
+
+        if (habitResetRequested) {
+            habitResetRequested = false
+            val id = habitProfile?.id
+            habitSession = null
+            if (id != null) {
+                habitStore.clear(id)
+                habitProfile = habitStore.load(id)
+            }
+            resetPersonalParams()
+            lastHabitStatusMs = 0L
+            recalibrationRequested = false
+            resetCalibration()
+        }
+    }
+
+    private fun resetPersonalParams() {
+        thrLookYaw = LOOK_AWAY_YAW_DEG
+        thrLookPitch = LOOK_AWAY_PITCH_DEG
+        thrGazeH = GAZE_H_DRIFT
+        thrGazeV = GAZE_V_DRIFT
+        thrBlinkLow = LOW_BLINK_BPM
+        thrBlinkHigh = HIGH_BLINK_BPM
+        thrPerclos = PERCLOS_ALERT
+        thrMar = MAR_YAWN
+        habitDetail = ""
+        personalSeiMean = Float.NaN
+        personalSeiSpread = 0f
+        lowVsPersonalStartMs = 0L
+        lastSeiValue = -1
+    }
+
+    /** Thay ngưỡng mặc định bằng ngưỡng cá nhân, trộn theo độ tin cậy c (0..1). */
+    private fun applyPersonalParams(base: HabitBaseline, c: Float) {
+        fun mix(default: Float, personal: Float?): Float =
+            if (personal == null) default else default * (1f - c) + personal * c
+
+        thrLookYaw = mix(LOOK_AWAY_YAW_DEG, base.threshold(HabitFeature.YAW, 2.5f, 12f, 30f))
+        thrLookPitch = mix(LOOK_AWAY_PITCH_DEG, base.threshold(HabitFeature.PITCH, 2.5f, 12f, 30f))
+        thrGazeH = mix(GAZE_H_DRIFT, base.threshold(HabitFeature.GAZE_H, 2.5f, 0.10f, 0.30f))
+        thrGazeV = mix(GAZE_V_DRIFT, base.threshold(HabitFeature.GAZE_V, 2.5f, 0.14f, 0.40f))
+
+        val bpmMean = base.mean(HabitFeature.BPM)
+        val bpmSpread = base.spread(HabitFeature.BPM)
+        if (bpmMean != null && bpmSpread != null) {
+            thrBlinkLow = mix(LOW_BLINK_BPM, (bpmMean - 2f * bpmSpread).coerceIn(4f, 12f))
+            thrBlinkHigh = mix(HIGH_BLINK_BPM, (bpmMean + 2f * bpmSpread).coerceIn(24f, 40f))
+        }
+
+        val pMean = base.mean(HabitFeature.PERCLOS)
+        val pSpread = base.spread(HabitFeature.PERCLOS)
+        if (pMean != null && pSpread != null) {
+            thrPerclos = mix(PERCLOS_ALERT, (pMean + 3f * pSpread).coerceIn(10f, 25f))
+        }
+
+        val mMean = base.mean(HabitFeature.MAR)
+        val mSpread = base.spread(HabitFeature.MAR)
+        if (mMean != null && mSpread != null) {
+            thrMar = mix(MAR_YAWN, (mMean + 5f * mSpread).coerceIn(0.45f, 0.70f))
+        }
+
+        val sMean = base.mean(HabitFeature.SEI)
+        val sSpread = base.spread(HabitFeature.SEI)
+        if (sMean != null && sSpread != null) {
+            personalSeiMean = sMean
+            personalSeiSpread = max(sSpread, PERSONAL_SEI_MIN_SPREAD)
+        }
+
+        habitDetail = buildString {
+            append("Mức cơ sở cá nhân: ")
+            base.mean(HabitFeature.BPM)?.let {
+                append(String.format(Locale.US, "chớp %.0f lần/phút; ", it))
+            }
+            base.mean(HabitFeature.DIST)?.let {
+                append(String.format(Locale.US, "ngồi cách %.0f cm; ", it))
+            }
+            append(
+                String.format(
+                    Locale.US,
+                    "cảnh báo quay đầu > %.0f°/%.0f°; liếc mắt > %.2f/%.2f; ",
+                    thrLookYaw, thrLookPitch, thrGazeH, thrGazeV
+                )
+            )
+            append(String.format(Locale.US, "PERCLOS cảnh báo > %.0f%%", thrPerclos))
+            base.mean(HabitFeature.SEI)?.let {
+                append(String.format(Locale.US, "; SEI quen thuộc %.0f", it))
+            }
+        }
+    }
+
+    /** Gọi khi hiệu chuẩn xong: mở phiên mới, áp ngưỡng cá nhân, trộn EAR cơ sở. */
+    private fun beginHabitSession(nowMs: Long) {
+        val prof = habitProfile
+        resetPersonalParams()
+        lastHabitSaveMs = nowMs
+        lastHabitStatusMs = 0L
+
+        if (prof == null) {
+            habitSession = null
+            return
+        }
+
+        val session = HabitSession(System.currentTimeMillis())
+        habitSession = session
+
+        // Ghi lại EAR cơ sở THÔ của phiên này (trước khi trộn) để không tự khuếch đại.
+        if (habitLearnEnabled) {
+            session.observe(HabitFeature.EAR, (baselineEar1 + baselineEar2) / 2f)
+        }
+
+        if (!prof.isReady()) return
+
+        val base = prof.baseline()
+        val c = prof.confidence()
+        applyPersonalParams(base, c)
+        blendEarWithHabit(base, c)
+    }
+
+    /**
+     * Trộn EAR cơ sở của phiên với EAR điển hình đã học (tối đa 35% khi đủ tin cậy).
+     * Nếu lệch quá 30% thì giữ nguyên giá trị mới (có thể vừa đổi kính hoặc điều kiện sáng).
+     */
+    private fun blendEarWithHabit(base: HabitBaseline, c: Float) {
+        val learned = base.mean(HabitFeature.EAR) ?: return
+        val current = (baselineEar1 + baselineEar2) / 2f
+        if (current <= 0f) return
+
+        val ratio = learned / current
+        if (ratio < 0.7f || ratio > 1.3f) return
+
+        val w = 0.35f * c
+        val k = (1f - w) + w * ratio
+        baselineEar1 *= k
+        baselineEar2 *= k
+    }
+
+    private fun commitHabitSession() {
+        val prof = habitProfile ?: return
+        val session = habitSession ?: return
+        if (!habitLearnEnabled) return
+        if (prof.commit(session.toSummary())) {
+            habitStore.save(prof)
+        }
+    }
+
+    private fun endHabitSession() {
+        commitHabitSession()
+        habitSession = null
+    }
+
+    /** Lưu định kỳ và làm mới dòng trạng thái (mỗi giây một lần). */
+    private fun maintainHabit(nowMs: Long) {
+        if (nowMs - lastHabitSaveMs >= HABIT_AUTOSAVE_MS) {
+            lastHabitSaveMs = nowMs
+            commitHabitSession()
+        }
+        if (nowMs - lastHabitStatusMs >= HABIT_STATUS_REFRESH_MS) {
+            lastHabitStatusMs = nowMs
+            habitStatus = buildHabitStatus()
+            habitHistory = habitProfile?.historyText(5) ?: ""
+        }
+    }
+
+    private fun buildHabitStatus(): String {
+        val prof = habitProfile ?: return "Đang nạp hồ sơ học sinh..."
+        val n = prof.sessionCount()
+        if (!habitLearnEnabled) {
+            return "Học thói quen đang tắt (hồ sơ có $n phiên)."
+        }
+
+        val totalMin = prof.totalValidMs() / 60000f
+        val sb = StringBuilder()
+        if (prof.isReady()) {
+            sb.append(
+                String.format(
+                    Locale.US,
+                    "Hồ sơ cá nhân: %d phiên, %.0f phút - đang dùng ngưỡng riêng (tin cậy %.0f%%).",
+                    n, totalMin, prof.confidence() * 100f
+                )
+            )
+        } else {
+            sb.append(
+                String.format(
+                    Locale.US,
+                    "Đang học thói quen: %d/%d phiên đạt, %.0f/%d phút hợp lệ.",
+                    n,
+                    HabitConfig.MIN_SESSIONS,
+                    totalMin,
+                    HabitConfig.MIN_TOTAL_MS / 60000L
+                )
+            )
+        }
+
+        val session = habitSession
+        if (session == null) {
+            sb.append(" Phiên mới sẽ bắt đầu sau khi hiệu chuẩn xong.")
+        } else {
+            sb.append(
+                String.format(Locale.US, " Phiên này: %.1f phút hợp lệ", session.validMs / 60000f)
+            )
+            val reason = prof.ineligibleReason(session.toSummary())
+            if (reason != null) {
+                sb.append(" (chưa đủ điều kiện lưu: $reason)")
+            } else {
+                sb.append(" (đủ điều kiện, đang được lưu)")
+            }
+        }
+        if (!personalSeiMean.isNaN() && lastSeiValue >= 0) {
+            sb.append(
+                String.format(
+                    Locale.US,
+                    " SEI hiện tại %d, thường ngày ~%.0f (%+.0f).",
+                    lastSeiValue, personalSeiMean, lastSeiValue - personalSeiMean
+                )
+            )
+        }
+        return sb.toString()
+    }
+
     // ======================= BÁO CÁO & ÂM BÁO (UI thread) =======================
 
     private fun buildReport(): String {
@@ -1099,6 +1621,14 @@ class MainActivity : ComponentActivity() {
             append("Số lần ngáp: ${s.yawnTotal}\n")
             append("Số lần mất tập trung được ghi nhận: ${s.violationsTotal}\n")
             append("Số đợt mất tập trung kéo dài: ${s.chronicEpisodes}\n")
+            append("Phân tích mắt: ${s.eyeDetail}\n")
+            append("Học sinh: $studentName\n")
+            append(s.habitStatus).append("\n")
+            if (s.habitDetail.isNotEmpty()) append(s.habitDetail).append("\n")
+            if (s.habitHistory.isNotEmpty()) {
+                append("Các phiên gần đây:\n")
+                append(s.habitHistory).append("\n")
+            }
             append("Lưu ý: các chỉ số chỉ mang tính tham khảo, không phải chẩn đoán y tế.")
         }
     }
@@ -1118,19 +1648,109 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun beep(nowMs: Long) {
-        if (nowMs - lastBeepMs < BEEP_MIN_GAP_MS) return
-        lastBeepMs = nowMs
+    /** Mức âm của từng loại cảnh báo: 1 nhắc nhẹ, 2 cảnh báo, 3 khẩn cấp, 4 nghỉ giải lao. */
+    private fun alertLevelOf(kind: Int): Int = when (kind) {
+        KIND_DROWSY, KIND_CHRONIC -> 3
+        KIND_PERCLOS, KIND_YAWN, KIND_TOO_CLOSE -> 2
+        KIND_BREAK -> 4
+        else -> 1
+    }
+
+    /**
+     * Số lần cảnh báo phải xuất hiện thì mới kêu.
+     * Buồn ngủ, mất tập trung kéo dài và nhắc nghỉ giải lao kêu ngay từ lần đầu.
+     */
+    private fun alertSoundAfter(kind: Int): Int = when (kind) {
+        KIND_DROWSY, KIND_CHRONIC, KIND_BREAK -> 1
+        KIND_LOW_PERSONAL -> ALERT_SOUND_AFTER_HABIT
+        else -> ALERT_SOUND_AFTER_NORMAL
+    }
+
+    /** Ghi nhận một lần xuất hiện; trả về true nếu đã đủ số lần để kêu. */
+    private fun registerAlertOccurrence(kind: Int, nowMs: Long): Boolean {
+        val window = if (kind == KIND_LOW_PERSONAL) ALERT_COUNT_WINDOW_HABIT_MS
+        else ALERT_COUNT_WINDOW_MS
+
+        val list = alertOccurrences[kind]
+        list.add(nowMs)
+        while (list.isNotEmpty() && nowMs - list[0] > window) {
+            list.removeAt(0)
+        }
+        return list.size >= alertSoundAfter(kind)
+    }
+
+    private fun resetAlertCounters() {
+        for (list in alertOccurrences) list.clear()
+        lastKindActiveMs.fill(-1_000_000L)
+    }
+
+    /**
+     * Âm báo theo mức độ, mỗi mức một âm khác nhau để nghe là biết loại cảnh báo:
+     * 1 nhắc nhẹ, 2 cảnh báo (bíp đôi), 3 khẩn cấp (âm dài), 4 nghỉ giải lao (âm dịu).
+     * Mỗi mức có khoảng nghỉ riêng để không kêu liên tục làm phiền cả lớp.
+     */
+    private fun playAlertSound(level: Int, nowMs: Long, force: Boolean = false) {
+        if (level !in 1..4) return
+
+        if (!force) {
+            val allowed = when (soundMode) {
+                2 -> true
+                1 -> level == 2 || level == 3
+                else -> false
+            }
+            if (!allowed) return
+
+            val minGap = when (level) {
+                1 -> 20_000L
+                2 -> 15_000L
+                3 -> 8_000L
+                else -> 60_000L
+            }
+            if (nowMs - lastToneMs[level] < minGap) return
+            // Tránh hai âm chồng lên nhau; âm khẩn cấp luôn được phép chen vào.
+            if (level < 3 && nowMs - lastAnyToneMs < 2_000L) return
+        }
+
+        lastToneMs[level] = nowMs
+        lastAnyToneMs = nowMs
 
         try {
             val generator = toneGenerator
-                ?: ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70).also {
+                ?: ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85).also {
                     toneGenerator = it
                 }
-            generator.startTone(ToneGenerator.TONE_PROP_BEEP, 250)
+            when (level) {
+                1 -> generator.startTone(ToneGenerator.TONE_PROP_PROMPT, 150)
+                2 -> generator.startTone(ToneGenerator.TONE_PROP_BEEP2, 300)
+                3 -> generator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
+                else -> generator.startTone(ToneGenerator.TONE_PROP_ACK, 400)
+            }
         } catch (e: RuntimeException) {
             Log.w(TAG, "Không phát được âm báo", e)
         }
+    }
+
+    // ======================= ĐỘ NHẠY =======================
+
+    /** Hệ số thời gian xác nhận: càng nhạy càng báo sớm (0.6 nghĩa là chỉ cần 60% thời gian). */
+    private fun sensTime(): Float = when (sensLevel) {
+        0 -> 1.5f
+        2 -> 0.6f
+        else -> 1.0f
+    }
+
+    /** Hệ số ngưỡng góc đầu / hướng nhìn: càng nhạy càng báo với độ lệch nhỏ hơn. */
+    private fun sensThr(): Float = when (sensLevel) {
+        0 -> 1.15f
+        2 -> 0.85f
+        else -> 1.0f
+    }
+
+    /** Hệ số làm mượt SEI: càng nhạy chỉ số càng bám sát diễn biến tức thời. */
+    private fun sensSmooth(): Float = when (sensLevel) {
+        0 -> 0.7f
+        2 -> 1.6f
+        else -> 1.0f
     }
 
     // ======================= TOÁN HỌC HÌNH HỌC =======================
@@ -1510,9 +2130,14 @@ class MainActivity : ComponentActivity() {
     // ======================= HIỆU CHUẨN & SEI 2.0 =======================
 
     private fun resetCalibration() {
+        endHabitSession()
+        eyeEngine.reset()
+        lastSeiValue = -1
+        lowVsPersonalStartMs = 0L
         calibrated = false
         calFrames = 0
         calWaitStartMs = 0L
+        calRejected = 0
         calSumEar1 = 0f
         calSumEar2 = 0f
         calSumYawDeg = 0f
@@ -1526,7 +2151,6 @@ class MainActivity : ComponentActivity() {
         baselineGazeV = 0.5f
         baselineBfr = 0.5f
         eyesClosed = false
-        closedFrameCount = 0
         closedStartMs = 0L
         lastBlinkMs = 0L
         blinkTimestamps.clear()
@@ -1573,10 +2197,14 @@ class MainActivity : ComponentActivity() {
         baselineEar1 = calSumEar1 / n
         baselineEar2 = calSumEar2 / n
 
+        // Mở phiên học thói quen và (nếu đã có hồ sơ) trộn EAR cơ sở với giá trị đã học.
+        val earBefore = (baselineEar1 + baselineEar2) / 2f
+        beginHabitSession(nowMs)
+        val earAfter = (baselineEar1 + baselineEar2) / 2f
+        eyeEngine.finishCalibration(if (earBefore > 0f) earAfter / earBefore else 1f)
+
         closeThreshold1 = baselineEar1 * CLOSE_RATIO
         closeThreshold2 = baselineEar2 * CLOSE_RATIO
-        openThreshold1 = baselineEar1 * OPEN_RATIO
-        openThreshold2 = baselineEar2 * OPEN_RATIO
 
         baselineYawDeg = calSumYawDeg / n
         baselinePitchDeg = calSumPitchDeg / n
@@ -1590,7 +2218,6 @@ class MainActivity : ComponentActivity() {
         blinkTimestamps.clear()
         blinkDurations.clear()
         eyesClosed = false
-        closedFrameCount = 0
         clearPoseState()
         resetFilters()
         perclos.reset()
@@ -1625,12 +2252,13 @@ class MainActivity : ComponentActivity() {
 
     private fun bpmScore(bpm: Float, reliable: Boolean): Float {
         if (!reliable) return 85f
+        // Vùng lý tưởng bám theo ngưỡng hiện hành (mặc định 12..25, cá nhân hóa khi đã học).
+        val lo = thrBlinkLow + 4f
+        val hi = thrBlinkHigh - 5f
         return when {
-            bpm in 12f..25f -> 100f
-            bpm in 8f..12f -> 70f + ((bpm - 8f) / 4f) * 30f
-            bpm in 25f..32f -> 100f - ((bpm - 25f) / 7f) * 30f
-            bpm < 8f -> 40f + (bpm / 8f) * 30f
-            else -> max(30f, 70f - (bpm - 32f) * 2f)
+            bpm in lo..hi -> 100f
+            bpm < lo -> 40f + (bpm / lo) * 60f
+            else -> max(30f, 100f - ((bpm - hi) / 7f) * 30f)
         }
     }
 
@@ -1658,8 +2286,8 @@ class MainActivity : ComponentActivity() {
         if (!available || !eyesOpen) return 85f
 
         val base = 100f -
-                clamp01(abs(offH) / (GAZE_H_DRIFT * 1.5f)) * 60f -
-                clamp01(abs(offV) / (GAZE_V_DRIFT * 1.5f)) * 40f
+                clamp01(abs(offH) / (thrGazeH * 1.5f)) * 60f -
+                clamp01(abs(offV) / (thrGazeV * 1.5f)) * 40f
 
         return if (driftLong) min(base, 30f) else base.coerceIn(0f, 100f)
     }
@@ -1701,7 +2329,7 @@ class MainActivity : ComponentActivity() {
 
         raw += min(25f, yawnsRecent * 8f)
 
-        if (bpmReliable && (bpmValue < LOW_BLINK_BPM || bpmValue > HIGH_BLINK_BPM)) {
+        if (bpmReliable && (bpmValue < thrBlinkLow || bpmValue > thrBlinkHigh)) {
             raw += 10f
         }
 
@@ -1710,7 +2338,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val target = min(100f, raw)
-        fatigueEma += (target - fatigueEma) * FATIGUE_SMOOTHING
+        fatigueEma += (target - fatigueEma) * frameAlpha(FATIGUE_SMOOTHING)
         return fatigueEma.roundToInt().coerceIn(0, 100)
     }
 
@@ -1720,7 +2348,7 @@ class MainActivity : ComponentActivity() {
             seiInitialized = true
             target
         } else {
-            seiEma + (target - seiEma) * SEI_SMOOTHING
+            seiEma + (target - seiEma) * frameAlpha(min(0.9f, SEI_SMOOTHING * sensSmooth()))
         }
 
         val value = seiEma.roundToInt().coerceIn(0, 100)
@@ -1752,10 +2380,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Hệ số làm mượt theo thời gian thực. perFrameAt30fps là hệ số quen thuộc khi máy chạy 30 FPS;
+     * hàm này trả về hệ số tương đương cho khoảng thời gian thực tế giữa hai khung, để SEI và chỉ số
+     * mệt mỏi phản ứng cùng tốc độ dù máy chạy 12 hay 30 khung/giây.
+     */
+    private fun frameAlpha(perFrameAt30fps: Float): Float {
+        val a = perFrameAt30fps.coerceIn(0.001f, 0.99f)
+        val tauMs = -33.3f / ln(1f - a)
+        return (1f - exp(-frameDtMs / tauMs)).coerceIn(0f, 1f)
+    }
+
     private fun updateFps(nowMs: Long) {
         if (prevFrameTimeMs != 0L) {
             val dt = nowMs - prevFrameTimeMs
             if (dt > 0L) {
+                frameDtMs = dt.toFloat().coerceIn(5f, 250f)
                 val instant = 1000f / dt.toFloat()
                 fpsEma = if (fpsEma == 0f) {
                     instant
@@ -1772,7 +2412,6 @@ class MainActivity : ComponentActivity() {
     /** Xóa các bộ đếm tức thời khi mất khuôn mặt (tránh sự kiện giả khi quay lại). */
     private fun clearTransientState() {
         eyesClosed = false
-        closedFrameCount = 0
         prevNoseX = Float.NaN
         prevNoseY = Float.NaN
         jitterEma = 0f
@@ -1791,6 +2430,7 @@ class MainActivity : ComponentActivity() {
         resetFilters()
         perclos.pause()
         inattention.pause()
+        eyeEngine.pause()
     }
 
     private fun noFaceSnapshot(
@@ -1800,6 +2440,7 @@ class MainActivity : ComponentActivity() {
         processingMs: Float
     ): HudSnapshot {
         clearTransientState()
+        if (habitLearnEnabled) habitSession?.tick(nowMs, false, false)
 
         // Rời khỏi màn hình đủ lâu được tính là đã nghỉ giải lao.
         if (faceLostSinceMs == 0L) {
@@ -1811,7 +2452,7 @@ class MainActivity : ComponentActivity() {
 
         var sei: Int? = null
         if (calibrated && seiInitialized) {
-            seiEma += (0f - seiEma) * SEI_NO_FACE_DECAY
+            seiEma += (0f - seiEma) * frameAlpha(SEI_NO_FACE_DECAY)
             sei = seiEma.roundToInt().coerceIn(0, 100)
         }
 
@@ -1858,7 +2499,12 @@ class MainActivity : ComponentActivity() {
             minSei = minSei(),
             violationsTotal = violationsTotal,
             chronicEpisodes = chronicEpisodes,
-            yawnTotal = yawnTotal
+            yawnTotal = yawnTotal,
+            habitStatus = habitStatus,
+            habitDetail = habitDetail,
+            habitHistory = habitHistory,
+            alertCode = 0,
+            eyeDetail = "--"
         )
     }
 
@@ -1867,14 +2513,18 @@ class MainActivity : ComponentActivity() {
         imgW: Int,
         imgH: Int,
         nowMs: Long,
-        processingMs: Float
+        processingMs: Float,
+        blend: FloatArray? = null
     ): HudSnapshot {
+        processHabitRequests()
+
         if (recalibrationRequested) {
             recalibrationRequested = false
             resetCalibration()
         }
 
         updateFps(nowMs)
+        maintainHabit(nowMs)
 
         if (lm.count < MIN_LANDMARKS) {
             return noFaceSnapshot(imgW, imgH, nowMs, processingMs)
@@ -2006,6 +2656,8 @@ class MainActivity : ComponentActivity() {
         var expressionStatus = "Đang hiệu chuẩn"
         var inattentionPct: Float? = null
         var fatigueOut: Int? = null
+        var alertCode = 0
+        var eyeDetail = "Đang hiệu chuẩn"
 
         if (!calibrated) {
             // ---- Pha hiệu chuẩn: chỉ nhận khung hợp lệ và tín hiệu đủ tốt ----
@@ -2016,7 +2668,14 @@ class MainActivity : ComponentActivity() {
                     nowMs - calWaitStartMs >= CAL_RELAX_AFTER_MS
             val minEar = if (relaxed) CAL_RELAXED_MIN_EAR else CALIBRATION_MIN_EAR
 
-            if (reliable && ear1 > minEar && ear2 > minEar) {
+            // Đầu phải đứng yên tương đối so với các khung đã nhận, để đường cơ sở (tư thế, hướng nhìn)
+            // không bị lệch khi học sinh vừa quay đi hoặc đang cúi trong lúc hiệu chuẩn.
+            val poseStable = calFrames < 8 ||
+                    (abs(poseYawAbs - calSumYawDeg / calFrames) < 10f &&
+                            abs(posePitchAbs - calSumPitchDeg / calFrames) < 10f)
+
+            if (reliable && ear1 > minEar && ear2 > minEar && poseStable) {
+                calRejected = 0
                 calSumEar1 += ear1
                 calSumEar2 += ear2
                 calSumYawDeg += poseYawAbs
@@ -2024,44 +2683,69 @@ class MainActivity : ComponentActivity() {
                 calSumGazeH += gazeH
                 calSumGazeV += gazeV
                 calSumBfr += bfr
+                eyeEngine.addCalibrationSample(lm, imgW, imgH, blend)
                 calFrames++
 
                 if (calFrames >= CALIBRATION_FRAMES) {
                     finishCalibration(nowMs)
                 }
+            } else if (reliable) {
+                // Bị loại liên tục khoảng 3 giây (đổi tư thế ngồi): bỏ dữ liệu cũ và hiệu chuẩn lại từ đầu.
+                calRejected++
+                if (calRejected > 90) {
+                    calRejected = 0
+                    calFrames = 0
+                    calSumEar1 = 0f
+                    calSumEar2 = 0f
+                    calSumYawDeg = 0f
+                    calSumPitchDeg = 0f
+                    calSumGazeH = 0f
+                    calSumGazeV = 0f
+                    calSumBfr = 0f
+                    eyeEngine.reset()
+                }
             }
             currentEyeStatus = "Đang hiệu chuẩn"
         } else {
-            // ---- Phát hiện chớp mắt theo ngưỡng thích nghi ----
-            val bothEyesClosed =
-                ear1 < closeThreshold1 && ear2 < closeThreshold2
-            val bothEyesOpen =
-                ear1 > openThreshold1 && ear2 > openThreshold2
+            val sT = sensTime()
+            val sH = sensThr()
+            eyeEngine.setSensitivity(sensLevel)
 
-            if (bothEyesClosed) {
-                closedFrameCount++
+            // ---- Phân tích mắt nâng cấp: hợp nhất hình học 5 cặp mí + blendshape, bù góc nghiêng/cúi ----
+            val poseOkForEyes = reliable &&
+                    abs(yawDeg) <= EYE_MAX_YAW_DEG && abs(pitchDeg) <= EYE_MAX_PITCH_DEG
+            val eye = eyeEngine.update(
+                lm, imgW, imgH, nowMs,
+                yawDeg, pitchDeg, gazeV - baselineGazeV,
+                blend, poseOkForEyes
+            )
 
-                if (closedFrameCount >= MIN_CLOSED_FRAMES && !eyesClosed) {
-                    eyesClosed = true
-                    closedStartMs = nowMs
-                }
-            } else if (bothEyesOpen) {
-                if (eyesClosed) {
-                    val duration = nowMs - closedStartMs
-                    if (duration <= MAX_BLINK_DURATION_MS) {
-                        blinkDetected = true
-                        blinkTimestamps.add(nowMs)
-                        blinkDurations.add(duration)
-                        lastBlinkMs = nowMs
-                    }
-                }
-
-                eyesClosed = false
-                closedFrameCount = 0
+            eyesClosed = eye.closed
+            if (eye.closed) closedStartMs = eye.closedStartMs
+            if (eye.blinkDurationMs > 0L) {
+                blinkDetected = true
+                blinkTimestamps.add(nowMs)
+                blinkDurations.add(eye.blinkDurationMs)
+                lastBlinkMs = nowMs
             }
 
-            // ---- PERCLOS ----
-            perclos.record(nowMs, eyesClosed)
+            eyeDetail = if (!eye.valid) {
+                "Góc nghiêng lớn hoặc tín hiệu kém: tạm bỏ qua phân tích mắt"
+            } else {
+                String.format(
+                    Locale.US,
+                    "độ mở %.2f | nhiễu %.2f | nheo %.0f%% | lệch 2 mắt %.0f%% | %s%s",
+                    eye.openness,
+                    eye.sigma,
+                    eye.squintPct,
+                    eye.asymPct,
+                    if (eye.usingBlendshapes) "AI blendshape + hình học" else "hình học (chưa bật blendshape)",
+                    if (eye.noisy) " | kính/chói gây nhiễu" else ""
+                )
+            }
+
+            // ---- PERCLOS (chỉ tính khi phân tích mắt hợp lệ) ----
+            if (eye.valid) perclos.record(nowMs, eyesClosed) else perclos.pause()
             val perclosValue = perclos.percent(nowMs)
             perclosOut = perclosValue
 
@@ -2075,17 +2759,19 @@ class MainActivity : ComponentActivity() {
             val bpmReliable = elapsed >= BPM_RELIABLE_AFTER_MS
 
             val closedDuration = if (eyesClosed) nowMs - closedStartMs else 0L
-            val drowsyNow = eyesClosed && closedDuration >= DROWSY_CLOSURE_MS
+            val drowsyNow = eyesClosed && closedDuration >= (DROWSY_CLOSURE_MS * sT).toLong()
 
             currentEyeStatus = when {
                 drowsyNow -> "Nhắm lâu - có thể buồn ngủ"
                 eyesClosed -> "Đang nhắm"
+                !eye.valid -> "Tạm bỏ qua (góc nghiêng lớn hoặc tín hiệu kém)"
+                eye.squintAlert -> "Mắt khép hoặc nheo một phần kéo dài"
                 else -> "Đang mở hoặc chuyển trạng thái"
             }
 
             // ---- Đầu quay lệch khỏi màn hình ----
             val headAwayNow =
-                abs(yawDeg) > LOOK_AWAY_YAW_DEG || abs(pitchDeg) > LOOK_AWAY_PITCH_DEG
+                abs(yawDeg) > thrLookYaw * sH || abs(pitchDeg) > thrLookPitch * sH
             if (headAwayNow) {
                 if (lookAwayStartMs == 0L) {
                     lookAwayStartMs = nowMs
@@ -2094,7 +2780,7 @@ class MainActivity : ComponentActivity() {
                 lookAwayStartMs = 0L
             }
             val lookAwayLong =
-                lookAwayStartMs != 0L && nowMs - lookAwayStartMs >= LOOK_AWAY_MS
+                lookAwayStartMs != 0L && nowMs - lookAwayStartMs >= (LOOK_AWAY_MS * sT).toLong()
 
             // ---- Cửa sổ trượt tư thế (góc thô): đóng băng / giật bất thường ----
             updatePoseWindow(nowMs, yawRawDev, pitchRawDev, poseRollAbs, (ear1 + ear2) / 2f)
@@ -2113,11 +2799,11 @@ class MainActivity : ComponentActivity() {
             }
 
             // ---- Hướng nhìn và Visual Drift ----
-            val eyesOpenForGaze = ear1 >= closeThreshold1 && ear2 >= closeThreshold2
+            val eyesOpenForGaze = eye.valid && eye.openness >= 0.75f
             val offH = gazeH - baselineGazeH
             val offV = gazeV - baselineGazeV
             val driftNow = irisAvailable && reliable && eyesOpenForGaze &&
-                    (abs(offH) > GAZE_H_DRIFT || abs(offV) > GAZE_V_DRIFT)
+                    (abs(offH) > thrGazeH * sH || abs(offV) > thrGazeV * sH)
 
             if (driftNow) {
                 if (driftStartMs == 0L) {
@@ -2127,9 +2813,9 @@ class MainActivity : ComponentActivity() {
                 driftStartMs = 0L
             }
             val driftMs = if (driftStartMs == 0L) 0L else nowMs - driftStartMs
-            val driftLong = driftMs >= VISUAL_DRIFT_MS
+            val driftLong = driftMs >= (VISUAL_DRIFT_MS * sT).toLong()
 
-            val gazeDir = if (abs(offH) / GAZE_H_DRIFT >= abs(offV) / GAZE_V_DRIFT) {
+            val gazeDir = if (abs(offH) / thrGazeH >= abs(offV) / thrGazeV) {
                 if (offH > 0f) "trái" else "phải"
             } else {
                 if (offV > 0f) "xuống" else "lên"
@@ -2160,9 +2846,11 @@ class MainActivity : ComponentActivity() {
                 furrowStartMs = 0L
             }
             val confusedSustained =
-                furrowStartMs != 0L && nowMs - furrowStartMs >= BFR_SUSTAIN_MS
+                furrowStartMs != 0L && nowMs - furrowStartMs >= (BFR_SUSTAIN_MS * sT).toLong()
 
-            val yawnNow = mar > MAR_YAWN
+            // Miệng mở rộng (blendshape jawOpen) cũng tính là ngáp: nhận ra cử chỉ nhanh và chắc hơn hình học.
+            val jawOpen = if (blend != null && blend.size > 4) blend[4] else 0f
+            val yawnNow = mar > thrMar || jawOpen > 0.55f
             if (yawnNow) {
                 if (yawnStartMs == 0L) {
                     yawnStartMs = nowMs
@@ -2172,7 +2860,7 @@ class MainActivity : ComponentActivity() {
                 yawnStartMs = 0L
                 yawnCounted = false
             }
-            val yawnConfirmed = yawnNow && nowMs - yawnStartMs >= YAWN_MIN_MS
+            val yawnConfirmed = yawnNow && nowMs - yawnStartMs >= (YAWN_MIN_MS * sT).toLong()
             if (yawnConfirmed && !yawnCounted) {
                 yawnCounted = true
                 yawnTimestamps.add(nowMs)
@@ -2257,7 +2945,8 @@ class MainActivity : ComponentActivity() {
             val gaze = gazeScore(irisAvailable && reliable, eyesOpenForGaze, offH, offV, driftLong)
             val eyes = (
                     eyeScore(closedDuration, eyesClosed) -
-                            clamp01((perclosValue - 5f) / 25f) * 50f
+                            clamp01((perclosValue - 5f) / 25f) * 50f -
+                            clamp01(eye.squintPct / 60f) * 15f
                     ).coerceAtLeast(0f)
             val blinkRate = bpmScore(bpmValue, bpmReliable)
             val expression = expressionScore(
@@ -2288,7 +2977,44 @@ class MainActivity : ComponentActivity() {
                 raw = min(raw, SEI_ANOMALY_CAP)
             }
 
-            sei = updateSei(raw)
+            val seiNow = updateSei(raw)
+            sei = seiNow
+            lastSeiValue = seiNow
+
+            // ---- So với thói quen: SEI tụt thấp hơn mức thường ngày của chính học sinh ----
+            val belowPersonal = reliable && !personalSeiMean.isNaN() &&
+                    seiNow < personalSeiMean - LOW_VS_PERSONAL_K * personalSeiSpread
+            if (belowPersonal) {
+                if (lowVsPersonalStartMs == 0L) lowVsPersonalStartMs = nowMs
+            } else {
+                lowVsPersonalStartMs = 0L
+            }
+            val lowVsPersonal =
+                lowVsPersonalStartMs != 0L && nowMs - lowVsPersonalStartMs >= LOW_VS_PERSONAL_MS
+
+            // ---- Học thói quen: chỉ lấy khung hợp lệ, không bất thường, không trong đợt mất tập trung kéo dài ----
+            val hs = habitSession
+            if (hs != null && habitLearnEnabled) {
+                val habitValid = reliable && !frozen && !jerky && chronicLevelValue < 2 &&
+                        !drowsyNow && !eyesClosed
+                hs.tick(nowMs, true, habitValid)
+                if (habitValid) {
+                    if (bpmReliable) hs.observe(HabitFeature.BPM, bpmValue)
+                    averageBlinkMs()?.let { hs.observe(HabitFeature.BLINK_MS, it) }
+                    if (distance != null) hs.observe(HabitFeature.DIST, distance)
+                    hs.observe(HabitFeature.YAW, yawDeg)
+                    hs.observe(HabitFeature.PITCH, pitchDeg)
+                    if (irisAvailable && eyesOpenForGaze) {
+                        hs.observe(HabitFeature.GAZE_H, offH)
+                        hs.observe(HabitFeature.GAZE_V, offV)
+                    }
+                    hs.observe(HabitFeature.MAR, mar)
+                    if (abs(yawDeg) < HEAD_FRONTAL_YAW_DEG) hs.observe(HabitFeature.BFR, bfr)
+                    hs.observe(HabitFeature.PERCLOS, perclosValue)
+                    hs.observe(HabitFeature.SEI, seiNow.toFloat())
+                    hs.addQuality(signalQuality.toFloat())
+                }
+            }
 
             // ---- Cảnh báo ưu tiên (khoảng cách / mãn tính / bất thường có dòng riêng) ----
             alert = when {
@@ -2296,7 +3022,7 @@ class MainActivity : ComponentActivity() {
                     "⚠ Tín hiệu kém ($signalNote) - kết quả có thể không chính xác."
                 drowsyNow ->
                     "⚠ Nhắm mắt quá lâu - bạn có thể đang buồn ngủ!"
-                perclosValue >= PERCLOS_ALERT ->
+                perclosValue >= thrPerclos ->
                     "⚠ Dấu hiệu mệt mỏi (PERCLOS cao) - hãy nghỉ ngơi."
                 driftLong ->
                     "⚠ Visual Drift: ánh mắt rời màn hình quá 3 giây."
@@ -2304,13 +3030,45 @@ class MainActivity : ComponentActivity() {
                     "⚠ Đầu bạn đang quay lệch khỏi màn hình."
                 yawnConfirmed ->
                     "⚠ Bạn đang ngáp - dấu hiệu mệt mỏi."
-                bpmReliable && bpmValue < LOW_BLINK_BPM ->
+                bpmReliable && bpmValue < thrBlinkLow ->
                     "⚠ Chớp mắt quá ít - hãy chớp mắt thường xuyên hơn."
-                confusedSustained ->
-                    "ℹ Bạn có vẻ đang căng thẳng hoặc bối rối với nội dung."
+                eye.squintAlert ->
+                    "⚠ Mắt khép hoặc nheo một phần kéo dài - có thể chói, mỏi hoặc khó chịu. Hãy nghỉ mắt và chỉnh độ sáng."
+                eye.asymAlert ->
+                    "ℹ Hai mắt mở không đều trong thời gian dài - hãy nghỉ mắt; nếu hay lặp lại, hãy báo người lớn hoặc giáo viên."
+                eye.incompleteAlert ->
+                    "ℹ Chớp mắt không hoàn toàn - mắt dễ khô, hãy chớp mắt chậm và đầy đủ."
+                bpmReliable && bpmValue > thrBlinkHigh ->
+                    "ℹ Chớp mắt rất nhiều - mắt có thể đang khô hoặc bị kích ứng, hãy nghỉ mắt."
                 breakReminder ->
                     "⏰ Đã 20 phút: hãy nhìn xa 6 m trong 20 giây (quy tắc 20-20-20)."
+                confusedSustained ->
+                    "ℹ Bạn có vẻ đang căng thẳng hoặc bối rối với nội dung."
+                lowVsPersonal ->
+                    "ℹ Mức tập trung đang thấp hơn thường ngày của bạn (thường khoảng ${personalSeiMean.roundToInt()})."
+                eye.noisy ->
+                    "ℹ Kính phản chiếu hoặc ánh sáng chói đang gây nhiễu - hãy nghiêng màn hình, giảm chói hoặc tăng ánh sáng đều."
                 else -> null
+            }
+
+            // Loại cảnh báo đang hiện (0 = không có / không kêu), cùng thứ tự ưu tiên với chuỗi alert.
+            alertCode = when {
+                !reliable -> 0
+                drowsyNow -> KIND_DROWSY
+                perclosValue >= thrPerclos -> KIND_PERCLOS
+                driftLong -> KIND_DRIFT
+                lookAwayLong -> KIND_LOOK_AWAY
+                yawnConfirmed -> KIND_YAWN
+                bpmReliable && bpmValue < thrBlinkLow -> KIND_LOW_BLINK
+                eye.squintAlert -> KIND_SQUINT
+                eye.asymAlert -> KIND_ASYMMETRY
+                eye.incompleteAlert -> KIND_INCOMPLETE_BLINK
+                bpmReliable && bpmValue > thrBlinkHigh -> KIND_HIGH_BLINK
+                breakReminder -> KIND_BREAK
+                confusedSustained -> 0
+                lowVsPersonal -> KIND_LOW_PERSONAL
+                eye.noisy -> 0
+                else -> 0
             }
         }
 
@@ -2382,23 +3140,17 @@ class MainActivity : ComponentActivity() {
             minSei = minSei(),
             violationsTotal = violationsTotal,
             chronicEpisodes = chronicEpisodes,
-            yawnTotal = yawnTotal
+            yawnTotal = yawnTotal,
+            habitStatus = habitStatus,
+            habitDetail = habitDetail,
+            habitHistory = habitHistory,
+            alertCode = alertCode,
+            eyeDetail = eyeDetail
         )
     }
 
-    /** Chạy trên UI thread: áp dụng ảnh chụp trạng thái lên giao diện. */
-    private fun applySnapshot(s: HudSnapshot) {
-        lastSnapshot = s
-
-        faceCount = if (s.faceDetected) 1 else 0
-        landmarkPoints = s.points
-        frameWidth = s.frameWidth
-        frameHeight = s.frameHeight
-
-        if (s.blinkDetected) {
-            blinkCount++
-        }
-
+    /** Chạy trên UI thread: cập nhật các dòng chữ của khung thông số (đã giới hạn tần suất). */
+    private fun applyHudText(s: HudSnapshot) {
         ear1Text = s.ear1?.let {
             String.format(Locale.US, "%.3f", it)
         } ?: "--"
@@ -2490,6 +3242,10 @@ class MainActivity : ComponentActivity() {
             else -> ""
         }
         anomalyText = s.anomaly ?: ""
+        habitText = s.habitStatus
+        habitDetailText = s.habitDetail
+        habitHistoryText = s.habitHistory
+        eyeDetailText = s.eyeDetail
 
         calibrationText = calibrationLabelFrom(s)
         seiValue = s.sei ?: -1
@@ -2508,6 +3264,27 @@ class MainActivity : ComponentActivity() {
             "Đã phát hiện khuôn mặt."
         } else {
             "Chưa phát hiện khuôn mặt."
+        }
+    }
+
+    /** Chạy trên UI thread: áp dụng ảnh chụp trạng thái lên giao diện. */
+    private fun applySnapshot(s: HudSnapshot) {
+        lastSnapshot = s
+
+        faceCount = if (s.faceDetected) 1 else 0
+        landmarkPoints = s.points
+        frameWidth = s.frameWidth
+        frameHeight = s.frameHeight
+
+        if (s.blinkDetected) {
+            blinkCount++
+        }
+
+        // Chữ chỉ cần làm mới ~8 lần/giây; vẽ lại toàn bộ khung thông số 30 lần/giây là lãng phí pin.
+        val nowText = SystemClock.elapsedRealtime()
+        if (nowText - lastUiTextMs >= UI_TEXT_REFRESH_MS) {
+            lastUiTextMs = nowText
+            applyHudText(s)
         }
 
         // Lịch sử SEI: mỗi giây một mẫu, giữ HISTORY_SIZE mẫu gần nhất.
@@ -2528,8 +3305,25 @@ class MainActivity : ComponentActivity() {
         // Âm báo khi vừa bước vào trạng thái nghiêm trọng.
         val chronicRising = s.chronicLevel == 2 && lastChronicLevelUi != 2
         val tooCloseRising = s.tooClose && !lastTooCloseUi
-        if (soundEnabled && (chronicRising || tooCloseRising)) {
-            beep(nowUi)
+        // Đếm số lần xuất hiện của từng loại cảnh báo, đủ số lần mới kêu.
+        val code = s.alertCode
+        if (code > 0) {
+            val isNew = nowUi - lastKindActiveMs[code] > ALERT_REARM_MS
+            lastKindActiveMs[code] = nowUi
+            if (isNew) {
+                if (registerAlertOccurrence(code, nowUi)) {
+                    playAlertSound(alertLevelOf(code), nowUi)
+                }
+            } else if (code == KIND_DROWSY) {
+                // Vẫn đang nhắm mắt lâu: nhắc lại theo chu kỳ.
+                playAlertSound(3, nowUi)
+            }
+        }
+        if (chronicRising && registerAlertOccurrence(KIND_CHRONIC, nowUi)) {
+            playAlertSound(3, nowUi)
+        }
+        if (tooCloseRising && registerAlertOccurrence(KIND_TOO_CLOSE, nowUi)) {
+            playAlertSound(2, nowUi)
         }
         lastChronicLevelUi = s.chronicLevel
         lastTooCloseUi = s.tooClose
@@ -2569,6 +3363,40 @@ class MainActivity : ComponentActivity() {
             data[i * 3 + 2] = p.z()
         }
         return Landmarks(data, list.size)
+    }
+
+    /**
+     * Lấy 5 hệ số blendshape: [nháy trái, nháy phải, nheo trái, nheo phải, mở hàm].
+     * Trả về null nếu FaceLandmarker chưa bật setOutputFaceBlendshapes(true) -
+     * khi đó phân tích mắt tự rơi về chế độ hình học.
+     */
+    private fun extractBlend(
+        result: com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
+    ): FloatArray? {
+        return try {
+            val all = result.faceBlendshapes()
+            if (!all.isPresent) return null
+            val list = all.get().firstOrNull() ?: return null
+
+            var blinkL = -1f
+            var blinkR = -1f
+            var squintL = 0f
+            var squintR = 0f
+            var jawOpen = 0f
+            for (c in list) {
+                when (c.categoryName()) {
+                    "eyeBlinkLeft" -> blinkL = c.score()
+                    "eyeBlinkRight" -> blinkR = c.score()
+                    "eyeSquintLeft" -> squintL = c.score()
+                    "eyeSquintRight" -> squintR = c.score()
+                    "jawOpen" -> jawOpen = c.score()
+                }
+            }
+            if (blinkL < 0f || blinkR < 0f) null
+            else floatArrayOf(blinkL, blinkR, squintL, squintR, jawOpen)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun analyzeFrame(imageProxy: ImageProxy) {
@@ -2640,7 +3468,8 @@ class MainActivity : ComponentActivity() {
                 imgW = imgW,
                 imgH = imgH,
                 nowMs = SystemClock.elapsedRealtime(),
-                processingMs = processingMs
+                processingMs = processingMs,
+                blend = extractBlend(result)
             )
 
             runOnUiThread {
@@ -2763,6 +3592,18 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    override fun onStop() {
+        // Lưu phiên đang học khi rời màn hình (chạy trên cameraExecutor để không tranh chấp dữ liệu).
+        if (::cameraExecutor.isInitialized && !cameraExecutor.isShutdown) {
+            try {
+                cameraExecutor.execute { commitHabitSession() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Không lưu được phiên khi dừng", e)
+            }
+        }
+        super.onStop()
+    }
+
     override fun onDestroy() {
         previewView = null
 
@@ -2770,6 +3611,11 @@ class MainActivity : ComponentActivity() {
         cameraProvider = null
 
         if (::cameraExecutor.isInitialized) {
+            try {
+                cameraExecutor.execute { endHabitSession() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Không chốt được phiên học thói quen", e)
+            }
             cameraExecutor.shutdown()
             try {
                 // Chờ khung đang xử lý kết thúc trước khi đóng model.
@@ -2790,5 +3636,928 @@ class MainActivity : ComponentActivity() {
         toneGenerator = null
 
         super.onDestroy()
+    }
+}
+
+// =====================================================================
+// HỒ SƠ THÓI QUEN TỪNG HỌC SINH (gộp chung vào một file)
+// =====================================================================
+
+/**
+ * Cấu hình học thói quen. Muốn thử nhanh khi phát triển: hạ MIN_SESSION_MS xuống 20_000L
+ * và MIN_TOTAL_MS xuống 60_000L.
+ */
+internal object HabitConfig {
+    /** Một phiên chỉ được lưu khi có ít nhất ngần này thời gian "hợp lệ". */
+    const val MIN_SESSION_MS = 3L * 60L * 1000L
+
+    /** Tỉ lệ thời gian thấy khuôn mặt tối thiểu trong phiên. */
+    const val MIN_FACE_RATIO = 0.70f
+
+    /** Tỉ lệ khung hợp lệ / khung thấy mặt tối thiểu. */
+    const val MIN_VALID_RATIO = 0.50f
+
+    /** Chất lượng tín hiệu trung bình tối thiểu (0-100). */
+    const val MIN_QUALITY = 60f
+
+    /** SEI trung bình tối thiểu: thấp hơn nghĩa là phiên không phản ánh việc học bình thường. */
+    const val MIN_SESSION_SEI = 40f
+
+    /** Số phiên đạt chuẩn tối thiểu và tổng thời gian hợp lệ tối thiểu để coi là "đã có hồ sơ". */
+    const val MIN_SESSIONS = 3
+    const val MIN_TOTAL_MS = 15L * 60L * 1000L
+
+    const val MAX_SESSIONS = 40
+    const val MIN_FRAMES_PER_FEATURE = 30
+    const val RECENCY_DECAY = 0.9
+    const val MAX_WEIGHT_MINUTES = 30.0
+}
+
+/** Các đặc trưng được học riêng cho từng học sinh. */
+internal object HabitFeature {
+    const val BPM = 0
+    const val BLINK_MS = 1
+    const val DIST = 2
+    const val YAW = 3
+    const val PITCH = 4
+    const val GAZE_H = 5
+    const val GAZE_V = 6
+    const val MAR = 7
+    const val BFR = 8
+    const val EAR = 9
+    const val PERCLOS = 10
+    const val SEI = 11
+    const val COUNT = 12
+
+    /** Giới hạn cắt (winsorize) từng quan sát để một khung nhiễu không làm lệch hồ sơ. */
+    val LO = floatArrayOf(0f, 40f, 10f, -60f, -60f, -0.5f, -0.6f, 0f, 0.1f, 0f, 0f, 0f)
+    val HI = floatArrayOf(60f, 1000f, 150f, 60f, 60f, 0.5f, 0.6f, 1.2f, 1.5f, 0.6f, 100f, 100f)
+
+    /** Độ rộng tối thiểu để ngưỡng không bị "co" về 0 khi dữ liệu còn ít. */
+    val MIN_SPREAD = floatArrayOf(2f, 20f, 3f, 2f, 2f, 0.02f, 0.03f, 0.02f, 0.01f, 0.01f, 1.5f, 3f)
+}
+
+/** Thống kê chạy (Welford): trung bình và độ lệch chuẩn mà không lưu từng mẫu. */
+internal class RunningStat {
+    var n = 0
+        private set
+    var mean = 0.0
+        private set
+    private var m2 = 0.0
+
+    fun add(x: Double) {
+        n++
+        val d = x - mean
+        mean += d / n
+        m2 += d * (x - mean)
+    }
+
+    fun std(): Double = if (n > 1) sqrt(m2 / n) else 0.0
+}
+
+/** Tóm tắt một phiên học: trung bình, độ lệch chuẩn và số mẫu của từng đặc trưng. */
+internal class SessionSummary(
+    val id: Long,
+    val validMs: Long,
+    val faceRatio: Float,
+    val validRatio: Float,
+    val quality: Float,
+    val mean: FloatArray,
+    val std: FloatArray,
+    val count: IntArray
+) {
+    fun toJson(): JSONObject {
+        val o = JSONObject()
+        o.put("id", id)
+        o.put("validMs", validMs)
+        o.put("fr", faceRatio.toDouble())
+        o.put("vr", validRatio.toDouble())
+        o.put("q", quality.toDouble())
+        o.put("m", mean.toJsonArray())
+        o.put("s", std.toJsonArray())
+        val n = JSONArray()
+        for (c in count) n.put(c)
+        o.put("n", n)
+        return o
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject): SessionSummary? {
+            return try {
+                val c = HabitFeature.COUNT
+                val m = o.getJSONArray("m")
+                val s = o.getJSONArray("s")
+                val n = o.getJSONArray("n")
+                if (m.length() != c || s.length() != c || n.length() != c) return null
+
+                SessionSummary(
+                    id = o.getLong("id"),
+                    validMs = o.getLong("validMs"),
+                    faceRatio = o.getDouble("fr").toFloat(),
+                    validRatio = o.getDouble("vr").toFloat(),
+                    quality = o.getDouble("q").toFloat(),
+                    mean = FloatArray(c) { m.getDouble(it).toFloat() },
+                    std = FloatArray(c) { s.getDouble(it).toFloat() },
+                    count = IntArray(c) { n.getInt(it) }
+                )
+            } catch (e: Exception) {
+                Log.w("HabitProfile", "Bỏ qua phiên lỗi định dạng", e)
+                null
+            }
+        }
+    }
+}
+
+private fun FloatArray.toJsonArray(): JSONArray {
+    val a = JSONArray()
+    for (v in this) a.put(v.toDouble())
+    return a
+}
+
+/**
+ * Bộ tích lũy của phiên đang chạy (chỉ dùng trên cameraExecutor).
+ * Mỗi khung hợp lệ gọi observe(); tick() cộng thời gian.
+ */
+internal class HabitSession(val id: Long) {
+    private val stats = Array(HabitFeature.COUNT) { RunningStat() }
+    private val quality = RunningStat()
+    private var lastTickMs = 0L
+
+    var activeMs = 0L
+        private set
+    var faceMs = 0L
+        private set
+    var validMs = 0L
+        private set
+
+    fun tick(nowMs: Long, faceVisible: Boolean, valid: Boolean) {
+        val dt = if (lastTickMs == 0L) 0L else (nowMs - lastTickMs).coerceIn(0L, 200L)
+        lastTickMs = nowMs
+        activeMs += dt
+        if (faceVisible) faceMs += dt
+        if (valid) validMs += dt
+    }
+
+    fun observe(feature: Int, value: Float) {
+        if (value.isNaN() || value.isInfinite()) return
+        val v = value.coerceIn(HabitFeature.LO[feature], HabitFeature.HI[feature])
+        stats[feature].add(v.toDouble())
+    }
+
+    fun addQuality(q: Float) {
+        quality.add(q.toDouble())
+    }
+
+    fun toSummary(): SessionSummary {
+        val c = HabitFeature.COUNT
+        val mean = FloatArray(c)
+        val std = FloatArray(c)
+        val cnt = IntArray(c)
+        for (f in 0 until c) {
+            cnt[f] = stats[f].n
+            mean[f] = stats[f].mean.toFloat()
+            std[f] = stats[f].std().toFloat()
+        }
+        val faceRatio = if (activeMs > 0L) faceMs.toFloat() / activeMs.toFloat() else 0f
+        val validRatio = if (faceMs > 0L) validMs.toFloat() / faceMs.toFloat() else 0f
+        return SessionSummary(
+            id = id,
+            validMs = validMs,
+            faceRatio = faceRatio,
+            validRatio = validRatio,
+            quality = quality.mean.toFloat(),
+            mean = mean,
+            std = std,
+            count = cnt
+        )
+    }
+}
+
+/** Mức cơ sở đã học: giá trị điển hình + độ dao động tự nhiên của từng đặc trưng. */
+internal class HabitBaseline(
+    private val means: FloatArray,
+    private val spreads: FloatArray,
+    private val ok: BooleanArray
+) {
+    fun mean(f: Int): Float? = if (ok[f]) means[f] else null
+    fun spread(f: Int): Float? = if (ok[f]) spreads[f] else null
+
+    /** |mean| + k * spread, kẹp trong [lo, hi]. Trả về null nếu chưa có dữ liệu. */
+    fun threshold(f: Int, k: Float, lo: Float, hi: Float): Float? {
+        if (!ok[f]) return null
+        return (abs(means[f]) + k * spreads[f]).coerceIn(lo, hi)
+    }
+}
+
+/** Hồ sơ thói quen của một học sinh: danh sách các phiên đạt chuẩn. */
+internal class HabitProfile(val id: String, var name: String) {
+    val sessions = ArrayList<SessionSummary>()
+
+    fun sessionCount(): Int = sessions.size
+
+    fun totalValidMs(): Long {
+        var t = 0L
+        for (s in sessions) t += s.validMs
+        return t
+    }
+
+    fun isReady(): Boolean =
+        sessions.size >= HabitConfig.MIN_SESSIONS &&
+                totalValidMs() >= HabitConfig.MIN_TOTAL_MS
+
+    /** Độ tin cậy 0..1: càng nhiều phiên, ngưỡng cá nhân càng được ưu tiên hơn ngưỡng mặc định. */
+    fun confidence(): Float {
+        if (!isReady()) return 0f
+        return ((sessions.size - 2) / 5f).coerceIn(0.2f, 1f)
+    }
+
+    /** Lý do phiên chưa đủ điều kiện để học (null nếu đạt). */
+    fun ineligibleReason(s: SessionSummary): String? = when {
+        s.validMs < HabitConfig.MIN_SESSION_MS ->
+            "chưa đủ ${HabitConfig.MIN_SESSION_MS / 60000L} phút hợp lệ"
+        s.faceRatio < HabitConfig.MIN_FACE_RATIO ->
+            "ít khi thấy khuôn mặt"
+        s.validRatio < HabitConfig.MIN_VALID_RATIO ->
+            "tín hiệu hoặc tư thế không ổn định, hoặc mất tập trung kéo dài"
+        s.quality < HabitConfig.MIN_QUALITY ->
+            "chất lượng tín hiệu thấp (ánh sáng, khoảng cách)"
+        s.count[HabitFeature.SEI] > 0 && s.mean[HabitFeature.SEI] < HabitConfig.MIN_SESSION_SEI ->
+            "mức tập trung trung bình thấp, không đại diện cho thói quen học"
+        else -> null
+    }
+
+    /**
+     * Thêm hoặc cập nhật phiên (cùng id thì ghi đè, vì phiên được lưu định kỳ).
+     * Phiên không đạt chuẩn sẽ bị gỡ nếu trước đó đã lưu.
+     * Trả về true nếu hồ sơ có thay đổi.
+     */
+    fun commit(s: SessionSummary): Boolean {
+        val pos = sessions.indexOfFirst { it.id == s.id }
+        if (ineligibleReason(s) != null) {
+            if (pos >= 0) {
+                sessions.removeAt(pos)
+                return true
+            }
+            return false
+        }
+        if (pos >= 0) sessions[pos] = s else sessions.add(s)
+        while (sessions.size > HabitConfig.MAX_SESSIONS) sessions.removeAt(0)
+        return true
+    }
+
+    /** Lịch sử các phiên gần nhất kèm xu hướng SEI (dùng cho màn hình và báo cáo). */
+    fun historyText(maxLines: Int): String {
+        if (sessions.isEmpty()) return "Chưa có phiên nào đạt chuẩn."
+
+        val fmt = java.text.SimpleDateFormat("dd/MM HH:mm", Locale.US)
+        val sb = StringBuilder()
+        val from = max(0, sessions.size - maxLines)
+        for (i in sessions.size - 1 downTo from) {
+            val s = sessions[i]
+            sb.append(fmt.format(java.util.Date(s.id)))
+            sb.append(" - ").append(s.validMs / 60000L).append(" phút hợp lệ")
+            if (s.count[HabitFeature.SEI] > 0) {
+                sb.append(", SEI TB ").append(s.mean[HabitFeature.SEI].roundToInt())
+            }
+            if (s.count[HabitFeature.BPM] > 0) {
+                sb.append(", chớp ").append(s.mean[HabitFeature.BPM].roundToInt()).append("/phút")
+            }
+            sb.append('\n')
+        }
+
+        if (sessions.size >= 4) {
+            val recent = avgSei(sessions.size - 3, sessions.size)
+            val previous = avgSei(max(0, sessions.size - 6), sessions.size - 3)
+            if (recent != null && previous != null) {
+                val diff = recent - previous
+                val word = when {
+                    diff >= 5f -> "đang tăng"
+                    diff <= -5f -> "đang giảm"
+                    else -> "ổn định"
+                }
+                sb.append(String.format(Locale.US, "Xu hướng SEI: %s (%+.0f so với các phiên trước)", word, diff))
+            }
+        }
+        return sb.toString().trimEnd()
+    }
+
+    private fun avgSei(fromIdx: Int, toIdx: Int): Float? {
+        var sum = 0f
+        var n = 0
+        for (i in fromIdx until toIdx) {
+            val s = sessions[i]
+            if (s.count[HabitFeature.SEI] > 0) {
+                sum += s.mean[HabitFeature.SEI]
+                n++
+            }
+        }
+        return if (n > 0) sum / n else null
+    }
+
+    /**
+     * Mức cơ sở: trung bình có trọng số (phiên dài hơn và gần đây hơn nặng hơn),
+     * loại phiên ngoại lai (MAD) khi đã có từ 5 phiên.
+     * spread = căn(phương sai giữa các phiên + phương sai trong phiên).
+     */
+    fun baseline(): HabitBaseline {
+        val c = HabitFeature.COUNT
+        val means = FloatArray(c)
+        val spreads = FloatArray(c)
+        val ok = BooleanArray(c)
+        val n = sessions.size
+
+        for (f in 0 until c) {
+            val minCount = if (f == HabitFeature.EAR) 1 else HabitConfig.MIN_FRAMES_PER_FEATURE
+            val idx = ArrayList<Int>()
+            for (i in 0 until n) {
+                if (sessions[i].count[f] >= minCount) idx.add(i)
+            }
+            if (idx.isEmpty()) continue
+
+            var keep: List<Int> = idx
+            if (idx.size >= 5) {
+                val vals = idx.map { sessions[it].mean[f] }.sorted()
+                val med = vals[vals.size / 2]
+                val dev = idx.map { abs(sessions[it].mean[f] - med) }.sorted()
+                val mad = max(dev[dev.size / 2], HabitFeature.MIN_SPREAD[f] * 0.5f)
+                val limit = 3.5f * 1.4826f * mad
+                val filtered = idx.filter { abs(sessions[it].mean[f] - med) <= limit }
+                if (filtered.size >= 3) keep = filtered
+            }
+
+            val w = DoubleArray(keep.size)
+            var sumW = 0.0
+            var sumM = 0.0
+            for ((j, i) in keep.withIndex()) {
+                val s = sessions[i]
+                val age = n - 1 - i
+                val minutes = min(s.validMs / 60000.0, HabitConfig.MAX_WEIGHT_MINUTES)
+                w[j] = max(minutes, 0.5) * HabitConfig.RECENCY_DECAY.pow(age)
+                sumW += w[j]
+                sumM += w[j] * s.mean[f]
+            }
+            val mean = sumM / sumW
+
+            var between = 0.0
+            var within = 0.0
+            for ((j, i) in keep.withIndex()) {
+                val s = sessions[i]
+                val d = s.mean[f] - mean
+                between += w[j] * d * d
+                within += w[j] * s.std[f] * s.std[f]
+            }
+            val spread = sqrt(between / sumW + within / sumW).toFloat()
+
+            means[f] = mean.toFloat()
+            spreads[f] = max(spread, HabitFeature.MIN_SPREAD[f])
+            ok[f] = true
+        }
+        return HabitBaseline(means, spreads, ok)
+    }
+}
+
+internal data class HabitStudent(val id: String, val name: String)
+
+/**
+ * Quản lý danh sách học sinh (SharedPreferences) và lưu hồ sơ từng em ra file JSON
+ * trong bộ nhớ riêng của ứng dụng. Không gửi dữ liệu ra ngoài.
+ */
+internal class HabitStore(private val context: Context) {
+
+    private val prefs = context.getSharedPreferences("focus_habit_prefs", Context.MODE_PRIVATE)
+
+    private companion object {
+        const val TAG = "HabitStore"
+        const val KEY_STUDENTS = "students"
+        const val KEY_CURRENT = "current_student"
+    }
+
+    fun students(): List<HabitStudent> {
+        val out = ArrayList<HabitStudent>()
+        val raw = prefs.getString(KEY_STUDENTS, null)
+        if (raw != null) {
+            try {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    out.add(HabitStudent(o.getString("id"), o.getString("name")))
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Danh sách học sinh lỗi, tạo lại", e)
+                out.clear()
+            }
+        }
+        if (out.isEmpty()) {
+            out.add(HabitStudent("hs1", "Học sinh 1"))
+            persist(out)
+        }
+        return out
+    }
+
+    private fun persist(list: List<HabitStudent>) {
+        val arr = JSONArray()
+        for (s in list) {
+            val o = JSONObject()
+            o.put("id", s.id)
+            o.put("name", s.name)
+            arr.put(o)
+        }
+        prefs.edit().putString(KEY_STUDENTS, arr.toString()).apply()
+    }
+
+    fun currentId(): String {
+        val list = students()
+        val cur = prefs.getString(KEY_CURRENT, null)
+        return list.firstOrNull { it.id == cur }?.id ?: list[0].id
+    }
+
+    fun setCurrent(id: String) {
+        prefs.edit().putString(KEY_CURRENT, id).apply()
+    }
+
+    fun nameOf(id: String): String = students().firstOrNull { it.id == id }?.name ?: id
+
+    fun addStudent(name: String): HabitStudent {
+        val list = students().toMutableList()
+        val clean = name.trim().take(24).ifEmpty { "Học sinh ${list.size + 1}" }
+        val st = HabitStudent("hs" + System.currentTimeMillis(), clean)
+        list.add(st)
+        persist(list)
+        return st
+    }
+
+    private fun file(id: String): File = File(context.filesDir, "habit_$id.json")
+
+    fun load(id: String): HabitProfile {
+        val profile = HabitProfile(id, nameOf(id))
+        val f = file(id)
+        if (!f.exists()) return profile
+        try {
+            val root = JSONObject(f.readText())
+            val arr = root.optJSONArray("sessions") ?: return profile
+            for (i in 0 until arr.length()) {
+                SessionSummary.fromJson(arr.getJSONObject(i))?.let { profile.sessions.add(it) }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Không đọc được hồ sơ $id, bắt đầu hồ sơ mới", e)
+            profile.sessions.clear()
+        }
+        return profile
+    }
+
+    fun save(p: HabitProfile) {
+        try {
+            val root = JSONObject()
+            root.put("id", p.id)
+            root.put("name", p.name)
+            val arr = JSONArray()
+            for (s in p.sessions) arr.put(s.toJson())
+            root.put("sessions", arr)
+
+            val f = file(p.id)
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(root.toString())
+            if (!tmp.renameTo(f)) {
+                f.writeText(root.toString())
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Không lưu được hồ sơ ${p.id}", e)
+        }
+    }
+
+    fun clear(id: String) {
+        try {
+            file(id).delete()
+        } catch (e: Exception) {
+            Log.w(TAG, "Không xóa được hồ sơ $id", e)
+        }
+    }
+}
+
+
+// =====================================================================
+// CÔNG CỤ PHÂN TÍCH MẮT NÂNG CAO (kính, góc chéo, nheo mắt, lệch hai mắt)
+// =====================================================================
+
+/** Kết quả phân tích mắt của một khung hình (đối tượng tái sử dụng, chỉ đọc trên cameraExecutor). */
+private class EyeFrame {
+    var valid = false
+    var openness = 1f
+    var closed = false
+    var closedStartMs = 0L
+    var blinkDurationMs = 0L
+    var blinkIncomplete = false
+    var noisy = false
+    var sigma = 0f
+    var squintPct = 0f
+    var asymPct = 0f
+    var incompleteRatio = Float.NaN
+    var squintAlert = false
+    var asymAlert = false
+    var incompleteAlert = false
+    var usingBlendshapes = false
+}
+
+/**
+ * Độ mở mắt hợp nhất, bền với kính và góc nhìn chéo.
+ *
+ * 1. Hình học: EAR 5 cặp điểm mí (trung bình cắt tỉa, bỏ điểm cao nhất/thấp nhất để loại điểm bị chói kính),
+ *    chuẩn hóa theo đường cơ sở từng mắt, bù co ngắn do quay đầu (cos yaw) và mí hạ khi nhìn xuống.
+ * 2. Blendshape (nếu có): mô hình học sâu của MediaPipe, ít bị ảnh hưởng bởi kính và góc nghiêng.
+ * 3. Hợp nhất có kiểm tra bất đồng, lọc One Euro, ngưỡng đóng/mở tự thích nghi theo mức nhiễu.
+ * 4. Máy trạng thái chớp mắt theo thời gian thực (không phụ thuộc FPS), có trễ hai ngưỡng.
+ * 5. Chỉ số khó chịu: nheo mắt kéo dài, hai mắt mở không đều, chớp không hoàn toàn.
+ */
+private class EyeEngine {
+
+    private companion object {
+        val R_UP = intArrayOf(161, 160, 159, 158, 157)
+        val R_LOW = intArrayOf(163, 144, 145, 153, 154)
+        val L_UP = intArrayOf(388, 387, 386, 385, 384)
+        val L_LOW = intArrayOf(390, 373, 374, 380, 381)
+        const val R_OUT = 33
+        const val R_IN = 133
+        const val L_IN = 362
+        const val L_OUT = 263
+
+        const val CLOSE_O = 0.60f
+        const val OPEN_O = 0.78f
+        const val MIN_CLOSE_DWELL_MS = 40L
+        const val MIN_BLINK_MS = 25L
+        const val MAX_BLINK_MS = 1_000L
+        const val INCOMPLETE_MIN_O = 0.45f
+        const val INCOMPLETE_MAX_DT_MS = 55f
+        const val ASYM_EXTRA_THRESHOLD = 0.25f
+        const val PARTIAL_LO = 0.45f
+        const val PARTIAL_HI = 0.80f
+        const val DEG2RAD = 0.017453292f
+        const val NOISY_ON = 0.12f
+        const val NOISY_OFF = 0.09f
+        const val NOISY_HOLD_MS = 10_000L
+        const val SQUINT_ALERT_PCT = 40f
+        const val ASYM_ALERT_PCT = 50f
+        const val INCOMPLETE_ALERT_RATIO = 0.6f
+        const val RING = 20
+    }
+
+    val out = EyeFrame()
+
+    /** Độ nhạy: 0 thấp (chỉ nhận chớp sâu), 1 vừa, 2 cao (nhận cả chớp nông). */
+    fun setSensitivity(level: Int) {
+        closeO = when (level) {
+            0 -> 0.54f
+            2 -> 0.66f
+            else -> CLOSE_O
+        }
+        openO = closeO + 0.18f
+    }
+
+    private val tmp = FloatArray(5)
+    private val openFilter = OneEuroFilter(4.0f, 1.0f)
+    private val squintRatio = WindowRatio(60, 20_000L)
+    private val asymRatio = WindowRatio(60, 30_000L)
+
+    // Hiệu chuẩn
+    private val calE1 = ArrayList<Float>()
+    private val calE2 = ArrayList<Float>()
+    private val calBs = ArrayList<Float>()
+    private val calAsym = ArrayList<Float>()
+    private var ready = false
+    private var calBase1 = 0.3f
+    private var calBase2 = 0.3f
+    private var base1 = 0.3f
+    private var base2 = 0.3f
+    private var bsBase = 0.08f
+    private var bsAsymBase = 0f
+    private var closeO = CLOSE_O
+    private var openO = OPEN_O
+
+    // Trạng thái chớp mắt
+    private var closed = false
+    private var candStart = 0L
+    private var candMin = 1f
+    private var closedStart = 0L
+    private var minDuring = 1f
+
+    // Nhiễu và lọc khung lỗi
+    private var sigma = 0.03f
+    private var noisyStart = 0L
+    private var prevWr = 0f
+    private var prevWl = 0f
+    private var glitchStreak = 0
+    private var lastUpdateMs = 0L
+    private var dtEma = 33f
+
+    // Chớp không hoàn toàn
+    private val ring = BooleanArray(RING)
+    private var ringIdx = 0
+    private var ringCount = 0
+
+    private fun d(lm: Landmarks, a: Int, b: Int, w: Int, h: Int): Float {
+        val dx = (lm.x(a) - lm.x(b)) * w
+        val dy = (lm.y(a) - lm.y(b)) * h
+        return sqrt(dx * dx + dy * dy)
+    }
+
+    /** EAR 5 cặp điểm, trung bình cắt tỉa. Trả về NaN nếu hình học không hợp lệ. */
+    private fun ear5(
+        lm: Landmarks,
+        up: IntArray,
+        low: IntArray,
+        a: Int,
+        b: Int,
+        w: Int,
+        h: Int
+    ): Float {
+        var sum = 0f
+        var mn = Float.MAX_VALUE
+        var mx = -Float.MAX_VALUE
+        for (i in 0 until 5) {
+            val v = d(lm, up[i], low[i], w, h)
+            tmp[i] = v
+            sum += v
+            if (v < mn) mn = v
+            if (v > mx) mx = v
+        }
+        val hor = d(lm, a, b, w, h)
+        if (hor < 1f) return Float.NaN
+        return ((sum - mn - mx) / 3f) / hor
+    }
+
+    private fun percentile(list: List<Float>, p: Float): Float {
+        val s = list.sorted()
+        return s[((s.size - 1) * p).toInt().coerceIn(0, s.size - 1)]
+    }
+
+    fun reset() {
+        calE1.clear()
+        calE2.clear()
+        calBs.clear()
+        calAsym.clear()
+        ready = false
+        sigma = 0.03f
+        noisyStart = 0L
+        ringIdx = 0
+        ringCount = 0
+        squintRatio.reset()
+        asymRatio.reset()
+        pause()
+    }
+
+    /** Mất khuôn mặt hoặc khởi động lại luồng: xóa trạng thái tức thời, giữ hiệu chuẩn. */
+    fun pause() {
+        closed = false
+        candStart = 0L
+        openFilter.reset()
+        squintRatio.pause()
+        asymRatio.pause()
+        prevWr = 0f
+        prevWl = 0f
+        glitchStreak = 0
+        lastUpdateMs = 0L
+        out.valid = false
+        out.closed = false
+    }
+
+    fun addCalibrationSample(lm: Landmarks, w: Int, h: Int, bs: FloatArray?) {
+        val e1 = ear5(lm, R_UP, R_LOW, R_OUT, R_IN, w, h)
+        val e2 = ear5(lm, L_UP, L_LOW, L_IN, L_OUT, w, h)
+        if (e1.isNaN() || e2.isNaN()) return
+        calE1.add(e1)
+        calE2.add(e2)
+        if (bs != null) {
+            calBs.add((bs[0] + bs[1]) / 2f)
+            calAsym.add(abs(bs[0] - bs[1]))
+        }
+    }
+
+    /**
+     * Chốt đường cơ sở: lấy phân vị 70 (loại các khung chớp mắt/nheo lọt vào lúc hiệu chuẩn).
+     * scale là hệ số trộn với giá trị đã học trong hồ sơ thói quen.
+     */
+    fun finishCalibration(scale: Float) {
+        if (calE1.size < 5) {
+            ready = false
+            return
+        }
+        calBase1 = percentile(calE1, 0.70f) * scale
+        calBase2 = percentile(calE2, 0.70f) * scale
+        base1 = calBase1
+        base2 = calBase2
+        bsBase = if (calBs.size >= 5) percentile(calBs, 0.5f).coerceIn(0f, 0.5f) else 0.08f
+        // Mắt hai bên vốn không đối xứng hoàn toàn: chỉ coi là lệch khi vượt mức lệch tự nhiên đã đo lúc hiệu chuẩn.
+        bsAsymBase = if (calAsym.size >= 5) percentile(calAsym, 0.5f).coerceIn(0f, 0.3f) else 0f
+        ready = true
+        sigma = 0.03f
+        noisyStart = 0L
+        ringIdx = 0
+        ringCount = 0
+        squintRatio.reset()
+        asymRatio.reset()
+        pause()
+    }
+
+    private fun recordBlink(incomplete: Boolean) {
+        ring[ringIdx] = incomplete
+        ringIdx = (ringIdx + 1) % RING
+        if (ringCount < RING) ringCount++
+    }
+
+    private fun incompleteRatio(): Float {
+        if (ringCount < 8) return Float.NaN
+        var n = 0
+        for (i in 0 until ringCount) if (ring[i]) n++
+        return n.toFloat() / ringCount.toFloat()
+    }
+
+    fun update(
+        lm: Landmarks,
+        w: Int,
+        h: Int,
+        nowMs: Long,
+        yawDev: Float,
+        pitchDev: Float,
+        gazeVDev: Float,
+        bs: FloatArray?,
+        poseOk: Boolean
+    ): EyeFrame {
+        val o = out
+        o.blinkDurationMs = 0L
+        o.blinkIncomplete = false
+        o.usingBlendshapes = bs != null
+
+        if (!ready) {
+            o.valid = false
+            o.closed = false
+            return o
+        }
+
+        val e1 = ear5(lm, R_UP, R_LOW, R_OUT, R_IN, w, h)
+        val e2 = ear5(lm, L_UP, L_LOW, L_IN, L_OUT, w, h)
+        val wr = d(lm, R_OUT, R_IN, w, h)
+        val wl = d(lm, L_IN, L_OUT, w, h)
+
+        if (lastUpdateMs != 0L) {
+            val dtFrame = (nowMs - lastUpdateMs).toFloat()
+            if (dtFrame in 1f..300f) dtEma = dtEma * 0.95f + dtFrame * 0.05f
+        }
+        lastUpdateMs = nowMs
+
+        // 1) Loại khung landmark "nhảy" bất thường (thường do chói kính hoặc mất dấu một khung).
+        var glitch = e1.isNaN() || e2.isNaN()
+        if (!glitch && prevWr > 0f && prevWl > 0f) {
+            val rr = wr / prevWr
+            val rl = wl / prevWl
+            if (rr > 1.3f || rr < 0.77f || rl > 1.3f || rl < 0.77f) glitch = true
+        }
+        if (glitch) {
+            glitchStreak++
+            if (glitchStreak > 8) {
+                // Hình học mới ổn định lâu hơn 8 khung: chấp nhận làm mốc mới.
+                prevWr = 0f
+                prevWl = 0f
+                glitchStreak = 0
+            }
+            o.valid = false
+            o.closed = closed
+            return o
+        }
+        glitchStreak = 0
+        prevWr = wr
+        prevWl = wl
+
+        // 2) Góc quá nghiêng hoặc tín hiệu kém: không kết luận trạng thái mắt.
+        if (!poseOk) {
+            closed = false
+            candStart = 0L
+            openFilter.reset()
+            o.valid = false
+            o.closed = false
+            return o
+        }
+
+        // 3) Độ mở hình học đã bù: co ngắn khi quay đầu và mí hạ khi nhìn xuống.
+        val cosY = cos(min(abs(yawDev), 50f) * 0.9f * DEG2RAD)
+        val down = max(pitchDev, 0f) * 0.006f + max(gazeVDev, 0f) * 0.5f
+        val expected = (1f - down).coerceIn(0.7f, 1f)
+        val c1 = e1 * cosY / expected
+        val c2 = e2 * cosY / expected
+        val og1 = (c1 / base1).coerceIn(0f, 1.5f)
+        val og2 = (c2 / base2).coerceIn(0f, 1.5f)
+        val og = (og1 + og2) / 2f
+
+        // 4) Blendshape (nếu có) và hợp nhất có kiểm tra bất đồng giữa hai nguồn.
+        var fused = og
+        var squintBs = 0f
+        var asymBs = 0f
+        if (bs != null) {
+            val blink = (bs[0] + bs[1]) / 2f
+            val ob = (1f - (blink - bsBase) / (1f - bsBase).coerceAtLeast(0.5f)).coerceIn(0f, 1.3f)
+            fused = if (abs(og - ob) > 0.45f) {
+                // Hai nguồn lệch mạnh: hình học thường bị chói kính làm sai, tin blendshape hơn.
+                0.8f * ob + 0.2f * og
+            } else {
+                0.65f * ob + 0.35f * og
+            }
+            squintBs = (bs[2] + bs[3]) / 2f
+            asymBs = abs(bs[0] - bs[1]) - bsAsymBase
+        }
+
+        // 5) Lọc thời gian và ước lượng nhiễu khi mắt đang mở ổn định.
+        val f = openFilter.filter(fused, nowMs)
+        if (!closed && f > 0.85f) {
+            sigma = sigma * 0.98f + abs(fused - f) * 1.25f * 0.02f
+        }
+        sigma = sigma.coerceIn(0f, 0.3f)
+
+        if (sigma > NOISY_ON) {
+            if (noisyStart == 0L) noisyStart = nowMs
+        } else if (sigma < NOISY_OFF) {
+            noisyStart = 0L
+        }
+        val noisy = noisyStart != 0L && nowMs - noisyStart >= NOISY_HOLD_MS
+
+        // 6) Ngưỡng đóng/mở tự thích nghi: càng nhiễu (kính, chói) càng khắt khe để tránh chớp giả.
+        val closeThr = (closeO - 1.5f * sigma).coerceIn(0.40f, closeO)
+        val openThr = max(closeThr + 0.12f, openO - sigma).coerceAtMost(0.88f)
+
+        // 7) Máy trạng thái chớp mắt theo thời gian thực.
+        if (!closed) {
+            if (f < closeThr) {
+                if (candStart == 0L) {
+                    candStart = nowMs
+                    candMin = f
+                }
+                candMin = min(candMin, f)
+                val dwell = nowMs - candStart
+                // Đóng chắc chắn nếu đủ lâu, hoặc đóng rất sâu (bắt được cú chớp 1 khung khi FPS thấp).
+                if (dwell >= MIN_CLOSE_DWELL_MS || f < closeThr - 0.15f) {
+                    closed = true
+                    closedStart = candStart
+                    minDuring = candMin
+                }
+            } else {
+                candStart = 0L
+            }
+        } else {
+            minDuring = min(minDuring, f)
+            if (f > openThr) {
+                val dur = nowMs - closedStart
+                if (dur in MIN_BLINK_MS..MAX_BLINK_MS) {
+                    o.blinkDurationMs = dur
+                    // FPS thấp (>55 ms/khung) có thể bỏ lỡ đáy của cú chớp: không kết luận "không hoàn toàn".
+                    if (dtEma <= INCOMPLETE_MAX_DT_MS) {
+                        o.blinkIncomplete = minDuring > INCOMPLETE_MIN_O
+                        recordBlink(o.blinkIncomplete)
+                    }
+                }
+                closed = false
+                candStart = 0L
+            }
+        }
+
+        // 8) Chỉ số khó chịu: nheo mắt kéo dài, hai mắt mở không đều.
+        var partial = !closed && f >= PARTIAL_LO && f < PARTIAL_HI
+        if (!partial && !closed && squintBs > 0.45f && f < 0.9f) partial = true
+        squintRatio.record(nowMs, partial)
+
+        val frontal = abs(yawDev) < 15f
+        val asymFlag = if (bs != null) asymBs > ASYM_EXTRA_THRESHOLD else abs(og1 - og2) > 0.35f
+        asymRatio.record(nowMs, frontal && !closed && f > 0.35f && asymFlag)
+
+        val sq = squintRatio.percent(nowMs)
+        val asym = asymRatio.percent(nowMs)
+        val inc = incompleteRatio()
+
+        // 9) Đường cơ sở theo dõi chậm: bám theo ánh sáng/kính thay đổi nhưng không "trôi" theo mệt mỏi.
+        if (f > 0.8f && !closed) {
+            if (c1 > base1) {
+                if (c1 < base1 * 1.35f) base1 += 0.02f * (c1 - base1)
+            } else if (c1 > base1 * 0.85f) {
+                base1 -= 0.0004f * (base1 - c1)
+            }
+            if (c2 > base2) {
+                if (c2 < base2 * 1.35f) base2 += 0.02f * (c2 - base2)
+            } else if (c2 > base2 * 0.85f) {
+                base2 -= 0.0004f * (base2 - c2)
+            }
+            base1 = base1.coerceIn(calBase1 * 0.85f, calBase1 * 1.25f)
+            base2 = base2.coerceIn(calBase2 * 0.85f, calBase2 * 1.25f)
+        }
+
+        o.valid = true
+        o.openness = f
+        o.closed = closed
+        o.closedStartMs = closedStart
+        o.sigma = sigma
+        o.noisy = noisy
+        o.squintPct = sq
+        o.asymPct = asym
+        o.incompleteRatio = inc
+        o.squintAlert = sq >= SQUINT_ALERT_PCT
+        o.asymAlert = asym >= ASYM_ALERT_PCT
+        o.incompleteAlert = !inc.isNaN() && inc >= INCOMPLETE_ALERT_RATIO
+        return o
     }
 }
