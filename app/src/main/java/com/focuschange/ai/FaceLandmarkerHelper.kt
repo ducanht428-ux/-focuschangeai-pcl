@@ -16,6 +16,7 @@ class FaceLandmarkerHelper(private val context: Context) {
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.VIDEO)
             .setNumFaces(1)
+            .setOutputFaceBlendshapes(true)
             .build()
 
         return FaceLandmarker.createFromOptions(context, options)
