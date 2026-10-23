@@ -805,7 +805,7 @@ internal class ImageEnhancer {
         buildAxis(rw, tilesX, colI0, colI1, colW, colT)
         buildAxis(rh, tilesY, rowI0, rowI1, rowW, rowT)
 
-        // 1) Histogram từng ô
+        // 1) Per-tile histogram
         for (row in 0 until rh) {
             val tRow = rowT[row] * tilesX
             var idx = (ry0 + row) * rowStride + rx0 * pixelStride
@@ -815,7 +815,8 @@ internal class ImageEnhancer {
             }
         }
 
-        // 2) Cắt ngưỡng, phân phối lại phần dư (đều + rải theo bước như OpenCV), rồi tạo bảng tra từ CDF
+        // 2) Clip to the threshold, redistribute the remainder (evenly, then spread in steps like
+        // OpenCV), then build the lookup table from the CDF
         for (t in 0 until nT) {
             val off = t * 256
             var total = 0
@@ -857,7 +858,8 @@ internal class ImageEnhancer {
             }
         }
 
-        // 3) Nội suy song tuyến giữa bảng tra của 4 ô lân cận (số nguyên, thang 256 x 256)
+        // 3) Bilinear interpolation between the lookup tables of the 4 neighbouring tiles
+        // (integer arithmetic on a 256 x 256 scale)
         for (row in 0 until rh) {
             val r0 = rowI0[row] * tilesX
             val r1 = rowI1[row] * tilesX
@@ -879,7 +881,7 @@ internal class ImageEnhancer {
         }
     }
 
-    /** Lọc Gaussian 3x3 (nhân [1 2 1] tách trục, biên lặp lại) trên một vùng của mặt phẳng Y. */
+    /** 3x3 Gaussian filter ([1 2 1] applied per axis, repeating edges) over a region of the Y plane. */
     private fun blur3(
         y: ByteArray,
         rowStride: Int,

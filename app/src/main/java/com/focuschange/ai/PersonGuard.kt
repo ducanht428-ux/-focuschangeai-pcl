@@ -3,30 +3,37 @@ package com.focuschange.ai
 import kotlin.math.abs
 
 /**
- * Cảnh báo "người đang ngồi không khớp hồ sơ đã chọn" mà KHÔNG nhận dạng khuôn mặt.
+ * Warns that "the person sitting here does not match the selected profile" WITHOUT recognizing
+ * any face.
  *
- * Ứng dụng chỉ có `face_landmarker.task` (478 điểm hình học), không có model nhận dạng, nên nó
- * không thể trả lời "đây là ai". Nó trả lời được câu yếu hơn nhưng thật: "khuôn mặt đang ngồi
- * RỘNG hơn hay hẹp hơn khuôn mặt đã hiệu chuẩn bao nhiêu phần trăm".
+ * The app only ships `face_landmarker.task` (478 geometric landmarks) and has no recognition
+ * model, so it cannot answer "who is this". It can answer the weaker but real question: "is the
+ * face currently sitting here WIDER or NARROWER than the face that was calibrated, by how many
+ * percent".
  *
- * Đại lượng so sánh là **khoảng cách thô chưa nhân hệ số** (`rawUnscaled` của
- * `estimateDistanceCm`) lấy trung vị trong 30 khung, đối chiếu với giá trị đã lưu lúc hiệu chuẩn.
- * `rawUnscaled = W_gia_dinh * tieu_cua / be_rong_khoe_mat_px`, nên với cùng một máy quay thì số đó
- * chỉ còn phụ thuộc bề rộng mặt thật của người ngồi — lệch bao nhiêu phần trăm là mặt rộng/hẹp ra
- * bấy nhiêu. Dùng số này thay vì tự lưu bề rộng pixel vì nó đã được bù phối cảnh theo góc quay đầu
- * ở trong `estimateDistanceCm`; một em ngồi nghiêng đầu vĩnh viễn sẽ bị nghi "đổi người" nếu so
- * pixel thô.
+ * The comparison quantity is the **raw distance before the scale factor** (`rawUnscaled` of
+ * `estimateDistanceCm`), taken as a median over 30 frames and checked against the value stored at
+ * calibration time.
+ * `rawUnscaled = assumedW * focal / faceWidthInPx`, so for one and the same camera only the real
+ * face width of the person sitting there still moves that number - however many percent it
+ * shifts, that is how much wider or narrower the face is. This quantity is used instead of
+ * storing raw pixel widths ourselves because `estimateDistanceCm` already compensates it for
+ * perspective using the head yaw; a student who always sits with a tilted head would be flagged
+ * as "different person" if raw pixels were compared.
  *
- * **Hai giới hạn phải nói thẳng, kể cả trước giám khảo:**
- * 1. Ước lượng khoảng cách và chữ ký này là CÙNG một nguồn thông tin, nên chốt chặn chỉ so sánh
- *    được khi người ngồi ở đúng vị trí tham chiếu. Cửa sổ bật khi khoảng cách ĐÃ quy đổi rơi vào
- *    [distanceLoCm, distanceHiCm]; ngoài băng đó coi như chưa đo. Hệ quả: một người có khuôn mặt
- *    rất khác nhưng ngồi xa/gần hơn 20-25 cm có thể lọt qua.
- * 2. Tiêu cự thuộc về chiếc điện thoại, không thuộc về hồ sơ. Đổi máy thì cả hệ số lẫn chữ ký đều
- *    phải hiệu chuẩn lại — giống hệt hành vi cũ của pref `distance_scale_v2`.
+ * **Two limits that must be stated out loud, including in front of the judges:**
+ * 1. The distance estimate and this signature come from the SAME information source, so the guard
+ *    can only compare when the person sits at the reference position. The window opens when the
+ *    CONVERTED distance falls inside [distanceLoCm, distanceHiCm]; outside that band it counts as
+ *    not measured. Consequence: a person whose face is very different but who sits 20-25 cm
+ *    further away or closer can slip through.
+ * 2. The focal length belongs to the phone, not to the profile. Switch devices and both the scale
+ *    factor and the signature have to be calibrated again - exactly like the old behaviour of the
+ *    `distance_scale_v2` preference.
  *
- * Cờ này không phát ra cảnh báo âm và không đi vào chuỗi cảnh báo: chọn sai hồ sơ là lỗi vận hành,
- * đưa vào máy đếm cảnh báo sẽ làm bẩn số liệu nghiên cứu.
+ * This flag never raises an audible alert and never enters the alert chain: picking the wrong
+ * profile is an operator error, and feeding it into the alert counter would dirty the research
+ * numbers.
  */
 internal class PersonGuard(
     private val tolerance: Float = WIDTH_TOLERANCE,
@@ -39,18 +46,20 @@ internal class PersonGuard(
 
     companion object {
         /**
-         * 12% chọn theo hai đầu: nhiễu điểm mốc của cặp khóe mắt ở 640x480/50 cm chỉ ~1,6% (con số
-         * đó ghi trong comment của `estimateDistanceCm`), còn khoảng hai khóe mắt giữa hai người
-         * trưởng thành chênh cỡ 5-8%. 12% vì vậy nằm trên nhiễu nhưng DƯỚI mức chênh của nhiều cặp
-         * người thật — chốt chặn này bỏ sót người chỉ hơi khác khuôn mặt, nó không phải máy phân biệt
-         * mọi người. Cả 1,6% lẫn 5-8% đều chưa được đo lại trên dữ liệu của chính dự án.
+         * 12% was picked from both ends: landmark noise of the eye-corner pair at 640x480/50 cm is
+         * only ~1.6% (that figure is recorded in the comment of `estimateDistanceCm`), while the
+         * eye-corner distance of two adults differs by roughly 5-8%. 12% therefore sits above the
+         * noise but BELOW the gap of many real person pairs - so this guard misses people whose
+         * faces only slightly differ; it is not a device that separates every person. Neither the
+         * 1.6% nor the 5-8% has been re-measured on this project's own data.
          */
         const val WIDTH_TOLERANCE = 0.12f
         const val HOLD_MS = 10_000L
 
         /**
-         * Băng "đang ngồi đúng chỗ": 40-62 cm quanh khoảng cách tham chiếu 50 cm.
-         * Rộng hơn ±10% cố ý, vì lệch vị trí và lệch bề rộng mặt cùng chiều đi vào một con số.
+         * The "sitting in the right place" band: 40-62 cm around the 50 cm reference distance.
+         * Deliberately wider than +/-10%, because a position shift and a face-width shift enter the
+         * same number in the same direction.
          */
         const val DIST_LO_CM = 40f
         const val DIST_HI_CM = 62f
@@ -58,13 +67,14 @@ internal class PersonGuard(
         const val WINDOW_SIZE = 30
 
         /**
-         * Lệch hệ số hiệu chuẩn trên 20% thì gần như chắc chắn là người khác: hiệu chuẩn diễn ra ở
-         * khoảng cách tham chiếu ĐÃ BIẾT, nên `scale = REF / trung vị khoảng cách thô` chỉ còn một
-         * biến số là bề rộng mặt thật của người ngồi. Đây là trigger đáng tin hơn phép thử liên tục.
+         * A calibration factor deviating by more than 20% is almost certainly a different person:
+         * calibration happens at a KNOWN reference distance, so `scale = REF / median raw distance`
+         * is left with a single variable - the real face width of whoever is sitting there. This is
+         * a more trustworthy trigger than the continuous test.
          */
         const val CALIBRATION_REJECT_RATIO = 0.20f
 
-        /** Tỷ lệ lệch của hệ số mới so với hệ số đã lưu, NaN nếu một trong hai vô hiệu. */
+        /** Relative deviation of the new factor against the stored one, NaN if either is invalid. */
         fun calibrationDeviation(newScale: Float, storedScale: Float): Float {
             if (!newScale.isFinite() || !storedScale.isFinite() || storedScale <= 0f) return Float.NaN
             return (newScale - storedScale) / storedScale
@@ -74,11 +84,11 @@ internal class PersonGuard(
     private val raws = ArrayDeque<Float>()
     private var suspectSinceMs = 0L
 
-    /** Độ lệch tương đối của lần đánh giá gần nhất, NaN khi khung này không đủ điều kiện so. */
+    /** Relative deviation of the most recent evaluation; NaN when this frame is not fit to compare. */
     var deviation: Float = Float.NaN
         private set
 
-    /** Số mẫu đang giữ trong cửa sổ — HUD in ra để người vận hành biết chưa đủ dữ liệu. */
+    /** Samples currently held in the window - printed in the HUD so the operator knows data is thin. */
     fun sampleCount(): Int = raws.size
 
     fun reset() {
@@ -88,11 +98,12 @@ internal class PersonGuard(
     }
 
     /**
-     * Trả về true nếu nghi đã đổi người và nghi ngờ đó kéo đủ [holdMs].
+     * Returns true when a person change is suspected AND that suspicion has lasted [holdMs].
      *
-     * `referenceRawCm` lấy từ hồ sơ đang chọn; null nghĩa là hồ sơ chưa hiệu chuẩn thì chưa có gì
-     * để so, không được phép suy ra "đổi người". Mỗi khung ngoài băng khoảng cách xóa đồng hồ giữ
-     * cờ: một em đứng dậy rồi ngồi lại không phải bằng chứng mới.
+     * `referenceRawCm` comes from the selected profile; null means the profile has not been
+     * calibrated, so there is nothing to compare against and "different person" must not be
+     * inferred. Every frame outside the distance band clears the flag timer: one student standing
+     * up and sitting back down is not new evidence.
      */
     fun observe(
         nowMs: Long,
@@ -127,10 +138,10 @@ internal class PersonGuard(
         return nowMs - suspectSinceMs >= holdMs
     }
 
-    /** Trung vị cửa sổ hiện tại, null nếu chưa đủ [minSamples] khung. */
+    /** Median of the current window, null until [minSamples] frames are in. */
     fun medianRaw(): Float? = if (raws.size < minSamples) null else medianOf(raws)
 
-    /** Số mili-giây nghi ngờ đã kéo dài, 0 khi sạch. */
+    /** How many milliseconds the suspicion has lasted; 0 when clean. */
     fun suspectMs(nowMs: Long): Long =
         if (suspectSinceMs == 0L) 0L else nowMs - suspectSinceMs
 
