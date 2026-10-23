@@ -31,13 +31,18 @@ internal class DataLogger {
     }
 
     /**
-     * 37 cột. Thứ tự phải trùng khớp với chỗ ghép chuỗi trong MainActivity.
+     * 37 cột đo + 8 cột dải hai phía = 45 cột. Thứ tự phải trùng khớp với chỗ ghép chuỗi
+     * trong MainActivity.
      *
      * Để lộ danh sách này (thay vì chỉ chuỗi tiêu đề) để những chỗ phải ghi một dòng
      * "trống" ghép theo TÊN cột. Đếm vị trí bằng tay thì chỉ cần thêm một cột ở giữa là
      * toàn bộ dữ liệu phía sau bị dồn lệch, và file đối chiếu sẽ sai mà không ai hay biết.
+     *
+     * Cột dải nằm CUỐI danh sách và mang mã số chứ không phải số đo: -2 = "khung này không được
+     * chấm", -1 = "chưa học được dải cho đặc trưng đó", còn 0/1/2 = dưới/trong/trên. Viết 0 thay
+     * cho -2 hoặc -1 sẽ biến "chưa đo" thành "nằm trong dải", tức là tuyên bố ngược với sự thật.
      */
-    val columnNames: List<String> = listOf(
+    private val measuredColumns: List<String> = listOf(
         "t_ms", "face", "ear1", "ear2", "openness", "sigma", "eye_valid",
         "base_ear1", "base_ear2", "close_thr1", "close_thr2",
         "yaw_deg", "pitch_deg", "roll_deg", "gaze_h", "gaze_v", "mar", "bfr",
@@ -47,6 +52,9 @@ internal class DataLogger {
         "sei", "fatigue", "quality", "alert_code", "chronic",
         "session_s", "fps", "proc_ms", "luma"
     )
+
+    val columnNames: List<String> =
+        measuredColumns + HabitFeature.BAND_FEATURES.map { "band_" + HabitFeature.KEYS[it] }
 
     val header: String = columnNames.joinToString(",")
 

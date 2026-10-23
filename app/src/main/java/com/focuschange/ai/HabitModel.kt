@@ -44,6 +44,14 @@ internal object HabitConfig {
 
     /** Khoảng cách giữa hai khung lớn hơn mức này: coi như đứng máy, không tính là thời gian học. */
     const val MAX_FRAME_GAP_MS = 700L
+
+    /**
+     * Bội số của [ToleranceBand]: dải = mức điển hình ± BAND_K * độ dao động.
+     * 2.5 là con số đang dùng cho các ngưỡng cảnh báo cá nhân (quay đầu, liếc mắt) nên dải và
+     * cảnh báo không tự mâu thuẫn với nhau. Đưa ra ngoài để HUD, CSV và bản ghi Firebase cùng
+     * nhân một hệ số - nếu mỗi nơi tự chọn một con số thì cùng một hành vi sẽ hai kết luận.
+     */
+    const val BAND_K = 2.5f
 }
 
 /** Các đặc trưng được học riêng cho từng học sinh. */
@@ -84,6 +92,36 @@ internal object HabitFeature {
 
     /** Độ rộng tối thiểu để ngưỡng không bị "co" về 0 khi dữ liệu còn ít. */
     val MIN_SPREAD = floatArrayOf(2f, 20f, 3f, 2f, 2f, 0.02f, 0.03f, 0.02f, 0.01f, 0.01f, 1.5f, 3f)
+
+    /**
+     * Tên miền của 12 đặc trưng, theo đúng thứ tự chỉ mục. Dùng chung cho tiêu đề CSV và khóa
+     * trong bản ghi Firebase: hai chỗ tự liệt kê thì sớm muộn cũng lệch nhau một chữ và không
+     * ai đọc lại được dữ liệu cũ.
+     */
+    val KEYS = arrayOf(
+        "blink_bpm", "avg_blink_ms", "distance_cm", "yaw_deg", "pitch_deg", "gaze_h",
+        "gaze_v", "mar", "bfr", "ear", "perclos_p60", "sei"
+    )
+
+    /** Chữ ngắn để in lên bảng, cùng đơn vị và số chữ thập phân đáng tin của từng đặc trưng. */
+    val NAMES = arrayOf(
+        "Chớp mắt", "Độ dài một cái chớp", "Khoảng cách", "Đầu quay ngang", "Đầu cúi/ngửa",
+        "Liếc ngang", "Liếc dọc", "Độ mở miệng (MAR)", "Một mắt nhắm (BFR)", "Độ mở mắt (EAR)",
+        "PERCLOS P60", "SEI"
+    )
+    val UNITS = arrayOf("/phút", "ms", "cm", "°", "°", "", "", "", "", "", "%", "/100")
+    val DECIMALS = intArrayOf(0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 0, 0)
+
+    /**
+     * Tám đặc trưng được đối chiếu hai phía mỗi khung hình.
+     *
+     * Có mặt ở đây để HUD, CSV, bản ghi Firebase và bảng "Chỉ số" dùng đúng một danh sách.
+     * Năm đặc trưng còn lại bị loại vì lý do đã ghi ở khối chú thích trên [LO]: DIST (ngồi 25 cm
+     * là thói quen có hại, không phải "bình thường của em"), BLINK_MS/BFR (chưa có bằng chứng ý
+     * nghĩa hành vi), EAR (đã có đường trộn riêng), và chỉ riêng SEI được đưa vào làm SỐ SO SÁNH
+     * chứ không làm ngưỡng cảnh báo.
+     */
+    val BAND_FEATURES = intArrayOf(BPM, YAW, PITCH, GAZE_H, GAZE_V, MAR, PERCLOS, SEI)
 }
 
 /** Thống kê chạy (Welford): trung bình và độ lệch chuẩn mà không lưu từng mẫu. */
@@ -102,6 +140,62 @@ internal class RunningStat {
     }
 
     fun std(): Double = if (n > 1) sqrt(m2 / n) else 0.0
+}
+
+/** Một giá trị nằm ở đâu so với dải quen thuộc của chính học sinh đó. */
+internal enum class BandPosition { IN, BELOW, ABOVE, UNKNOWN }
+
+/**
+ * Đổi vị trí dải ra mã số của cột CSV: 0 = dưới dải, 1 = trong dải, 2 = trên dải,
+ * -1 = không chấm được (chưa học được dải, hoặc giá trị không hữu hạn).
+ */
+internal fun BandPosition.toCsvCode(): Int = when (this) {
+    BandPosition.BELOW -> 0
+    BandPosition.IN -> 1
+    BandPosition.ABOVE -> 2
+    BandPosition.UNKNOWN -> -1
+}
+
+/**
+ * Dải cho phép HAI PHÍA học từ thói quen: [min, max] quanh mức điển hình của riêng em đó.
+ *
+ * Đây là MÔ TẢ, không phải ngưỡng cảnh báo. Cảnh báo vẫn do các ngưỡng riêng quyết (nhóm ngưỡng
+ * đó kẹp trong khoảng an toàn chung); dải chỉ trả lời câu hỏi "khung hình hôm nay có thuộc thói
+ * quen của chính em này không", tức là phần thấp quá / cao quá mà một đường trung bình che mất.
+ */
+internal data class ToleranceBand(val mean: Float, val min: Float, val max: Float) {
+    fun position(value: Float): BandPosition = when {
+        !value.isFinite() -> BandPosition.UNKNOWN
+        value < min -> BandPosition.BELOW
+        value > max -> BandPosition.ABOVE
+        else -> BandPosition.IN
+    }
+}
+
+/**
+ * Kết quả đối chiếu cả một phiên với dải quen thuộc, bất biến để hiển thị và gửi đi.
+ * Giữ SỐ KHUNG chứ không giữ tỷ lệ: muốn tổng hợp cả phiên thì phải cộng các số đếm, còn cộng
+ * tỷ lệ đã làm tròn của tám đặc trưng cho ra một con số không đúng với cái nào.
+ *
+ * Đặc trưng không có khung nào được chấm bị loại hẳn khỏi danh sách thay vì báo "0%": con số 0
+ * sẽ bị đọc thành "luôn nằm trong dải", tức là khẳng định ngược với sự thật (chưa đo gì).
+ */
+internal data class BandOutcome(
+    val feature: Int,
+    val mean: Float,
+    val min: Float,
+    val max: Float,
+    val samples: Int,
+    val below: Int,
+    val above: Int
+) {
+    val inSamples: Int get() = samples - below - above
+    val inPct: Float get() = inSamples * 100f / samples
+    val belowPct: Float get() = below * 100f / samples
+    val abovePct: Float get() = above * 100f / samples
+
+    /** Phần trăm khung lọt ra NGOÀI dải - con số duy nhất đáng để đánh dấu trên bảng. */
+    val outsidePct: Float get() = belowPct + abovePct
 }
 
 /** Tóm tắt một phiên học: trung bình, độ lệch chuẩn và số mẫu của từng đặc trưng. */
@@ -125,6 +219,10 @@ internal class SessionSummary(
 internal class HabitSession(val id: Long) {
     private val stats = Array(HabitFeature.COUNT) { RunningStat() }
     private val quality = RunningStat()
+    private val bands = arrayOfNulls<ToleranceBand>(HabitFeature.COUNT)
+    private val bandIn = IntArray(HabitFeature.COUNT)
+    private val bandBelow = IntArray(HabitFeature.COUNT)
+    private val bandAbove = IntArray(HabitFeature.COUNT)
     private var lastTickMs = 0L
 
     var activeMs = 0L
@@ -156,6 +254,64 @@ internal class HabitSession(val id: Long) {
         if (value.isNaN() || value.isInfinite()) return
         val v = value.coerceIn(HabitFeature.LO[feature], HabitFeature.HI[feature])
         stats[feature].add(v.toDouble())
+    }
+
+    /**
+     * Nạp dải cho cả phiên, gọi MỘT LẦN lúc bắt đầu phiên.
+     *
+     * Dải tính từ các phiên đã có TRƯỚC phiên này (phiên đang chạy chưa được commit vào hồ sơ).
+     * Nếu nạp lại giữa chừng thì một buổi học khác thường sẽ tự nới dải của chính nó và che đi
+     * cái mà dải ấy đáng ra phải báo.
+     */
+    fun setBands(base: HabitBaseline, features: IntArray) {
+        for (f in features) bands[f] = base.band(f)
+    }
+
+    /**
+     * Chấm xem một giá trị nằm trong/dưới/trên dải quen thuộc.
+     *
+     * Đi riêng với [observe] có chủ đích: [observe] kẹp mẫu vào khoảng vật lý trước khi tính
+     * trung bình, còn ở đây giá trị lọt ra ngoài phải giữ nguyên - kẹp thì "thấp hơn thường ngày"
+     * bị kéo về đúng mép dải và không bao giờ thành BELOW. UNKNOWN (chưa có dải, giá trị không
+     * hữu hạn) không được đếm vào đâu cả, kể cả "trong dải".
+     */
+    fun observeBand(feature: Int, value: Float?): BandPosition {
+        val band = bands[feature] ?: return BandPosition.UNKNOWN
+        val v = value ?: return BandPosition.UNKNOWN
+        return when (band.position(v)) {
+            BandPosition.IN -> { bandIn[feature]++; BandPosition.IN }
+            BandPosition.BELOW -> { bandBelow[feature]++; BandPosition.BELOW }
+            BandPosition.ABOVE -> { bandAbove[feature]++; BandPosition.ABOVE }
+            BandPosition.UNKNOWN -> BandPosition.UNKNOWN
+        }
+    }
+
+    /** Bao nhiêu đặc trưng trong [features] đã học được dải. */
+    fun bandCoverage(features: IntArray): Int = features.count { bands[it] != null }
+
+    /**
+     * Toàn bộ kết quả đối chiếu của phiên, theo thứ tự [HabitFeature.BAND_FEATURES].
+     * Đặc trưng chưa có dải hoặc chưa có khung nào được chấm thì bị bỏ hẳn.
+     */
+    fun bandOutcomes(): List<BandOutcome> {
+        val out = ArrayList<BandOutcome>(HabitFeature.BAND_FEATURES.size)
+        for (f in HabitFeature.BAND_FEATURES) {
+            val band = bands[f] ?: continue
+            val n = bandIn[f] + bandBelow[f] + bandAbove[f]
+            if (n == 0) continue
+            out.add(
+                BandOutcome(
+                    feature = f,
+                    mean = band.mean,
+                    min = band.min,
+                    max = band.max,
+                    samples = n,
+                    below = bandBelow[f],
+                    above = bandAbove[f]
+                )
+            )
+        }
+        return out
     }
 
     fun addQuality(q: Float) {
@@ -200,6 +356,24 @@ internal class HabitBaseline(
     fun threshold(f: Int, k: Float, lo: Float, hi: Float): Float? {
         if (!ok[f]) return null
         return (abs(means[f]) + k * spreads[f]).coerceIn(lo, hi)
+    }
+
+    /**
+     * Dải cho phép hai phía của một đặc trưng: mean ± k*spread, kẹp trong khoảng vật lý LO/HI
+     * của chính nó. Trả null khi đặc trưng này chưa học được gì - "chưa biết" phải khác với
+     * "dải rộng bằng 0".
+     *
+     * Không cần kiểm tra min <= max: [means] là trung bình có trọng số của các giá trị đã bị kẹp
+     * vào [LO, HI] ngay lúc đo, nên mean luôn nằm giữa hai mép và mỗi mép chỉ bị kéo về phía mean.
+     */
+    fun band(f: Int, k: Float = HabitConfig.BAND_K): ToleranceBand? {
+        if (!ok[f]) return null
+        val half = k * spreads[f]
+        return ToleranceBand(
+            mean = means[f],
+            min = max(HabitFeature.LO[f], means[f] - half),
+            max = min(HabitFeature.HI[f], means[f] + half)
+        )
     }
 }
 

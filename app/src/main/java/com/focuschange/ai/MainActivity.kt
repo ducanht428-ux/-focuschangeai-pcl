@@ -108,6 +108,17 @@ class MainActivity : ComponentActivity() {
          *  + PERCLOS + MAR. Nếu thêm ngưỡng cá nhân mới thì phải sửa con số này theo. */
         const val TOTAL_PERSONAL_THRESHOLDS = 8
 
+        /**
+         * Mã cột dải trong CSV cho khung hình KHÔNG được chấm đặc trưng đó (mất mặt, tín hiệu
+         * kém, hoặc học thói quen đang tắt). Khác -1 của BandPosition.toCsvCode(): -1 nghĩa là
+         * "có chấm nhưng chưa học được dải". Gộp hai mã này thì không còn phân biệt được giữa
+         * "thiết bị chưa đủ dữ liệu" và "hôm nay em đó vắng mặt".
+         */
+        const val CODE_BAND_NOT_SCORED = -2
+
+        /** Tỷ lệ khung lọt ra ngoài dải để bảng "Chỉ số" đánh dấu một dòng bằng mũi tên. */
+        const val BAND_MARK_OUT_PCT = 5f
+
         // Loại cảnh báo (dùng để đếm số lần xuất hiện trước khi kêu).
         const val KIND_DROWSY = 1
         const val KIND_PERCLOS = 2
@@ -427,6 +438,7 @@ class MainActivity : ComponentActivity() {
     private var habitText by mutableStateOf("--")
     private var habitDetailText by mutableStateOf("")
     private var habitHistoryText by mutableStateOf("")
+    private var bandText by mutableStateOf("")
     private var eyeDetailText by mutableStateOf("--")
     private var sensitivityUi by mutableStateOf(1)
     private var enhanceUi by mutableStateOf(0)
@@ -576,6 +588,19 @@ class MainActivity : ComponentActivity() {
     /** 0 = không nhắc, 1 = phép thử liên tục (mất khi sạch), 2 = hiệu chuẩn vừa lệch (giữ lại). */
     @Volatile
     private var personHintKind = 0
+
+    /**
+     * Mã vị trí dải của 12 đặc trưng tại khung hình đang xử lý. Chỉ cameraExecutor chạm tới,
+     * dùng lại một mảng như csvBuf để không cấp phát 8 object mỗi khung.
+     */
+    private val bandCodes = IntArray(HabitFeature.COUNT) { CODE_BAND_NOT_SCORED }
+
+    /** Một dòng tóm tắt + một bảng dài, cameraExecutor dựng mỗi giây một lần. */
+    @Volatile
+    private var bandSummaryPlain = ""
+
+    @Volatile
+    private var bandTablePlain = ""
 
     // Hiệu chuẩn EAR + đường cơ sở cá nhân
     // Ba biến này thường chỉ cameraExecutor chạm tới, NHƯNG loggerMeta() đọc chúng trên UI
@@ -998,6 +1023,12 @@ class MainActivity : ComponentActivity() {
                             if (habitDetailText.isNotEmpty()) {
                                 Text(
                                     text = habitDetailText,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            if (bandText.isNotEmpty()) {
+                                Text(
+                                    text = bandText,
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -1994,6 +2025,8 @@ class MainActivity : ComponentActivity() {
         personalThresholdCount = 0
         personalBlend = 0f
         habitDetail = ""
+        bandSummaryPlain = ""
+        bandTablePlain = ""
         personalSeiMean = Float.NaN
         personalSeiSpread = 0f
         lowVsPersonalStartMs = 0L
@@ -2102,6 +2135,10 @@ class MainActivity : ComponentActivity() {
         val c = prof.confidence()
         applyPersonalParams(base, c)
         blendEarWithHabit(base, c)
+
+        // Dải hai phía dựng MỘT LẦN cho cả phiên, từ các phiên đã có trước phiên này. Nạp lại
+        // giữa chừng thì một buổi học khác thường sẽ tự nới dải của chính nó.
+        session.setBands(base, HabitFeature.BAND_FEATURES)
     }
 
     /**
@@ -2132,10 +2169,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun endHabitSession() {
-        val summary = habitSession?.toSummary()
+        val session = habitSession
+        val summary = session?.toSummary()
+        // Dải phải đọc TRƯỚC khi phiên bị vứt. Nó không được lưu vào hồ sơ (dải của hôm nay mà
+        // nạp vào hồ sơ ngày mai thì một buổi học khác thường sẽ tự nới dải của chính nó), nên
+        // chỗ này là cơ hội duy nhất để giữ nó lại cho CSV và bản ghi trên mây.
+        val bands = session?.bandOutcomes() ?: emptyList()
         commitHabitSession()
         habitSession = null
-        if (summary != null) uploadSessionToCloud(summary)
+        if (summary != null) uploadSessionToCloud(summary, bands)
     }
 
     /**
@@ -2144,7 +2186,7 @@ class MainActivity : ComponentActivity() {
      * dấu không đủ điều kiện kèm lý do: dữ liệu loại ra cũng là dữ liệu, giấu đi thì bảng tổng
      * hợp trên đám mây sẽ chỉ còn những phiên đẹp.
      */
-    private fun uploadSessionToCloud(s: SessionSummary) {
+    private fun uploadSessionToCloud(s: SessionSummary, bands: List<BandOutcome>) {
         if (!FirebaseSync.enabled) return
         val prof = habitProfile ?: return
         var alerts = 0
@@ -2160,7 +2202,8 @@ class MainActivity : ComponentActivity() {
             device = android.os.Build.MODEL,
             appVersion = packageManager.getPackageInfo(packageName, 0).versionName ?: "?",
             endedAtWallMs = System.currentTimeMillis(),
-            ineligibleReason = prof.ineligibleReason(s)
+            ineligibleReason = prof.ineligibleReason(s),
+            bandOutcomes = bands
         )
         FirebaseSync.upload(report) { ok ->
             // Firestore báo kết quả trên luồng chính nên chạm thẳng vào state của HUD được.
@@ -2182,6 +2225,96 @@ class MainActivity : ComponentActivity() {
             lastHabitStatusMs = nowMs
             habitStatus = buildHabitStatus()
             habitHistory = habitProfile?.historyText(5) ?: ""
+            refreshBandText()
+        }
+    }
+
+    /**
+     * Dựng chữ cho dải hai phía: một dòng cho màn hình chính, một bảng cho tab "Chỉ số".
+     * Chạy trên cameraExecutor cùng nhịp 1 giây với [habitStatus]; bảng dài chỉ được đọc khi
+     * người xem mở tab đó nên không tốn công vô ích.
+     *
+     * Hai điều phải in thẳng ra màn hình, không để người xem tự suy ra:
+     * (1) dải chỉ MÔ TẢ, nó không đổi một ngưỡng cảnh báo nào, và
+     * (2) "chưa có dải" khác với "luôn nằm trong dải": hồ sơ chưa đủ phiên thì bảng phải nói là
+     * chưa có gì, chứ không được báo 0% lọt dải.
+     */
+    private fun refreshBandText() {
+        val totalFeatures = HabitFeature.BAND_FEATURES.size
+        val session = habitSession
+        if (session == null || !habitLearnEnabled) {
+            bandSummaryPlain = if (habitLearnEnabled) {
+                "Dải hai phía: chưa có phiên nào đang đo (chỉ có sau khi hiệu chuẩn xong)."
+            } else {
+                "Dải hai phía: không chấm vì nút 'Học thói quen' đang tắt."
+            }
+            bandTablePlain = ""
+            return
+        }
+
+        val outcomes = session.bandOutcomes()
+        val covered = session.bandCoverage(HabitFeature.BAND_FEATURES)
+        if (outcomes.isEmpty()) {
+            bandSummaryPlain = String.format(
+                Locale.US,
+                "Dải hai phía: chưa dựng được chỉ số nào (cần %d phiên đạt, hồ sơ có %d).",
+                HabitConfig.MIN_SESSIONS, habitProfile?.sessionCount() ?: 0
+            )
+            bandTablePlain = "Chưa có dải nên mọi cột band_* trong CSV đang mang -1 (chưa học được " +
+                "dải) hoặc -2 (khung này không chấm) - không phải 'tất cả đều bình thường'."
+            return
+        }
+
+        var samples = 0
+        var below = 0
+        var above = 0
+        for (o in outcomes) {
+            samples += o.samples
+            below += o.below
+            above += o.above
+        }
+        bandSummaryPlain = String.format(
+            Locale.US,
+            "Dải hai phía (%d/%d chỉ số): %.1f%% lượt đo nằm trong dải, %.1f%% dưới, %.1f%% trên - " +
+                "tính trên %d lượt đo, mỗi khung chấm tối đa %d chỉ số. Mô tả, không phải cảnh báo.",
+            covered, totalFeatures,
+            (samples - below - above) * 100f / samples,
+            below * 100f / samples, above * 100f / samples, samples, totalFeatures
+        )
+
+        bandTablePlain = buildString {
+            appendLine(
+                String.format(
+                    Locale.US,
+                    "Dải cho phép học từ thói quen (mô tả - không phải ngưỡng cảnh báo; " +
+                        "dải = mức điển hình ±%.1f lần dao động):",
+                    HabitConfig.BAND_K
+                )
+            )
+            for (o in outcomes) {
+                val dp = HabitFeature.DECIMALS[o.feature]
+                val range = String.format(
+                    Locale.US, "[%." + dp + "f – %." + dp + "f]%s",
+                    o.min, o.max, HabitFeature.UNITS[o.feature]
+                )
+                val mark = if (o.outsidePct >= BAND_MARK_OUT_PCT) "  ← lệch thường xuyên" else ""
+                appendLine(
+                    String.format(
+                        Locale.US, "%-24s %-18s dưới %5.1f%% | trong %5.1f%% | trên %5.1f%%  (%d khung)%s",
+                        HabitFeature.NAMES[o.feature], range,
+                        o.belowPct, o.inPct, o.abovePct, o.samples, mark
+                    )
+                )
+            }
+            append(
+                String.format(
+                    Locale.US,
+                    "SEI nằm trong bảng này với tư cách số so sánh, không phải bằng chứng. " +
+                        "%d/%d đặc trưng có dải; 4 đặc trưng cố ý không dựng dải (khoảng cách, " +
+                        "độ dài một cái chớp, BFR, EAR) vì lý do ghi trong HabitModel.kt.",
+                    covered, totalFeatures
+                )
+            )
         }
     }
 
@@ -3207,7 +3340,10 @@ class MainActivity : ComponentActivity() {
             imageDetail = imageDetail,
             // Nhắc "mới hiệu chuẩn lệch 20%" là chuyện của người vận hành, nó phải còn hiện trên
             // HUD khi em đó đứng dậy; chỉ phép thử liên tục là hết giá trị khi mất khuôn mặt.
-            personHint = if (personHintKind == 2) personHintPlain else null
+            personHint = if (personHintKind == 2) personHintPlain else null,
+            // Dòng dải giữ nguyên khi mất mặt: nó mô tả cả phiên chứ không mô tả riêng khung này.
+            // Nếu để nó biến mất mỗi lần em đó quay đi thì HUD sẽ nhấp nháy vô nghĩa.
+            bandSummary = bandSummaryPlain
         )
     }
 
@@ -3301,7 +3437,10 @@ class MainActivity : ComponentActivity() {
                     // vẫn dùng số của em khác.
                     val prof = habitProfile
                     val storedScale = prof?.distanceScale
-                    val calDev = if (storedScale != null && prof != null && prof.hasCalibration()) {
+                    // storedScale có giá trị thì prof cũng có (nó vừa được lấy từ prof), nên không
+                    // kiểm tra prof lần nữa: điều kiện luôn đúng khiến người đọc không nhận ra điều
+                    // kiện nào thật sự quyết định, và compiler đã báo warning vì chỗ này.
+                    val calDev = if (storedScale != null && prof.hasCalibration()) {
                         PersonGuard.calibrationDeviation(newScale, storedScale)
                     } else {
                         Float.NaN
@@ -3826,6 +3965,10 @@ class MainActivity : ComponentActivity() {
 
             // ---- Học thói quen: chỉ lấy khung hợp lệ, không bất thường, không trong đợt mất tập trung kéo dài ----
             val hs = habitSession
+            // Mã dải phải reset MỖI KHUNG. Nếu không, một khung không được chấm sẽ mang mã của
+            // khung trước, và người mở file CSV không phân biệt được "khung này không đo" với
+            // "vẫn y như khung trước" - hai kết luận hoàn toàn khác nhau khi đối chiếu số.
+            for (f in HabitFeature.BAND_FEATURES) bandCodes[f] = CODE_BAND_NOT_SCORED
             if (hs != null && habitLearnEnabled) {
                 // `eye.valid` ở đây là chữ "không chớp lỗi" mà bảng Diễn giải đã hứa. Thiếu nó thì
                 // một khung mà EyeEngine báo "tôi không kết luận được về mắt" (landmark nhảy, góc quá
@@ -3851,6 +3994,22 @@ class MainActivity : ComponentActivity() {
                     perclosSample?.let { hs.observe(HabitFeature.PERCLOS, it) }
                     hs.observe(HabitFeature.SEI, seiNow.toFloat())
                     hs.addQuality(signalQuality.toFloat())
+
+                    // Đối chiếu hai phía với dải quen thuộc của chính em này. Dùng lại đúng điều
+                    // kiện lấy mẫu ở trên: BPM không đáng tin thì dải cũng không được chấm - nếu
+                    // không, cột dải sẽ đầy mã trên chính những khung mà chỉ số gốc đã bị bỏ.
+                    fun scoreBand(f: Int, sampled: Boolean, value: Float) {
+                        bandCodes[f] = if (sampled) hs.observeBand(f, value).toCsvCode()
+                        else CODE_BAND_NOT_SCORED
+                    }
+                    scoreBand(HabitFeature.BPM, bpmReliable, bpmValue)
+                    scoreBand(HabitFeature.YAW, true, yawDeg)
+                    scoreBand(HabitFeature.PITCH, true, pitchDeg)
+                    scoreBand(HabitFeature.GAZE_H, irisAvailable && eyesOpenForGaze, offH)
+                    scoreBand(HabitFeature.GAZE_V, irisAvailable && eyesOpenForGaze, offV)
+                    scoreBand(HabitFeature.MAR, true, mar)
+                    perclosSample?.let { scoreBand(HabitFeature.PERCLOS, true, it) }
+                    scoreBand(HabitFeature.SEI, true, seiNow.toFloat())
                 }
             }
 
@@ -3974,10 +4133,15 @@ class MainActivity : ComponentActivity() {
             b.append(sessionSeconds(nowMs)).append(',')            // 34
             b.num(fpsEma)                                          // 35
             b.num(processingMs)                                    // 36
+            // luma là cột đo cuối: không có dấu phẩy nối tiếp, và để trống khi độ sáng không hữu hạn.
             if (lumaMean.isFinite()) {
                 b.append(String.format(Locale.US, "%.2f", lumaMean))
             }
-            // Cột cuối không có dấu phẩy nối tiếp; nếu độ sáng không hữu hạn thì để trống.
+            // Tám cột dải nối SAU luma, không chèn vào giữa, nên 37 cột đo giữ nguyên thứ tự và
+            // file của những phiên trước vẫn mở được bằng cùng một script phân tích.
+            for (f in HabitFeature.BAND_FEATURES) {
+                b.append(',').append(bandCodes[f])
+            }
             dataLogger.submit(b.toString())
         }
 
@@ -4033,7 +4197,8 @@ class MainActivity : ComponentActivity() {
             alertCode = alertCode,
             eyeDetail = eyeDetail,
             imageDetail = imageDetail,
-            personHint = personHintPlain
+            personHint = personHintPlain,
+            bandSummary = bandSummaryPlain
         )
     }
 
@@ -4141,6 +4306,7 @@ class MainActivity : ComponentActivity() {
         anomalyText = s.anomaly ?: ""
         habitText = s.habitStatus
         habitDetailText = s.habitDetail
+        bandText = s.bandSummary
         habitHistoryText = s.habitHistory
         eyeDetailText = s.eyeDetail
         imageDetailText = s.imageDetail
@@ -4525,8 +4691,9 @@ class MainActivity : ComponentActivity() {
             try {
                 cameraExecutor.execute {
                     val session = habitSession
+                    val bands = session?.bandOutcomes() ?: emptyList()
                     commitHabitSession()
-                    if (session != null) uploadSessionToCloud(session.toSummary())
+                    if (session != null) uploadSessionToCloud(session.toSummary(), bands)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Không lưu được phiên khi dừng", e)
@@ -5205,6 +5372,14 @@ class MainActivity : ComponentActivity() {
             )
         )
         append("Độ tin của hồ sơ xem ở dòng 'Hồ sơ cá nhân' phía trên. Chưa ngưỡng nào được đối chiếu với quan sát của giáo viên.")
+        appendLine()
+        appendLine()
+        // Bảng dải được cameraExecutor dựng mỗi giây, đọc sang đây như mọi dòng chữ HUD khác.
+        // Nó đứng SAU các ngưỡng vì nó chỉ mô tả: không ngưỡng nào trong app đổi vì nó.
+        val bandTable = bandTablePlain
+        if (bandTable.isNotEmpty()) {
+            append(bandTable)
+        }
     }
 
     /**
@@ -5358,6 +5533,11 @@ class MainActivity : ComponentActivity() {
         appendLine("  alert_code    loại cảnh báo ở khung đó, 0 = không có")
         appendLine("  proc_ms       thời gian xử lý một khung, dùng để suy nhịp khung hình")
         appendLine("  luma          độ sáng trung bình khung (0-255), dùng để giải thích chất lượng thấp")
+        appendLine("  band_<tên>    8 cột cuối: giá trị khung đó nằm ở đâu SO VỚI DẢI RIÊNG của em này -")
+        appendLine("                  0 = dưới dải, 1 = trong dải, 2 = trên dải,")
+        appendLine("                  -1 = chưa học được dải (hồ sơ còn thiếu phiên), -2 = khung này không chấm")
+        appendLine("                  Dải = mức điển hình ±2.5 lần dao động của chính em đó. Đây là mô tả,")
+        appendLine("                  không phải ngưỡng cắt cảnh báo: cột band_* và cột alert_code độc lập nhau.")
         append("\n")
         append(
             String.format(
@@ -5503,6 +5683,14 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "với ngưỡng của cá nhân theo độ tin, độ tin tăng dần theo số phiên. HUD nói rõ đang có bao nhiêu " +
         "trên tổng 8 ngưỡng là của riêng bạn - nếu thấy 0/8 là vì hồ sơ chưa đủ điều kiện, không phải vì " +
         "app không học.",
+    "Dải cho phép của từng em (hai phía)" to
+        "Với mỗi đặc trưng, app dựng một dải [thấp nhất – cao nhất] từ thói quen của đúng em đó: " +
+        "mức điển hình ±2.5 lần dao động tự nhiên, kẹp trong khoảng vật lý của chỉ số. Mỗi khung hình " +
+        "được gắn mã dưới/trên/trong dải, ghi vào CSV và gửi kèm bản tổng kết. Tab 'Chỉ số' hiển thị " +
+        "tỉ lệ thời gian của ba loại đó, nên một hôm khác thường hiện ra rõ ràng thay vì bị đường " +
+        "trung bình của cả phiên che mất. Bảng này MÔ TẢ, không cắt cảnh báo: alert_code không đổi " +
+        "vì nó. Khoảng cách tới màn hình, độ dài một cái chớp, BFR và EAR cố ý không có dải riêng - " +
+        "xem mục 'Học thói quen theo hồ sơ'.",
     "Mất khuôn mặt thì sao" to
         "App giữ nguyên dấu '--' cho SEI và không tính khoảng trống đó là thời gian mở mắt hay mất " +
         "tập trung. Trước đây khoảng trống bị suy diễn thành 'bằng chứng không chú ý', gây báo đỏ " +

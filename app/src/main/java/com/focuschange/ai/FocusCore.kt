@@ -76,7 +76,8 @@ internal data class HudSnapshot(
      * Dòng nhắc cho người vận hành khi bề rộng khuôn mặt hiện tại không khớp hồ sơ đã chọn.
      * Không phải cảnh báo mất tập trung và không bao giờ phát ra tiếng; null khi chưa có gì để nghi.
      */
-    val personHint: String? = null
+    val personHint: String? = null,
+    val bandSummary: String = ""
 )
 
 /** Một mẫu tư thế đầu trong cửa sổ trượt thời gian (góc thô, chưa lọc). */

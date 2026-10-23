@@ -20,7 +20,15 @@ internal class SessionReport(
     val device: String,
     val appVersion: String,
     val endedAtWallMs: Long,
-    val ineligibleReason: String?
+    val ineligibleReason: String?,
+    /**
+     * Kết quả đối chiếu phiên này với dải hai phía của chính học sinh đó. Rỗng khi hồ sơ còn
+     * quá ít phiên để dựng dải.
+     *
+     * Để riêng, không gộp vào các bộ đếm cảnh báo: một phiên có thể không vượt ngưỡng cảnh báo
+     * nào mà vẫn nằm ngoài dải quen thuộc - đúng cái mà con số trung bình của phiên che mất.
+     */
+    val bandOutcomes: List<BandOutcome>
 )
 
 /**
@@ -33,14 +41,19 @@ internal class SessionReport(
 internal object FirebaseSync {
     private const val COLLECTION = "sessions"
 
-    /** Phiên bản cấu trúc bản ghi. Tăng lên khi đổi tên cột để dữ liệu cũ không bị đọc lệch. */
+    /**
+     * Phiên bản cấu trúc bản ghi. Tăng lên khi đổi tên cột để dữ liệu cũ không bị đọc lệch.
+     * Các cột dải mới chỉ THÊM vào, không đổi tên và không đổi nghĩa cột cũ, nên bản ghi đời
+     * 1 vẫn đọc đúng - vì vậy ở đây vẫn là 1, không phải 2.
+     */
     private const val SCHEMA = 1
 
-    /** Khóa của 12 đặc trưng trong HabitFeature, theo đúng thứ tự chỉ mục. */
-    private val FEATURE_KEYS = arrayOf(
-        "blink_bpm", "avg_blink_ms", "distance_cm", "yaw_deg", "pitch_deg", "gaze_h",
-        "gaze_v", "mar", "bfr", "ear", "perclos_p60", "sei"
-    )
+    /**
+     * Khóa của 12 đặc trưng. Lấy từ [HabitFeature.KEYS] chứ không liệt kê lại ở đây: tên khóa
+     * trong Firebase và tên cột dải trong CSV phải là một, nếu tự viết hai bản thì sớm muộn
+     * cũng lệch nhau một chữ và bản ghi trên mây không đọc được nữa.
+     */
+    private val FEATURE_KEYS = HabitFeature.KEYS
 
     @Volatile
     var disabledReason = "Chưa bật"
@@ -151,6 +164,22 @@ internal object FirebaseSync {
                 out["mean_$key"] = round2(s.mean[f])
                 out["std_$key"] = round2(s.std[f])
                 out["n_$key"] = n
+            }
+        }
+        if (r.bandOutcomes.isNotEmpty()) {
+            // Hệ số nhân của dải đi kèm bản ghi: giáo viên đọc "dải ±2.5 lần dao động" thì mới
+            // hiểu vì sao hai em có cùng trung bình lại có dải rộng khác nhau.
+            out["band_k"] = HabitConfig.BAND_K.toDouble()
+            for (b in r.bandOutcomes) {
+                val key = FEATURE_KEYS[b.feature]
+                // Ghi số khung, không ghi tỷ lệ: muốn tính trung bình cả tuần thì phải cộng các
+                // số đếm, còn trung bình của mấy con số % đã làm tròn thì không có nghĩa gì.
+                out["band_min_$key"] = round2(b.min)
+                out["band_max_$key"] = round2(b.max)
+                out["band_typical_$key"] = round2(b.mean)
+                out["band_frames_$key"] = b.samples
+                out["band_below_$key"] = b.below
+                out["band_above_$key"] = b.above
             }
         }
         return out

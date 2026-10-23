@@ -246,10 +246,10 @@ class ReportFormatterTest {
         assertTrue(csvShapeOk("1,2,3", 3))
         assertFalse(csvShapeOk("1,2,3", 4))
         assertFalse(csvShapeOk("1,2,3,", 3))
-        // Một ô trống vẫn là một dòng hợp lệ của file một cột; điều quan trọng là dòng 37 cột
-        // thì phải có đúng 36 dấu phẩy, thiếu một cái là cả dòng bị chặn.
+        // Một ô trống vẫn là một dòng hợp lệ của file một cột; điều quan trọng là dòng của cả
+        // tiêu đề thì phải có đúng số dấu phẩy theo cột, thiếu một cái là cả dòng bị chặn.
         assertTrue(csvShapeOk("", 1))
-        assertFalse(csvShapeOk("", 37))
+        assertFalse(csvShapeOk("", cols.size))
         assertTrue(csvShapeOk("5", 1))
         val row = buildNoFaceCsvRow(
             columns = cols, out = StringBuilder(), nowMs = 1L, sei = null,
