@@ -71,7 +71,12 @@ internal data class HudSnapshot(
     val habitHistory: String,
     val alertCode: Int,
     val eyeDetail: String,
-    val imageDetail: String
+    val imageDetail: String,
+    /**
+     * Dòng nhắc cho người vận hành khi bề rộng khuôn mặt hiện tại không khớp hồ sơ đã chọn.
+     * Không phải cảnh báo mất tập trung và không bao giờ phát ra tiếng; null khi chưa có gì để nghi.
+     */
+    val personHint: String? = null
 )
 
 /** Một mẫu tư thế đầu trong cửa sổ trượt thời gian (góc thô, chưa lọc). */

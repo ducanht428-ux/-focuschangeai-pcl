@@ -15,7 +15,7 @@ import kotlin.math.sqrt
  */
 internal object HabitConfig {
     /** Một phiên chỉ được lưu khi có ít nhất ngần này thời gian "hợp lệ". */
-    const val MIN_SESSION_MS = 3L * 60L * 1000L
+    const val MIN_SESSION_MS = 2L * 60L * 1000L
 
     /** Tỉ lệ thời gian thấy khuôn mặt tối thiểu trong phiên. */
     const val MIN_FACE_RATIO = 0.70f
@@ -29,9 +29,13 @@ internal object HabitConfig {
     /** SEI trung bình tối thiểu: thấp hơn nghĩa là phiên không phản ánh việc học bình thường. */
     const val MIN_SESSION_SEI = 40f
 
-    /** Số phiên đạt chuẩn tối thiểu và tổng thời gian hợp lệ tối thiểu để coi là "đã có hồ sơ". */
-    const val MIN_SESSIONS = 3
-    const val MIN_TOTAL_MS = 15L * 60L * 1000L
+    /**
+     * Số phiên đạt chuẩn tối thiểu và tổng thời gian hợp lệ tối thiểu để coi là "đã có hồ sơ".
+     * Hai con số này đi cặp: 4 phiên x MIN_SESSION_MS (2 phút) mới ra 8 phút, nên trần tổng 10
+     * phút buộc các phiên phải dài trung bình 2,5 phút chứ không được bốn phiên 2 phút liền.
+     */
+    const val MIN_SESSIONS = 4
+    const val MIN_TOTAL_MS = 10L * 60L * 1000L
 
     const val MAX_SESSIONS = 40
     const val MIN_FRAMES_PER_FEATURE = 30
@@ -57,6 +61,22 @@ internal object HabitFeature {
     const val PERCLOS = 10
     const val SEI = 11
     const val COUNT = 12
+
+    /**
+     * Năm đặc trưng KHÔNG có ngưỡng cá nhân, ghi lại để không ai (kể cả tôi) gọi 7 cái còn lại
+     * là "mọi chỉ số đều học theo từng em":
+     *
+     * - DIST: 30 cm là chuẩn vệ sinh học đường áp dụng cho mọi người, không phải thói quen. Cá
+     *   nhân hóa thành "em này quen ngồi 25 cm" sẽ biến một thói quen có hại thành mức bình thường
+     *   của riêng em đó - đúng điều dự án đang muốn sửa.
+     * - BLINK_MS / BFR: chưa có bằng chứng rằng độ dài một lần chớp hay tỉ lệ nhắm một mắt mang ý
+     *   nghĩa hành vi ở độ phân giải này; BFR chủ yếu phản ánh landmark trượt khi nghiêng đầu.
+     * - EAR: đã được cá nhân hóa bằng đường riêng (`blendEarWithHabit`, tối đa 35%) và ngưỡng đóng
+     *   mắt của phiên lấy từ chính hiệu chuẩn của em đó, nên đưa thêm vào mix() là nhân đôi hiệu
+     *   chuẩn trên cùng một con số.
+     * - SEI: dùng làm MỨC SO SÁNH ("thấp hơn thường ngày của bạn", LOW_VS_PERSONAL_K), không đặt
+     *   thành ngưỡng cảnh báo trực tiếp vì SEI đã là tổ hợp có trọng số của sáu thứ khác.
+     */
 
     /** Giới hạn cắt (winsorize) từng quan sát để một khung nhiễu không làm lệch hồ sơ. */
     val LO = floatArrayOf(0f, 40f, 10f, -60f, -60f, -0.5f, -0.6f, 0f, 0.1f, 0f, 0f, 0f)
@@ -187,6 +207,26 @@ internal class HabitBaseline(
 internal class HabitProfile(val id: String, var name: String) {
     val sessions = ArrayList<SessionSummary>()
 
+    /**
+     * Kết quả hiệu chuẩn khoảng cách, lưu THEO HỒ SƠ chứ không theo chiếc điện thoại.
+     *
+     * Trước đây hệ số chỉ là một pref của máy (`distance_scale_v2`), nên khi em thứ hai bấm hiệu
+     * chuẩn thì mọi con số cm của em thứ nhất đổi theo mà không ai thấy.
+     *
+     * Hai giá trị này cũng là chữ ký hình học duy nhất mà ứng dụng có, vì hiệu chuẩn diễn ra ở
+     * khoảng cách tham chiếu đã biết trước: `distanceScale = REF / calRawDistanceCm` chỉ còn biến
+     * số là bề rộng mặt thật của người ngồi, và [PersonGuard] dùng đúng cái đó để nghi đã đổi người.
+     */
+    var distanceScale: Float = Float.NaN
+
+    /** Trung vị khoảng cách THÔ (chưa nhân hệ số) của các khung được dùng để hiệu chuẩn. */
+    var calRawDistanceCm: Float = Float.NaN
+
+    /** Giây mà máy tính thiết bị (`System.currentTimeMillis`) của lần hiệu chuẩn gần nhất. */
+    var calibratedAtMs: Long = 0L
+
+    fun hasCalibration(): Boolean = distanceScale.isFinite() && distanceScale > 0f
+
     fun sessionCount(): Int = sessions.size
 
     fun totalValidMs(): Long {
@@ -199,10 +239,16 @@ internal class HabitProfile(val id: String, var name: String) {
         sessions.size >= HabitConfig.MIN_SESSIONS &&
                 totalValidMs() >= HabitConfig.MIN_TOTAL_MS
 
-    /** Độ tin cậy 0..1: càng nhiều phiên, ngưỡng cá nhân càng được ưu tiên hơn ngưỡng mặc định. */
+    /**
+     * Độ tin cậy 0..1: càng nhiều phiên, ngưỡng cá nhân càng được ưu tiên hơn ngưỡng mặc định.
+     * Mốc "+1" neo vào MIN_SESSIONS để đúng PHIÊN ĐẦU TIÊN đạt chuẩn của một hồ sơ vừa đủ điều
+     * kiện luôn bắt đầu ở 0.2. Nếu giữ `- 2` như bản cũ thì từ 3 phiên lên 4 phiên, hồ sơ vừa
+     * "ready" đã nhảy thẳng xuống 0.4 - trộn mạnh gấp đôi với cùng lượng dữ liệu, chỉ vì một hằng
+     * số khác bị đổi ở chỗ khác.
+     */
     fun confidence(): Float {
         if (!isReady()) return 0f
-        return ((sessions.size - 2) / 5f).coerceIn(0.2f, 1f)
+        return ((sessions.size - HabitConfig.MIN_SESSIONS + 1) / 5f).coerceIn(0.2f, 1f)
     }
 
     /** Lý do phiên chưa đủ điều kiện để học (null nếu đạt). */

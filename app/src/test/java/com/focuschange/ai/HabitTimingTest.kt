@@ -1,6 +1,7 @@
 package com.focuschange.ai
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -213,5 +214,44 @@ class HabitTimingTest {
         val both = p.avgSei(-5, 99)   // chỉ số vượt hai đầu phải được kẹp lại, không ném ngoại lệ
         assertEquals(65f, both!!.first, 0.01f)
         assertEquals(2, both.second)
+    }
+
+    private fun studySession(validMs: Long, sei: Float = 70f) = SessionSummary(
+        id = 1L,
+        validMs = validMs,
+        faceRatio = 0.95f,
+        validRatio = 0.90f,
+        quality = 80f,
+        mean = FloatArray(HabitFeature.COUNT).also { it[HabitFeature.SEI] = sei },
+        std = FloatArray(HabitFeature.COUNT),
+        count = IntArray(HabitFeature.COUNT).also { it[HabitFeature.SEI] = 100 }
+    )
+
+    /**
+     * Hai ngưỡng mới đi CẶP: MIN_SESSIONS x MIN_SESSION_MS (4 x 2 phút = 8 phút) vẫn DƯỚI
+     * MIN_TOTAL_MS (10 phút), nên bốn phiên sát mép không đủ lập hồ sơ. Test này tồn tại để
+     * một lần sửa hằng số ở chỗ khác không âm thầm làm hồ sơ không bao giờ "ready" trong lúc thi.
+     */
+    @Test
+    fun fourSessionsAtThePerSessionFloorStillMissTheTotalBar() {
+        val p = HabitProfile("hs1", "Học sinh 1")
+        repeat(HabitConfig.MIN_SESSIONS) { p.sessions.add(studySession(HabitConfig.MIN_SESSION_MS)) }
+        assertEquals(8L * 60L * 1000L, p.totalValidMs())
+        assertFalse("4 phiên sát mép mà đã ready thì MIN_TOTAL_MS không còn tác dụng", p.isReady())
+    }
+
+    /**
+     * Bốn phiên 2,5 phút = đúng 10 phút = vừa đủ cho MỘT lượt demo. Và độ tin cậy phải bắt đầu
+     * ở 0.2 tại phiên đầu tiên đạt chuẩn của một hồ sơ vừa ready - con số thiết kế ban đầu, không
+     * phải 0.4 do mốc "- 2" cũ lệch theo khi MIN_SESSIONS tăng từ 3 lên 4.
+     */
+    @Test
+    fun demoLengthSessionsReachReadinessWithConfidenceAtItsFloor() {
+        val p = HabitProfile("hs1", "Học sinh 1")
+        repeat(HabitConfig.MIN_SESSIONS) { p.sessions.add(studySession(150_000L)) }
+        assertTrue(p.isReady())
+        assertEquals(0.2f, p.confidence(), 0.001f)
+        repeat(4) { p.sessions.add(studySession(150_000L)) }
+        assertEquals(1f, p.confidence(), 0.001f)
     }
 }

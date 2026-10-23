@@ -388,6 +388,7 @@ class MainActivity : ComponentActivity() {
     private var distanceText by mutableStateOf("--")
     private var distanceAlert by mutableStateOf(false)
     private var distanceScaleText by mutableStateOf("x1.00")
+    private var personHintText by mutableStateOf<String?>(null)
     private var calibrationText by mutableStateOf("Đang chờ khuôn mặt để hiệu chuẩn...")
     private var bpmText by mutableStateOf("--")
     private var seiValue by mutableIntStateOf(-1)
@@ -527,6 +528,43 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var distanceScale = 1f
 
+    /**
+     * Hệ số đọc từ pref cũ `distance_scale_v2`. Từ bản này hệ số thật sống trong hồ sơ từng em
+     * (HabitProfile.distanceScale); pref cũ chỉ còn là giá trị cứu cho hồ sơ chưa từng hiệu chuẩn
+     * trên bản mới, và bị ghi đè ngay lần hiệu chuẩn kế tiếp.
+     */
+    @Volatile
+    private var legacyDistanceScale = 1f
+
+    /** Đổi hồ sơ là đổi luôn hệ số + chữ ký bề rộng mặt, không được mang số của em khác sang. */
+    private fun applyProfileCalibration() {
+        val prof = habitProfile
+        val stored = prof?.distanceScale
+        distanceScale = if (stored != null && stored.isFinite() && stored > 0f) {
+            stored.coerceIn(0.3f, 3f)
+        } else {
+            legacyDistanceScale
+        }
+        personGuard.reset()
+        personHintPlain = null
+        personHintKind = 0
+        distanceScaleText = String.format(Locale.US, "x%.2f", distanceScale)
+    }
+
+    private val personGuard = PersonGuard()
+
+    /**
+     * Dòng nhắc "có vẻ đã đổi người", do cameraExecutor viết và HudSnapshot chép lại.
+     * Không đi qua chuỗi cảnh báo: chọn sai hồ sơ là lỗi vận hành, không phải biểu hiện mất tập
+     * trung, và ghi nó vào máy đếm cảnh báo sẽ làm bẩn số liệu.
+     */
+    @Volatile
+    private var personHintPlain: String? = null
+
+    /** 0 = không nhắc, 1 = phép thử liên tục (mất khi sạch), 2 = hiệu chuẩn vừa lệch (giữ lại). */
+    @Volatile
+    private var personHintKind = 0
+
     // Hiệu chuẩn EAR + đường cơ sở cá nhân
     // Ba biến này thường chỉ cameraExecutor chạm tới, NHƯNG loggerMeta() đọc chúng trên UI
     // thread để viết meta.txt. Không có @Volatile thì file môi trường của phiên ghi CSV có
@@ -614,6 +652,14 @@ class MainActivity : ComponentActivity() {
 
     @Volatile
     private var personalThresholdCount = 0
+
+    /**
+     * Phần trăm trọng số của hồ sơ riêng trong ngưỡng hiện hành (chính là c của
+     * HabitProfile.confidence, 0 khi chưa đủ phiên). Bảng "Chỉ số" in ra để không ai hiểu nhầm
+     * "hồ sơ riêng" nghĩa là 100% số của em đó: ở 4 phiên thì cá nhân chỉ chiếm 20%.
+     */
+    @Volatile
+    private var personalBlend = 0f
     private var lowVsPersonalStartMs = 0L
     private var lastSeiValue = -1
 
@@ -768,7 +814,8 @@ class MainActivity : ComponentActivity() {
         FirebaseSync.start(applicationContext)
         firebaseText = FirebaseSync.statusText()
 
-        distanceScale = prefs.getFloat(KEY_DISTANCE_SCALE, 1f).coerceIn(0.3f, 3f)
+        legacyDistanceScale = prefs.getFloat(KEY_DISTANCE_SCALE, 1f).coerceIn(0.3f, 3f)
+        distanceScale = legacyDistanceScale
         distanceScaleText = String.format(Locale.US, "x%.2f", distanceScale)
         soundMode = prefs.getInt(
             KEY_SOUND_MODE,
@@ -1055,10 +1102,18 @@ class MainActivity : ComponentActivity() {
                             Text(text = "Xử lý ảnh: $imageDetailText")
 
                             Text(
-                                text = "Khoảng cách: $distanceText (hệ số $distanceScaleText)",
+                                text = "Khoảng cách: $distanceText (hệ số $distanceScaleText của hồ sơ này)",
                                 color = if (distanceAlert) Color.Red
                                 else MaterialTheme.colorScheme.onSurface
                             )
+
+                            personHintText?.let {
+                                Text(
+                                    text = it,
+                                    color = Color(0xFFFFA000),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
 
                             Text(text = "Tư thế đầu: $headPoseText")
                             Text(text = "Hướng nhìn: $gazeText")
@@ -1798,6 +1853,7 @@ class MainActivity : ComponentActivity() {
             studentSwitchRequest = null
             endHabitSession()
             habitProfile = habitStore.load(switchTo)
+            applyProfileCalibration()
             resetPersonalParams()
             lastHabitStatusMs = 0L
             recalibrationRequested = false
@@ -1809,9 +1865,21 @@ class MainActivity : ComponentActivity() {
             val id = habitProfile?.id
             habitSession = null
             if (id != null) {
+                val old = habitProfile
                 habitStore.clear(id)
                 habitProfile = habitStore.load(id)
+                // "Xóa hồ sơ" có nghĩa là quên các phiên đã học, không phải quên luôn lần hiệu
+                // chuẩn khoảng cách: đó là phép đo vật lý, xóa xong bắt người dùng hiệu chuẩn lại
+                // bằng tay mà không nói cho họ biết.
+                old?.let { prev ->
+                    if (prev.hasCalibration()) {
+                        habitProfile?.distanceScale = prev.distanceScale
+                        habitProfile?.calRawDistanceCm = prev.calRawDistanceCm
+                        habitProfile?.calibratedAtMs = prev.calibratedAtMs
+                    }
+                }
             }
+            applyProfileCalibration()
             resetPersonalParams()
             lastHabitStatusMs = 0L
             recalibrationRequested = false
@@ -1829,6 +1897,7 @@ class MainActivity : ComponentActivity() {
         thrPerclos = PERCLOS_ALERT
         thrMar = MAR_YAWN
         personalThresholdCount = 0
+        personalBlend = 0f
         habitDetail = ""
         personalSeiMean = Float.NaN
         personalSeiSpread = 0f
@@ -1839,6 +1908,7 @@ class MainActivity : ComponentActivity() {
     /** Thay ngưỡng mặc định bằng ngưỡng cá nhân, trộn theo độ tin cậy c (0..1). */
     private fun applyPersonalParams(base: HabitBaseline, c: Float) {
         personalThresholdCount = 0
+        personalBlend = c
 
         fun mix(default: Float, personal: Float?): Float {
             if (personal == null) return default
@@ -1898,9 +1968,13 @@ class MainActivity : ComponentActivity() {
             }
             append(
                 String.format(
-                    Locale.US, ". %d/%d ngưỡng cá nhân, %d vẫn là mặc định.",
+                    Locale.US,
+                    ". %d/%d ngưỡng có trộn cá nhân, cá nhân chỉ chiếm %.0f%% nên %d%% vẫn là mặc định" +
+                        "; %d ngưỡng chưa có dữ liệu để trộn.",
                     personalThresholdCount,
                     TOTAL_PERSONAL_THRESHOLDS,
+                    c * 100f,
+                    (1f - c) * 100f,
                     TOTAL_PERSONAL_THRESHOLDS - personalThresholdCount
                 )
             )
@@ -2267,12 +2341,20 @@ class MainActivity : ComponentActivity() {
      * ~1,6%) trong khi mống mắt chỉ ~12 px (~12%). Trước đây hai nguồn được trộn đều
      * trọng số, nên thước nhiễu hơn lại chi phối; và khi mắt nhắm hàm trả về riêng mống
      * mắt, làm cửa sổ trung vị nhảy qua lại giữa hai ước lượng có sai lệch hệ thống khác nhau.
+     *
+     * `yawAbsDeg` phải là góc quay ĐẦU TUYỆT ĐỐI so với trục ống kính, không phải độ lệch
+     * khỏi tư thế nghỉ của em đó. Số hạng cos ở dưới bù đúng cái phần bị ngắn đi vì phối
+     * cảnh, mà phần đó chỉ tồn tại khi mặt thật sự quay so với máy ảnh. Trước đây nó nhận
+     * `yawRawDev`, nên một em ngồi quay đầu 20 độ vĩnh viễn không được bù gì cả: khoảng cách
+     * ước lượng THỪA 6,4% (1,9 cm ở mốc 30 cm), to hơn cả dải trễ 30->32 cm, nghĩa là cảnh
+     * báo "quá gần" không bao giờ bắn dù em đó đang ngồi rất gần. Đổi sang góc tuyệt đối còn
+     * sửa được một lỗi nữa: quay đầu 30 độ từng làm con số nhảy 15% dù em đó không dời chỗ.
      */
     private fun estimateDistanceCm(
         lm: Landmarks,
         imgW: Int,
         imgH: Int,
-        yawDevDeg: Float,
+        yawAbsDeg: Float,
         eyesOpen: Boolean
     ): Float? {
         val f = focalPx()
@@ -2280,11 +2362,13 @@ class MainActivity : ComponentActivity() {
         val cornerPx = pixelDistance(lm, LM_OUTER_RIGHT_EYE, LM_OUTER_LEFT_EYE, imgW, imgH)
         if (cornerPx < 1f) return null
 
-        // Ngoài ngưỡng này thì 1/cos(yaw) phóng đại sai số landmark, thà bỏ khung còn hơn.
-        val yaw = abs(yawDevDeg)
+        // Cổng loại khung cũng phải xét góc tuyệt đối: chính số hạng 1/cos này phóng đại sai số
+        // landmark khi quay sâu, nên góc nào KHÔNG được bù mới là góc cần chặn.
+        val yaw = abs(yawAbsDeg)
         if (yaw > DIST_MAX_YAW_DEG) return null
 
-        val dCorner = EYE_OUTER_WIDTH_CM * f / (cornerPx / cos(yaw / RAD_TO_DEG))
+        // Kẹp ở 0.3f: cos(72 độ) ~ 0.31, chặn chia cho 0 nếu ai đó gọi hàm ngoài cổng ở trên.
+        val dCorner = EYE_OUTER_WIDTH_CM * f / (cornerPx / cos(yaw / RAD_TO_DEG).coerceAtLeast(0.3f))
 
         // Đối chiếu bằng mống mắt: hai mắt phải cho kích thước gần nhau và phải
         // khớp khóe mắt trong ~35%. Lệch nghĩa là landmark đang nhiễu -> bỏ khung này.
@@ -3025,7 +3109,10 @@ class MainActivity : ComponentActivity() {
             habitHistory = habitHistory,
             alertCode = 0,
             eyeDetail = "--",
-            imageDetail = imageDetail
+            imageDetail = imageDetail,
+            // Nhắc "mới hiệu chuẩn lệch 20%" là chuyện của người vận hành, nó phải còn hiện trên
+            // HUD khi em đó đứng dậy; chỉ phép thử liên tục là hết giá trị khi mất khuôn mặt.
+            personHint = if (personHintKind == 2) personHintPlain else null
         )
     }
 
@@ -3081,7 +3168,7 @@ class MainActivity : ComponentActivity() {
             lm,
             imgW,
             imgH,
-            if (calibrated) yawRawDev else 0f,
+            poseYawAbs,
             eyesOpenForDist
         )
 
@@ -3106,9 +3193,48 @@ class MainActivity : ComponentActivity() {
                     distCalSamples.clear()
                     distWindow.clear()
                     smoothedDistanceCm = null
+                    // Đổi hệ số là đổi luôn thang đo đang dựng nên cờ "quá gần", nên cờ phải tắt:
+                    // nếu giữ, em ngồi đúng 50 cm vẫn bị còi báo tiếp vì cờ học từ thang cũ.
+                    distanceAlertActive = false
                     distanceFilter.reset()
-                    prefs.edit().putFloat(KEY_DISTANCE_SCALE, newScale).apply()
-                    Log.d(TAG, "Hiệu chuẩn khoảng cách: hệ số = $newScale")
+                    personGuard.reset()
+                    personHintPlain = null
+                    personHintKind = 0
+
+                    // Hệ số giờ thuộc về hồ sơ, không thuộc về chiếc điện thoại. Ghi vào
+                    // HabitProfile và lưu file luôn: nếu chỉ nhớ trong bộ nhớ thì lần mở app sau
+                    // vẫn dùng số của em khác.
+                    val prof = habitProfile
+                    val storedScale = prof?.distanceScale
+                    val calDev = if (storedScale != null && prof != null && prof.hasCalibration()) {
+                        PersonGuard.calibrationDeviation(newScale, storedScale)
+                    } else {
+                        Float.NaN
+                    }
+                    if (prof != null) {
+                        prof.distanceScale = newScale
+                        prof.calRawDistanceCm = med
+                        prof.calibratedAtMs = System.currentTimeMillis()
+                        habitStore.save(prof)
+                    }
+
+                    if (calDev.isFinite() && abs(calDev) > PersonGuard.CALIBRATION_REJECT_RATIO) {
+                        // Đây là trigger đáng tin nhất: hiệu chuẩn diễn ra ở khoảng cách ĐÃ BIẾT,
+                        // nên hệ số nhảy 20% chỉ có thể nghĩa là khuôn mặt khác, hoặc em này ngồi
+                        // sai chỗ so với hướng dẫn.
+                        personHintPlain = String.format(
+                            Locale.US,
+                            "Vừa hiệu chuẩn ra hệ số x%.2f, lệch %.0f%% so với hồ sơ %s (x%.2f). " +
+                                "Nếu người ngồi là người khác thì phải đổi học sinh, đừng dùng chung ngưỡng.",
+                            newScale,
+                            calDev * 100f,
+                            prof?.name ?: activeStudentId,
+                            storedScale ?: Float.NaN
+                        )
+                        personHintKind = 2
+                        Log.w(TAG, "Hiệu chuẩn lệch ${calDev * 100f}% so với hồ sơ ${prof?.id}")
+                    }
+                    Log.d(TAG, "Hiệu chuẩn khoảng cách: hệ số = $newScale, thô = $med cm")
                 }
             }
         } else if (!distanceCalibrationRequested) {
@@ -3121,6 +3247,29 @@ class MainActivity : ComponentActivity() {
             smoothedDistanceCm = distanceFilter.filter(medianOf(distWindow), nowMs)
         }
         val distance = smoothedDistanceCm
+
+        // ---- Nghi đã đổi người (nhắc người vận hành, không phải cảnh báo mất tập trung) ----
+        val suspectPerson = personGuard.observe(
+            nowMs,
+            rawUnscaled,
+            distance,
+            habitProfile?.calRawDistanceCm
+        )
+        val personDev = personGuard.deviation
+        if (suspectPerson && personDev.isFinite()) {
+            personHintPlain = String.format(
+                Locale.US,
+                "Khuôn mặt đang ngồi %s chữ ký của hồ sơ %.0f%% trong %d giây ở đúng vị trí tham chiếu. " +
+                    "Nếu là người khác thì phải đổi học sinh trước khi theo dõi. (Nhắc vận hành, không tính vào cảnh báo.)",
+                if (personDev > 0f) "rộng hơn" else "hẹp hơn",
+                abs(personDev) * 100f,
+                personGuard.suspectMs(nowMs) / 1000L
+            )
+            personHintKind = 1
+        } else if (personHintKind == 1) {
+            personHintPlain = null
+            personHintKind = 0
+        }
 
         if (distance != null) {
             distanceAlertActive = if (distanceAlertActive) {
@@ -3583,8 +3732,12 @@ class MainActivity : ComponentActivity() {
             // ---- Học thói quen: chỉ lấy khung hợp lệ, không bất thường, không trong đợt mất tập trung kéo dài ----
             val hs = habitSession
             if (hs != null && habitLearnEnabled) {
-                val habitValid = reliable && !frozen && !jerky && chronicLevelValue < 2 &&
-                        !drowsyNow && !eyesClosed
+                // `eye.valid` ở đây là chữ "không chớp lỗi" mà bảng Diễn giải đã hứa. Thiếu nó thì
+                // một khung mà EyeEngine báo "tôi không kết luận được về mắt" (landmark nhảy, góc quá
+                // nghiêng) vẫn được cộng vào validMs, nên tỉ lệ "khung hợp lệ" phình lên đúng lúc
+                // tín hiệu kém - và PERCLOS đã được chặn bằng eye.valid từ trước, chỉ còn thời gian là lọt.
+                val habitValid = eye.valid && reliable && !frozen && !jerky &&
+                        chronicLevelValue < 2 && !drowsyNow && !eyesClosed
                 hs.tick(nowMs, true, habitValid)
                 if (habitValid) {
                     if (bpmReliable) hs.observe(HabitFeature.BPM, bpmValue)
@@ -3784,7 +3937,8 @@ class MainActivity : ComponentActivity() {
             habitHistory = habitHistory,
             alertCode = alertCode,
             eyeDetail = eyeDetail,
-            imageDetail = imageDetail
+            imageDetail = imageDetail,
+            personHint = personHintPlain
         )
     }
 
@@ -3812,6 +3966,7 @@ class MainActivity : ComponentActivity() {
         } ?: "--"
         distanceAlert = s.tooClose
         distanceScaleText = String.format(Locale.US, "x%.2f", s.distanceScale)
+        personHintText = s.personHint
 
         bpmText = s.bpm?.let {
             String.format(Locale.US, "%.1f", it)
@@ -4883,7 +5038,13 @@ class MainActivity : ComponentActivity() {
      */
     private fun buildThresholdRows(): String = buildString {
         fun line(name: String, current: Float, default: Float, note: String, unit: String = "") {
-            val src = if (current == default) "mặc định" else "hồ sơ riêng"
+            // "hồ sơ riêng" một mình là chữ dễ gây hiểu nhầm nhất trong toàn bộ bảng này: ngưỡng
+            // trộn thì không phải 100% số của em đó, nên phải in kèm đúng phần trăm trọng số.
+            val src = when {
+                current == default -> "mặc định"
+                personalBlend <= 0f -> "hồ sơ riêng"
+                else -> String.format(Locale.US, "trộn %.0f%% hồ sơ", personalBlend * 100f)
+            }
             appendLine(
                 String.format(
                     Locale.US,
@@ -4893,7 +5054,13 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        appendLine("Ngưỡng đang dùng cho $studentName:")
+        appendLine(
+            String.format(
+                Locale.US,
+                "Ngưỡng đang dùng cho $studentName (hồ sơ riêng đang chiếm %.0f%%):",
+                personalBlend * 100f
+            )
+        )
         line("Mắt gần đóng (cột perclos_p60)", thrPerclos, PERCLOS_ALERT, "trên mức này thì báo buồn ngủ", "%")
         line("Ngang - mất tập trung", thrLookYaw, LOOK_AWAY_YAW_DEG, "góc yaw duy trì 2 giây", "°")
         line("Dọc - mất tập trung", thrLookPitch, LOOK_AWAY_PITCH_DEG, "góc pitch duy trì 2 giây", "°")
@@ -5234,10 +5401,10 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "không có lần chớp nào, app coi đó nhiều khả năng là ảnh tĩnh hoặc camera bị đứng, rồi chặn " +
         "điểm SEI ở mức thấp để không khen nhầm một bức ảnh.",
     "Học thói quen theo hồ sơ" to
-        "Một phiên chỉ được đưa vào hồ sơ khi đạt cả năm điều kiện: >= 3 phút hợp lệ, >= 70% thời gian " +
+        "Một phiên chỉ được đưa vào hồ sơ khi đạt cả năm điều kiện: >= 2 phút hợp lệ, >= 70% thời gian " +
         "thấy khuôn mặt, >= 50% khung trong lúc thấy mặt là hợp lệ (không chớp lỗi, không đứng ảnh, " +
         "không buồn ngủ), chất lượng tín hiệu trung bình >= 60/100 và SEI trung bình >= 40. App chỉ lập " +
-        "đường cơ sở riêng khi có >= 3 phiên đạt và tổng >= 15 phút hợp lệ; từ đó ngưỡng chung được trộn " +
+        "đường cơ sở riêng khi có >= 4 phiên đạt và tổng >= 10 phút hợp lệ; từ đó ngưỡng chung được trộn " +
         "với ngưỡng của cá nhân theo độ tin, độ tin tăng dần theo số phiên. HUD nói rõ đang có bao nhiêu " +
         "trên tổng 8 ngưỡng là của riêng bạn - nếu thấy 0/8 là vì hồ sơ chưa đủ điều kiện, không phải vì " +
         "app không học.",

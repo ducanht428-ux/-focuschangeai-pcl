@@ -48,7 +48,12 @@ class IndependentFeatureEngine(
     fun evaluate(feature: Feature, value: Double?): FeatureEvaluation {
         val bound = bounds[feature]
         val finite = value?.takeIf { it.isFinite() }
-        if (finite == null || bound == null) {
+        // Cổng khoảng vật lý phải áp cả lúc đo, không chỉ lúc học. calibrate() bỏ mẫu ngoài
+        // validMin/validMax ở trên, còn evaluate trước đây chỉ kiểm tra isFinite: một khung
+        // distance rác (3 cm hoặc 250 cm do landmark nhảy) thành BELOW/ABOVE_BOUND chứ không phải
+        // INSUFFICIENT_DATA, tức là sinh cảnh báo giả từ lỗi đo.
+        val plausible = finite?.takeIf { it >= feature.validMin && it <= feature.validMax }
+        if (plausible == null || bound == null) {
             return FeatureEvaluation(feature, finite, bound, FeatureStatus.INSUFFICIENT_DATA)
         }
         return FeatureEvaluation(feature, finite, bound, bound.classify(finite))

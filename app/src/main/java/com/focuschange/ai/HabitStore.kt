@@ -113,6 +113,19 @@ internal class HabitStore(private val context: Context) {
                 }
                 if (s == null) dropped++ else profile.sessions.add(s)
             }
+            // Khối hiệu chuẩn đọc trong try riêng: hồ sơ chưa từng hiệu chuẩn (hoặc file đời cũ
+            // không có mục "cal") chỉ có nghĩa là chưa hiệu chuẩn, không được ăn mất các phiên
+            // đã học. Nếu nó nằm trong try ở ngoài, một giá trị NaN là sessions.clear() chạy theo.
+            try {
+                val cal = root.optJSONObject("cal")
+                if (cal != null) {
+                    profile.distanceScale = cal.optDouble("distance_scale", Double.NaN).toFloat()
+                    profile.calRawDistanceCm = cal.optDouble("raw_distance_cm", Double.NaN).toFloat()
+                    profile.calibratedAtMs = cal.optLong("calibrated_at_ms", 0L)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Hồ sơ $id không đọc được khối hiệu chuẩn", e)
+            }
         } catch (e: Exception) {
             parseError = e
             profile.sessions.clear()
@@ -146,6 +159,18 @@ internal class HabitStore(private val context: Context) {
             val arr = JSONArray()
             for (s in p.sessions) arr.put(s.toJson())
             root.put("sessions", arr)
+
+            if (p.hasCalibration()) {
+                val cal = JSONObject()
+                // JSONObject.put(String, Double) ném ngoại lệ với NaN, nên từng giá trị phải
+                // tự kiểm tra thay vì ghi cả ba rồi để try ở ngoài bắt.
+                cal.put("distance_scale", p.distanceScale.toDouble())
+                if (p.calRawDistanceCm.isFinite()) {
+                    cal.put("raw_distance_cm", p.calRawDistanceCm.toDouble())
+                }
+                if (p.calibratedAtMs > 0L) cal.put("calibrated_at_ms", p.calibratedAtMs)
+                root.put("cal", cal)
+            }
 
             val f = file(p.id)
             val tmp = File(f.parentFile, f.name + ".tmp")
