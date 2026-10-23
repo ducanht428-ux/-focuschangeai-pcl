@@ -31,11 +31,12 @@ internal object HabitConfig {
 
     /**
      * Minimum number of qualifying sessions and minimum total valid time to count as "profile
-     * established". The two numbers come as a pair: 4 sessions x MIN_SESSION_MS (2 minutes) only gives
-     * 8 minutes, so the 10-minute total cap forces sessions to average 2.5 minutes rather than
-     * allowing four back-to-back 2-minute sessions.
+     * established". Sized for the demo booth: one visit is 5 sessions x 2.5 minutes of recording,
+     * which needs 10 valid minutes and has ~20% slack (750 s filmed vs 600 s required) because
+     * validMs only counts frames with a usable face signal. The previous 4 x 2.5 = 600 s case had
+     * exactly zero margin - one glance away from the camera could lose the whole profile.
      */
-    const val MIN_SESSIONS = 4
+    const val MIN_SESSIONS = 5
     const val MIN_TOTAL_MS = 10L * 60L * 1000L
 
     const val MAX_SESSIONS = 40
@@ -418,11 +419,12 @@ internal class HabitProfile(val id: String, var name: String) {
                 totalValidMs() >= HabitConfig.MIN_TOTAL_MS
 
     /**
-     * Độ tin cậy 0..1: càng nhiều phiên, ngưỡng cá nhân càng được ưu tiên hơn ngưỡng mặc định.
-     * Mốc "+1" neo vào MIN_SESSIONS để đúng PHIÊN ĐẦU TIÊN đạt chuẩn của một hồ sơ vừa đủ điều
-     * kiện luôn bắt đầu ở 0.2. Nếu giữ `- 2` như bản cũ thì từ 3 phiên lên 4 phiên, hồ sơ vừa
-     * "ready" đã nhảy thẳng xuống 0.4 - trộn mạnh gấp đôi với cùng lượng dữ liệu, chỉ vì một hằng
-     * số khác bị đổi ở chỗ khác.
+     * Confidence 0..1: the more sessions, the more the personal threshold outweighs the default.
+     * The "+1" milestone is anchored to MIN_SESSIONS so the FIRST qualifying session of a profile
+     * that has just become eligible always starts at 0.2. Keeping the old `- 2` would have made a
+     * profile jump straight to 0.4 the moment it turned "ready" after MIN_SESSIONS went from 4 to
+     * 5 - twice the blending strength for the same amount of data, just because a constant was
+     * changed elsewhere.
      */
     fun confidence(): Float {
         if (!isReady()) return 0f

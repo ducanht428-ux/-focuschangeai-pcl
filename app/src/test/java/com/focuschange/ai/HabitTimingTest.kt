@@ -232,24 +232,43 @@ class HabitTimingTest {
     )
 
     /**
-     * The two new thresholds come as a PAIR: MIN_SESSIONS x MIN_SESSION_MS (4 x 2 minutes = 8
-     * minutes) is still BELOW MIN_TOTAL_MS (10 minutes), so four borderline sessions are not
-     * enough to open a profile. This test exists so that editing a constant somewhere else
-     * cannot silently keep the profile from ever becoming "ready" during the fair.
+     * The two gates still come as a PAIR, but at 5 sessions the per-session floor and the total bar
+     * now meet exactly (5 x 2 minutes = 10 minutes = MIN_TOTAL_MS), so "borderline sessions miss the
+     * total" is no longer a real case. This test pins the other direction instead: four long sessions
+     * already satisfy the 10-minute total and must STILL be refused. Without it, MIN_SESSIONS would
+     * bind nothing at all and a single long recording could open a profile.
      */
     @Test
-    fun fourSessionsAtThePerSessionFloorStillMissTheTotalBar() {
+    fun fourLongSessionsMeetTheTotalButMissTheSessionCount() {
         val p = HabitProfile("hs1", "Học sinh 1")
-        repeat(HabitConfig.MIN_SESSIONS) { p.sessions.add(studySession(HabitConfig.MIN_SESSION_MS)) }
-        assertEquals(8L * 60L * 1000L, p.totalValidMs())
-        assertFalse("4 phiên sát mép mà đã ready thì MIN_TOTAL_MS không còn tác dụng", p.isReady())
+        repeat(HabitConfig.MIN_SESSIONS - 1) { p.sessions.add(studySession(150_000L)) }
+        assertEquals(10L * 60L * 1000L, p.totalValidMs())
+        assertFalse("thiếu một phiên mà đã ready thì MIN_SESSIONS không còn tác dụng", p.isReady())
     }
 
     /**
-     * Four sessions of 2.5 minutes = exactly 10 minutes = just enough for ONE demo run. And
+     * Five sessions at the per-session floor land on the boundary: 5 x 120 s = exactly MIN_TOTAL_MS,
+     * so the profile is ready with ZERO slack. The booth script does 5 x 2.5 minutes, which needs 10
+     * valid minutes out of 12.5 filmed (~20% headroom) - validMs only counts frames that had a usable
+     * face signal. Recorded so anyone who later lowers MIN_SESSION_MS or raises MIN_TOTAL_MS can see
+     * which demo script stops producing a baseline.
+     */
+    @Test
+    fun fiveSessionsAtTheFloorSitExactlyOnTheTotalBar() {
+        val p = HabitProfile("hs1", "Học sinh 1")
+        repeat(HabitConfig.MIN_SESSIONS) { p.sessions.add(studySession(HabitConfig.MIN_SESSION_MS)) }
+        assertEquals(HabitConfig.MIN_TOTAL_MS, p.totalValidMs())
+        assertTrue(
+            "ngưỡng phiên và ngưỡng tổng lệch nhau thì kịch bản booth 5 phiên sẽ không bao giờ ready",
+            p.isReady()
+        )
+    }
+
+    /**
+     * The booth run: five sessions of 2.5 minutes = 12.5 valid minutes, over the 10-minute bar. And
      * confidence must start at 0.2 on the first qualifying session of a profile that has just
      * become ready - the original design number, not 0.4 shifted by the old "- 2" milestone
-     * once MIN_SESSIONS went up from 3 to 4.
+     * once MIN_SESSIONS moved from 4 to 5.
      */
     @Test
     fun demoLengthSessionsReachReadinessWithConfidenceAtItsFloor() {

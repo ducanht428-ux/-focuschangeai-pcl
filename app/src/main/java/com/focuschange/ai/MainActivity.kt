@@ -710,9 +710,10 @@ class MainActivity : ComponentActivity() {
     private var personalThresholdCount = 0
 
     /**
-     * Phần trăm trọng số của hồ sơ riêng trong ngưỡng hiện hành (chính là c của
-     * HabitProfile.confidence, 0 khi chưa đủ phiên). Bảng "Chỉ số" in ra để không ai hiểu nhầm
-     * "hồ sơ riêng" nghĩa là 100% số của em đó: ở 4 phiên thì cá nhân chỉ chiếm 20%.
+     * Percentage weight of the personal profile in the current threshold (this is c of
+     * HabitProfile.confidence, 0 while there are not enough sessions). The "Chi so" table prints it
+     * so nobody reads "ho so rieng" as "100% of that student's numbers": at 5 sessions the personal
+     * profile is still only 20%.
      */
     @Volatile
     private var personalBlend = 0f
@@ -5765,7 +5766,7 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "Một phiên chỉ được đưa vào hồ sơ khi đạt cả năm điều kiện: >= 2 phút hợp lệ, >= 70% thời gian " +
         "thấy khuôn mặt, >= 50% khung trong lúc thấy mặt là hợp lệ (không chớp lỗi, không đứng ảnh, " +
         "không buồn ngủ), chất lượng tín hiệu trung bình >= 60/100 và SEI trung bình >= 40. App chỉ lập " +
-        "đường cơ sở riêng khi có >= 4 phiên đạt và tổng >= 10 phút hợp lệ; từ đó ngưỡng chung được trộn " +
+        "đường cơ sở riêng khi có >= 5 phiên đạt và tổng >= 10 phút hợp lệ; từ đó ngưỡng chung được trộn " +
         "với ngưỡng của cá nhân theo độ tin, độ tin tăng dần theo số phiên. HUD nói rõ đang có bao nhiêu " +
         "trên tổng 8 ngưỡng là của riêng bạn - nếu thấy 0/8 là vì hồ sơ chưa đủ điều kiện, không phải vì " +
         "app không học.",

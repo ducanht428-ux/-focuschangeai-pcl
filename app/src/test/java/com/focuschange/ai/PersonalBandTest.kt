@@ -139,14 +139,16 @@ class PersonalBandTest {
     }
 
     /**
-     * Dải phải dựng được từ hồ sơ thật, không chỉ từ một baseline bịa ra: đường đi qua
-     * commit() -> baseline() -> band() là nơi các hằng số (MIN_SESSIONS, MIN_TOTAL_MS,
-     * MIN_FRAMES_PER_FEATURE) gặp nhau, và chỉ một trong bốn cái bị đổi là dải biến mất.
+     * The band must be buildable from a REAL profile, not only from a made-up baseline: the path
+     * commit() -> baseline() -> band() is where the constants (MIN_SESSIONS, MIN_TOTAL_MS,
+     * MIN_FRAMES_PER_FEATURE) meet, and changing any one of them can make the band disappear.
+     * The session count is read from HabitConfig instead of hard-coded so this test keeps meaning
+     * "one demo run" after MIN_SESSIONS moved from 4 to 5.
      */
     @Test
-    fun realProfileProducesAUsableBandAfterFourSessions() {
+    fun realProfileProducesAUsableBandAfterOneDemoRun() {
         val prof = HabitProfile("test_band", "Em Test")
-        repeat(4) { i ->
+        repeat(HabitConfig.MIN_SESSIONS) { i ->
             val means = FloatArray(HabitFeature.COUNT) { 50f }
             val stds = FloatArray(HabitFeature.COUNT)
             val counts = IntArray(HabitFeature.COUNT) { 100 }
