@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.google.services)
 }
 
 android {
@@ -55,6 +56,9 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     implementation("com.google.mediapipe:tasks-vision:0.10.26")
+
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.firestore)
 
     implementation("androidx.camera:camera-core:1.4.2")
     implementation("androidx.camera:camera-camera2:1.4.2")

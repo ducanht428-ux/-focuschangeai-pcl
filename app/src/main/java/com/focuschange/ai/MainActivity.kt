@@ -447,6 +447,7 @@ class MainActivity : ComponentActivity() {
     private var glossaryOpen by mutableIntStateOf(-1)
     private var presenterMode by mutableStateOf(false)
     private var showCsvTail by mutableStateOf(false)
+    private var firebaseText by mutableStateOf("Firebase: chưa bật")
     private var csvTailLines by mutableStateOf(emptyList<String>())
     private var csvTailNote by mutableStateOf("")
     private var timelineMarks by mutableStateOf(emptyList<Pair<Float, Int>>())
@@ -761,6 +762,11 @@ class MainActivity : ComponentActivity() {
 
         // Giữ màn hình sáng khi đang theo dõi.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Firebase chỉ để đồng bộ bản tổng kết khi một phiên kết thúc. Thiếu file cấu hình thì
+        // start() tự đánh dấu đã tắt và app vẫn đo bình thường.
+        FirebaseSync.start(applicationContext)
+        firebaseText = FirebaseSync.statusText()
 
         distanceScale = prefs.getFloat(KEY_DISTANCE_SCALE, 1f).coerceIn(0.3f, 3f)
         distanceScaleText = String.format(Locale.US, "x%.2f", distanceScale)
@@ -1251,6 +1257,16 @@ class MainActivity : ComponentActivity() {
                                             Text(if (loggingEnabled) "Dừng ghi CSV" else "Ghi CSV đối chiếu")
                                         }
                                     }
+
+                                    Text(
+                                        firebaseText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (FirebaseSync.enabled) {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        } else {
+                                            Color.Red
+                                        }
+                                    )
 
                                     Spacer(Modifier.height(8.dp))
 
@@ -1947,8 +1963,44 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun endHabitSession() {
+        val summary = habitSession?.toSummary()
         commitHabitSession()
         habitSession = null
+        if (summary != null) uploadSessionToCloud(summary)
+    }
+
+    /**
+     * Kết thúc một phiên là gửi ĐÚNG MỘT bản ghi lên Firestore, chứa số trung bình của cả phiên
+     * chứ không phải từng khung hình. Phiên không đủ điều kiện vào hồ sơ vẫn được gửi và bị đánh
+     * dấu không đủ điều kiện kèm lý do: dữ liệu loại ra cũng là dữ liệu, giấu đi thì bảng tổng
+     * hợp trên đám mây sẽ chỉ còn những phiên đẹp.
+     */
+    private fun uploadSessionToCloud(s: SessionSummary) {
+        if (!FirebaseSync.enabled) return
+        val prof = habitProfile ?: return
+        var alerts = 0
+        for (list in alertOccurrences) alerts += list.size
+        val report = SessionReport(
+            studentId = prof.id,
+            studentName = studentName,
+            summary = s,
+            alertsTotal = alerts,
+            falseAlerts = falseAlertCount,
+            csvRows = dataLogger.rows,
+            avgFps = fpsEma,
+            device = android.os.Build.MODEL,
+            appVersion = packageManager.getPackageInfo(packageName, 0).versionName ?: "?",
+            endedAtWallMs = System.currentTimeMillis(),
+            ineligibleReason = prof.ineligibleReason(s)
+        )
+        FirebaseSync.upload(report) { ok ->
+            // Firestore báo kết quả trên luồng chính nên chạm thẳng vào state của HUD được.
+            firebaseText = FirebaseSync.statusText()
+            if (!ok) {
+                status = "Không gửi được lên Firebase (${FirebaseSync.lastError}) - " +
+                    "số liệu vẫn còn nguyên trong máy."
+            }
+        }
     }
 
     /** Lưu định kỳ và làm mới dòng trạng thái (mỗi giây một lần). */
@@ -4215,10 +4267,17 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        // Lưu phiên đang học khi rời màn hình (chạy trên cameraExecutor để không tranh chấp dữ liệu).
+        // Lưu phiên đang học khi rời màn hình (chạy trên cameraExecutor để không tranh chấp dữ
+        // liệu), và gửi luôn bản tổng kết: với người dùng, tắt màn hình mới là lúc một buổi đo
+        // kết thúc - endHabitSession chỉ chạy khi đổi học sinh hoặc hiệu chuẩn lại. Hai lần gửi
+        // cùng một phiên vẫn chỉ thành MỘT bản ghi trên Firestore vì tên tài liệu là tất định.
         if (::cameraExecutor.isInitialized && !cameraExecutor.isShutdown) {
             try {
-                cameraExecutor.execute { commitHabitSession() }
+                cameraExecutor.execute {
+                    val session = habitSession
+                    commitHabitSession()
+                    if (session != null) uploadSessionToCloud(session.toSummary())
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Không lưu được phiên khi dừng", e)
             }
@@ -5077,6 +5136,7 @@ class MainActivity : ComponentActivity() {
                 dataLogger.rows, dataLogger.droppedRows, dataLogger.malformedRows
             )
         )
+        appendLine(FirebaseSync.statusText())
         appendLine()
         appendLine(seiBreakdown)
         appendLine()
@@ -5186,10 +5246,13 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "tập trung. Trước đây khoảng trống bị suy diễn thành 'bằng chứng không chú ý', gây báo đỏ " +
         "giả khi học sinh với sách hoặc quay sang bạn - nay đã sửa: mất tín hiệu là thiếu dữ liệu.",
     "Quyền riêng tư và dữ liệu" to
-        "Toàn bộ suy luận chạy trên máy, không có lời gọi mạng. Ảnh không lưu, chỉ lưu chuỗi số. Bản " +
-        "sao lưu dự phòng của hệ thống đã tắt (allowBackup=false) và dữ liệu nằm trong thư mục riêng " +
-        "của app. Văn bản chia sẻ chỉ gồm những dòng bạn tự bấm nút tạo ra, và tên hiển thị là do bạn " +
-        "đặt."
+        "Toàn bộ suy luận chạy trên máy; ảnh không được lưu và không rời khỏi điện thoại. Khi một " +
+        "phiên kết thúc, app gửi đúng MỘT bản tổng kết lên Cloud Firestore: tên học sinh, các giá " +
+        "trị trung bình của phiên, số cảnh báo và số lần bấm 'cảnh báo sai'. Mất mạng thì lệnh ghi " +
+        "nằm trong hàng đợi ngoài luồng của Firestore và tự gửi lại khi có mạng. Ngoài bản tổng kết " +
+        "đó không có lời gọi mạng nào khác. Sao lưu dự phòng của hệ thống đã tắt (allowBackup=false), " +
+        "dữ liệu nằm trong thư mục riêng của app, và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm " +
+        "nút tạo ra."
 )
 
 /** Dải màu cho dòng sự kiện, thứ tự khớp với TL_BAND_* ở trên. */
