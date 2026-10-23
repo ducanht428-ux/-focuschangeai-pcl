@@ -5,8 +5,8 @@ import kotlin.math.PI
 import kotlin.math.abs
 
 /**
- * Điểm mốc khuôn mặt dạng mảng phẳng [x0, y0, z0, x1, y1, z1, ...].
- * Tránh tạo ~1.400 đối tượng Pair/Float mỗi khung hình (giảm GC, mượt hơn).
+ * Face landmarks as one flat array [x0, y0, z0, x1, y1, z1, ...].
+ * Avoids allocating ~1,400 Pair/Float objects per frame (less GC, smoother).
  */
 internal class Landmarks(val data: FloatArray, val count: Int) {
     fun x(i: Int): Float = data[i * 3]
@@ -17,8 +17,8 @@ internal class Landmarks(val data: FloatArray, val count: Int) {
 internal val EMPTY_LANDMARKS = Landmarks(FloatArray(0), 0)
 
 /**
- * Ảnh chụp toàn bộ trạng thái HUD sau mỗi khung hình.
- * Được tạo trên cameraExecutor và chỉ đọc trên UI thread (immutable).
+ * Snapshot of the whole HUD state after each frame.
+ * Built on cameraExecutor, read only on the UI thread (immutable).
  */
 internal data class HudSnapshot(
     val faceDetected: Boolean,
@@ -73,14 +73,14 @@ internal data class HudSnapshot(
     val eyeDetail: String,
     val imageDetail: String,
     /**
-     * Dòng nhắc cho người vận hành khi bề rộng khuôn mặt hiện tại không khớp hồ sơ đã chọn.
-     * Không phải cảnh báo mất tập trung và không bao giờ phát ra tiếng; null khi chưa có gì để nghi.
+     * Reminder line for the operator when the face width does not match the selected profile.
+     * Not a distraction alert and never audible; null while there is nothing to suspect.
      */
     val personHint: String? = null,
     val bandSummary: String = ""
 )
 
-/** Một mẫu tư thế đầu trong cửa sổ trượt thời gian (góc thô, chưa lọc). */
+/** One head-pose sample in the time sliding window (raw angle, unfiltered). */
 internal data class PoseSample(
     val timeMs: Long,
     val yawDeg: Float,
@@ -89,19 +89,19 @@ internal data class PoseSample(
     val ear: Float
 )
 
-/** Một lần vi phạm chú ý (có trọng số) trong cửa sổ tích lũy. */
+/** One weighted attention violation inside the accumulating window. */
 internal data class ViolationEvent(
     val timeMs: Long,
     val weight: Float
 )
 
 /**
- * Bảng "điểm từ đâu mà ra", dựng từ các giá trị đã tính sẵn nên không đo lại gì.
- * Tách ra file thuần để test trên máy tính được: đây là bảng giám khảo sẽ đọc,
- * một con số in sai ở đây tệ hơn là điểm số thay đổi.
+ * The "where did the score come from" table, built from values already computed so nothing is
+ * measured again. Kept in a pure file so it can be tested on a computer: this is the table judges
+ * read, and one wrongly printed number there is worse than a score that changes.
  *
- * @param weightedSum tổng có trọng số TRƯỚC khi trừ phạt (để cộng được ngược lại).
- * @param finalRaw giá trị thật đưa vào làm mượt, tức là sau khi trừ phạt và chặn ảnh tĩnh.
+ * @param weightedSum weighted total BEFORE the penalty (so it can be added back up).
+ * @param finalRaw value actually smoothed, i.e. after the penalty and the still-image block.
  */
 internal fun buildSeiBreakdown(
     posture: Float,
@@ -155,9 +155,9 @@ private fun StringBuilder.seiPart(name: String, score: Float, weight: Float) {
 }
 
 /**
- * Kiểm tra nhanh một dòng CSV có đúng số cột của tiêu đề không, bằng cách đếm dấu phẩy.
- * Đếm thủ công thay bằng split: split tạo ra ~37 chuỗi cho mỗi khung hình, tức ~1.100 chuỗi
- * mỗi giây chỉ để kiểm tra một thứ lẽ ra miễn phí.
+ * Quick check that a CSV row has exactly the header's column count, by counting commas.
+ * Counted by hand instead of split: split would allocate ~37 strings per frame, i.e. ~1,100
+ * strings per second just to check something that should be free.
  */
 internal fun csvShapeOk(line: String, columnCount: Int): Boolean {
     var commas = 0
@@ -170,15 +170,15 @@ internal fun csvShapeOk(line: String, columnCount: Int): Boolean {
 }
 
 /**
- * Giá trị của một cột CSV ở khung hình KHÔNG có mặt người.
+ * Value of a CSV column in a frame with NO face present.
  *
- * Tra theo TÊN cột thay vì đếm vị trí: trước đây dòng này được viết bằng vòng lặp
- * `for (i in 3..28) append(',')`, nghĩa là thêm một cột vào tiêu đề ở giữa là mọi giá trị
- * phía sau bị dồn lệch một ô và cả file đối chiếu thành rác mà không ai phát hiện.
- * Với cách tra tên, một cột lạ chỉ nhận ô trống - đúng ý "không đo được".
+ * Looked up by column NAME instead of counting positions: this row used to be written with
+ * `for (i in 3..28) append(',')`, so inserting one column into the middle of the header shifted
+ * every later value by one cell and turned the whole audit file to garbage unnoticed.
+ * With a name lookup an unknown column simply gets an empty cell - exactly "not measured".
  *
- * Ô trống khác với số 0. Viết 0 vào cột tai/mắt sẽ bị đọc thành "mắt nhắm", còn để trống
- * thì người phân tích biết ngay khung hình này không có gì để đo.
+ * An empty cell is not a 0. Writing 0 into an eye column reads as "eyes closed", while an empty
+ * cell tells the analyst immediately that this frame had nothing to measure.
  */
 internal fun noFaceCsvValue(
     column: String,
@@ -202,7 +202,7 @@ internal fun noFaceCsvValue(
     else -> ""
 }
 
-/** Bốn chữ số thập phân, giống hệt cột tương ứng trong dòng có mặt người. */
+/** Four decimals, matching the corresponding column of a face-present row exactly. */
 private fun fixed4(v: Float): String =
     if (v.isNaN() || v.isInfinite()) "" else String.format(Locale.US, "%.4f", v)
 
@@ -210,10 +210,10 @@ private fun fixed2(v: Float): String =
     if (v.isNaN() || v.isInfinite()) "" else String.format(Locale.US, "%.2f", v)
 
 /**
- * Ghép trọn một dòng "mất mặt" vào [out] theo đúng thứ tự [columns].
- * Tách ra ngoài MainActivity để hàm này chạy được trên máy tính trong unit test:
- * thủng một ô trong file đối chiếu là mất luôn cả phiên đo, mà mắt người thì không
- * đếm nổi 37 dấu phẩy.
+ * Builds a complete "no face" row into [out] in exactly the [columns] order.
+ * Moved out of MainActivity so this runs on a computer in a unit test: one missing cell
+ * in the audit file costs the whole measurement session, and a human
+ * eye cannot count 37 commas.
  */
 internal fun buildNoFaceCsvRow(
     columns: List<String>,
@@ -237,14 +237,14 @@ internal fun buildNoFaceCsvRow(
 }
 
 /**
- * Đọc [wanted] dòng cuối của một file văn bản mà không nạp cả file.
- * Cửa sổ [windowBytes] được cắt sao cho dòng đầu tiên (rất có thể bị cắt giữa chừng) bị loại,
- * trừ khi phần đọc bắt đầu đúng từ đầu file.
+ * Reads the last [wanted] lines of a text file without loading the whole file.
+ * The [windowBytes] window is cut so that its first line (very likely truncated mid-line) is
+ * dropped, unless the read started exactly at the beginning of the file.
  *
- * Trả về `null` khi không có gì để đọc - file không tồn tại, bị xoá giữa chừng, hoặc quyền truy
- * cập bị thu hồi. Danh sách rỗng nghĩa là đọc được nhưng file chưa có dòng dữ liệu nào. Hai
- * chuyện này phải khác nhau: "app chưa ghi được dòng nào" và "tìm không thấy file" là hai kết
- * luận khác hẳn nhau khi đối chiếu số.
+ * Returns `null` when there is nothing to read - the file does not exist, was deleted midway, or
+ * access was revoked. An empty list means the file could be read but holds no data rows yet.
+ * Those two must stay different: "the app has not written any row" and "file not found" are
+ * opposite conclusions when reconciling the numbers.
  */
 internal fun readTailLines(
     file: java.io.File,
@@ -256,17 +256,17 @@ internal fun readTailLines(
         return emptyList()
     }
     if (len == 0L) {
-        // length() cũng trả về 0 khi file không có thật, nên phải hỏi lại exists() để không
-        // báo "file rỗng" cho một file thực ra là tìm không thấy.
+        // length() also returns 0 for a file that does not exist, so exists() is asked again so as not
+        // to report "empty file" for a file that was actually not found.
         return if (file.exists()) emptyList() else null
     }
     val window = minOf(len, windowBytes).toInt()
     val start = len - window
     return try {
         java.io.RandomAccessFile(file, "r").use { raf ->
-            // Dòng đầu của cửa sổ chỉ bị cắt khi cửa sổ bắt đầu GIỮA một dòng. Nếu byte liền
-            // trước cửa sổ là xuống dòng thì dòng đó nguyên vẹn và phải được giữ lại: bỏ nó
-            // theo phản xạ khiến bảng "vài dòng cuối" ít hơn số dòng thật đang có trên đĩa.
+            // The first line of the window is truncated only when the window starts MID-line. If the byte
+            // right before the window is a newline, that line is intact and must be kept: dropping it
+            // reflexively would make the "last few rows" table show fewer rows than the disk really has.
             val firstLineCut = start > 0L && try {
                 raf.seek(start - 1L)
                 raf.readByte() != '\n'.code.toByte()
@@ -289,7 +289,7 @@ internal fun readTailLines(
 }
 
 /**
- * Bộ lọc One Euro: làm mượt tín hiệu nhiễu nhưng vẫn bám nhanh khi chuyển động nhanh.
+ * One Euro filter: smooths a noisy signal yet keeps up during fast movement.
  */
 internal class OneEuroFilter(
     private val minCutoff: Float,
@@ -340,19 +340,19 @@ internal class OneEuroFilter(
 }
 
 /**
- * Giới hạn trên của một khoảng cách khung hình được coi là còn thuộc nhịp máy.
- * Khung nào thưa hơn mức này là ứng dụng bị đứng, không suy ra được mắt mở hay đóng.
+ * Upper bound of a frame gap still considered part of the machine cadence.
+ * A gap wider than this means the app stalled - no inference about eyes open or closed.
  */
 internal const val WINDOW_STALL_MS = 700L
 
 /**
- * Bộ đếm tỉ lệ thời gian một cờ đúng trong cửa sổ trượt (60 bucket, mỗi bucket 1 giây).
- * Dùng cho PERCLOS và tỉ lệ mất tập trung.
+ * Counts the fraction of time a flag holds inside a sliding window (60 buckets, 1 second each).
+ * Used for PERCLOS and the distraction ratio.
  *
- * @param capFrameMs trần của dt khi nhịp máy nhanh hơn [refFrameMs]; khi nhịp máy chậm
- * thì dt bị chặn ở refFrameMs để khoảng cách thật không nhân đôi mẫu số.
- * @param refFrameMs nhịp khung hình tham chiếu; mặc định cho ra xấp xỉ mức 200 ms mà
- * phiên bản cũ dùng, nên không làm đổi thang đo đã chỉnh ngưỡng.
+ * @param capFrameMs ceiling for dt when the machine cadence is faster than [refFrameMs]; when the
+ * cadence is slower, dt is clamped to refFrameMs so a real gap does not double the denominator.
+ * @param refFrameMs reference frame cadence; the default lands close to the 200 ms the old
+ * version used, so thresholds tuned against that scale stay valid.
  */
 internal class WindowRatio(
     private val buckets: Int,
@@ -372,16 +372,16 @@ internal class WindowRatio(
         lastFrameMs = 0L
     }
 
-    /** Gọi khi mất khuôn mặt để không cộng dồn khoảng trống thời gian. */
+    /** Called when the face is lost so a time gap is not accumulated. */
     fun pause() {
         lastFrameMs = 0L
     }
 
     /**
-     * Cờ của một khung được gán cho KHOẢNG VỪA KẾT THÚC tại khung đó (dt là khoảng tính từ
-     * khung trước), nên khung đầu tiên của một cụm không đóng góp gì. Cửa sổ dài 60 giây còn
-     * nhịp máy cỡ vài chục ms nên độ lệch một khung không đáng kể; điều cần đúng là khoảng
-     * dừng bị loại hẳn và mọi khoảng dài hơn [refFrameMs] quy về cùng một trọng số.
+     * A frame's flag is assigned to the INTERVAL THAT JUST ENDED at that frame (dt is measured from
+     * the previous frame), so the first frame of a burst contributes nothing. The window is 60 seconds
+     * while the machine cadence is tens of ms, so a one-frame offset is negligible; what has to be
+     * right is that stalls are excluded entirely and every gap over [refFrameMs] carries one weight.
      */
     fun record(nowMs: Long, flagged: Boolean) {
         val rawDt = if (lastFrameMs == 0L) 0L else nowMs - lastFrameMs
@@ -405,8 +405,8 @@ internal class WindowRatio(
     }
 
     /**
-     * Trả về null khi chưa đủ [minSampleMs] mẫu trong cửa sổ. "Chưa đo đủ" và "đo ra 0%" là hai
-     * kết luận khác nhau: 0% là bằng chứng tốt, còn 0% giả vì thiếu mẫu thì lại là chưa biết gì.
+     * Returns null while the window holds fewer than [minSampleMs] samples. "Not measured enough" and
+     * "measured 0%" are different conclusions: 0% is evidence, a fake 0% from missing samples is not.
      */
     fun percentOrNull(nowMs: Long): Float? {
         val nowSec = nowMs / 1000L
@@ -431,6 +431,6 @@ internal class WindowRatio(
         }
     }
 
-    /** Như [percentOrNull] nhưng coi "chưa đủ mẫu" là 0% - dùng cho phép tính điểm, không dùng để hiển thị. */
+    /** Like [percentOrNull] but treats "not enough samples" as 0% - for scoring, never for display. */
     fun percent(nowMs: Long): Float = percentOrNull(nowMs) ?: 0f
 }

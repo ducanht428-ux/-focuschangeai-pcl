@@ -7,11 +7,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Test chốt chặn "có vẻ đã đổi người".
+ * Tests the guard for "the person sitting here seems to have changed".
  *
- * Lý do tồn tại: ứng dụng KHÔNG nhận dạng khuôn mặt (chỉ có face_landmarker.task, không có model
- * nhận dạng), nên con đường dễ nói quá nhất là gọi phép so sánh bề rộng mặt bằng "ID khuôn mặt".
- * Các test này giữ nó đúng là cái nó thật: một gợi ý cho người vận hành, có vùng mù được ghi rõ.
+ * Why this exists: the app does NOT recognise faces (only face_landmarker.task, no recognition model), so
+ * the claim that is easiest to overstate is calling the face-width comparison "face ID". These tests keep
+ * it as what it really is: a hint for the operator, with its blind spots written out.
  */
 class PersonGuardTest {
 
@@ -31,7 +31,7 @@ class PersonGuardTest {
         return last
     }
 
-    /** Cùng người, đúng ghế: dao động điểm mốc ~1,6% phải sạch hoàn toàn. */
+    /** Same person, right seat: landmark jitter of ~1.6% must come out completely clean. */
     @Test
     fun samePersonAtTheReferenceSeatIsNotFlagged() {
         val g = PersonGuard()
@@ -46,29 +46,29 @@ class PersonGuardTest {
     }
 
     /**
-     * Mặt hẹp hơn 25% (ước lượng thô dài ra) thì phải bị nghi, nhưng CHỈ sau khi đủ mẫu và
-     * cờ đã kéo đủ HOLD_MS. Cờ bật ngay khung đầu là sai: một khung landmark sập không phải
-     * bằng chứng đổi người.
+     * A face 25% narrower (the raw estimate lengthens) must be suspected, but ONLY once there are enough
+     * samples and the flag has already held for HOLD_MS. Raising it on the first frame is wrong: one frame
+     * with collapsed landmarks is not evidence that the person changed.
      */
     @Test
     fun differentFaceWidthNeedsBothEnoughSamplesAndTheHoldWindow() {
         val g = PersonGuard()
         assertFalse(g.observe(0L, 75f, 50f, 60f))
         assertFalse(g.observe(1_000L, 75f, 50f, 60f))
-        // Mẫu thứ 10 mới bắt đầu tính trung vị; đồng hồ nghi ngờ khởi động tại đó.
+        // The median only starts at sample 10; the suspicion clock begins counting right there.
         var t = 2_000L
         for (i in 2 until PersonGuard.MIN_SAMPLES) {
             assertFalse("bật cờ trước khi đủ ${PersonGuard.MIN_SAMPLES} mẫu", g.observe(t, 75f, 50f, 60f))
             t += 1_000L
         }
-        // t = 10_000: suspectSince = 9_000, mới trôi 1 giây trong số 10 giây HOLD_MS.
+        // t = 10_000: suspectSince = 9_000, only 1 of the 10 HOLD_MS seconds has elapsed.
         assertFalse(g.observe(t, 75f, 50f, 60f))
         t += 9_000L
         assertEquals(19_000L, t)
         assertTrue("kéo dài 10 giây mà vẫn không báo thì chốt chặn vô dụng", g.observe(t, 75f, 50f, 60f))
     }
 
-    /** Ngoài băng tham chiếu thì phải trả NaN: không có quyền suy ra gì từ một khung ngồi lệch. */
+    /** Outside the reference band it must return NaN: no conclusion is allowed from a frame off the seat. */
     @Test
     fun framesOutsideTheReferenceBandMakeNoClaim() {
         val g = PersonGuard()
@@ -78,7 +78,7 @@ class PersonGuardTest {
         assertEquals(0, g.sampleCount())
     }
 
-    /** Hồ sơ chưa hiệu chuẩn (chữ ký NaN/null) thì không bao giờ được đổ tội đổi người. */
+    /** A profile that was never calibrated (NaN/null signature) must never be blamed on a person change. */
     @Test
     fun uncalibratedProfileNeverAccusesAnyone() {
         val g = PersonGuard()
@@ -90,8 +90,8 @@ class PersonGuardTest {
     }
 
     /**
-     * Em đó đứng dậy rồi ngồi lại: đồng hồ nghi ngờ phải về 0, nếu không một cú lỡ 11 giây cộng
-     * với lần trước sẽ thành "đổi người" mà không cần bằng chứng mới.
+     * That student stands up and sits back down: the suspicion clock must go to 0, otherwise one 11 second
+     * slip added to the earlier one becomes "person changed" without any new evidence at all.
      */
     @Test
     fun standingUpResetsTheHoldTimer() {
@@ -103,21 +103,21 @@ class PersonGuardTest {
         }
         assertTrue(g.observe(t, 75f, 50f, 60f))
 
-        // Ra khỏi băng 40-62 cm: mất tín hiệu, không phải bằng chứng.
+        // Leaving the 40-62 cm band: signal lost, not evidence of anything.
         assertFalse(g.observe(t + 1_000L, 75f, 15f, 60f))
         assertEquals(0L, g.suspectMs(t + 1_000L))
 
-        // Ngồi lại đúng chỗ: cửa sổ trung vị còn mẫu cũ, nhưng phải giữ đủ lâu lần nữa mới báo.
+        // Sitting back in place: the median window still holds old samples but must hold long enough again.
         assertFalse("quay lại là phải báo ngay -> cờ học từ lần đứng dậy trước", g.observe(t + 2_000L, 75f, 50f, 60f))
     }
 
-    /** Hiệu chuẩn ra hệ số lệch 20% là trigger đáng tin nhất: khoảng cách lúc đó đã biết trước. */
+    /** A calibration whose factor deviates 20% is the most trustworthy trigger: the distance was known. */
     @Test
     fun calibrationDeviationIsTheTrustworthyTrigger() {
         assertEquals(0f, PersonGuard.calibrationDeviation(60f, 60f), 1e-6f)
         assertEquals(0.25f, PersonGuard.calibrationDeviation(75f, 60f), 1e-6f)
         assertEquals(-0.2f, PersonGuard.calibrationDeviation(48f, 60f), 1e-6f)
-        // Hồ sơ chưa hiệu chuẩn thì không được so, và NaN phải nổi lên thay vì 0 (0 nghĩa là "khớp").
+        // An uncalibrated profile must not be compared, and NaN has to surface instead of 0 (0 means "match").
         assertTrue(PersonGuard.calibrationDeviation(60f, Float.NaN).isNaN())
         assertTrue(PersonGuard.calibrationDeviation(60f, 0f).isNaN())
         assertTrue(PersonGuard.calibrationDeviation(Float.NaN, 60f).isNaN())

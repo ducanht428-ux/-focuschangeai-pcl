@@ -7,16 +7,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Dải cho phép HAI PHÍA học từ thói quen của từng em.
+ * The TWO-SIDED allowed band learned from each student's own habit.
  *
- * Lý do phải có test riêng: dải này được in ra HUD, ghi vào CSV và gửi lên Firebase. Nếu nó
- * báo sai theo một chiều nào đó thì hậu quả không phải một con số lệch mà là một em bị gọi là
- * "bất thường" chỉ vì hồ sơ chưa đủ phiên, hoặc ngược lại - "0% lọt dải" trên đúng những phiên
- * chưa đo được gì.
+ * Why it needs its own test: this band is printed on the HUD, written into the CSV and uploaded to
+ * Firebase. If it reports wrongly in some direction, the consequence is not one skewed number but a
+ * student called "abnormal" merely because the profile has too few sessions - or the reverse, a
+ * "0% outside the band" on exactly the sessions where nothing was measured.
  */
 class PersonalBandTest {
 
-    /** Bas giả tạo: mọi đặc trưng đều "đã học", mean/spread đặt tay đôi với từng chỉ mục. */
+    /** Synthetic baseline: every feature marked as learned, mean/spread hand-set for each index. */
     private fun fakeBaseline(means: FloatArray, spreads: FloatArray, ok: BooleanArray) =
         HabitBaseline(means, spreads, ok)
 
@@ -31,7 +31,7 @@ class PersonalBandTest {
         spreads[HabitFeature.YAW] = 2f
         val band = fakeBaseline(means, spreads, allOk()).band(HabitFeature.YAW)!!
 
-        // BAND_K = 2.5, nên dải của yaw = 0 ± 5 độ, kẹp trong [-60, 60].
+        // BAND_K = 2.5, so the yaw band is 0 +/- 5 degrees, clamped inside [-60, 60].
         assertEquals(-5f, band.min, 1e-4f)
         assertEquals(5f, band.max, 1e-4f)
         assertEquals(BandPosition.BELOW, band.position(-7f))
@@ -47,7 +47,7 @@ class PersonalBandTest {
         spreads[HabitFeature.SEI] = 40f
         val band = fakeBaseline(means, spreads, allOk()).band(HabitFeature.SEI)!!
 
-        // ±100 quanh 98 sẽ đòi dải tới 198 - SEI không có đơn vị đó. Mép trên phải bị kẹp.
+        // +/-100 around 98 would demand a band up to 198 - SEI has no such unit. The upper edge must be clamped.
         assertEquals(100f, band.max, 1e-4f)
         assertEquals(0f, band.min, 1e-4f)
         assertTrue(band.min <= band.mean && band.mean <= band.max)
@@ -55,13 +55,13 @@ class PersonalBandTest {
 
     @Test
     fun featureWithoutDataHasNoBandInsteadOfAZeroWidthBand() {
-        val ok = BooleanArray(HabitFeature.COUNT) // tất cả false
+        val ok = BooleanArray(HabitFeature.COUNT) // all false
         val base = fakeBaseline(zeros(), zeros(), ok)
 
         assertNull(base.band(HabitFeature.YAW))
 
-        // "Chưa biết" mà báo thành dải [0,0] thì mọi giá trị dương đều thành "trên dải":
-        // có tới hai lỗi cùng lúc - báo sai cho hôm nay và làm sạch bằng chứng của ngày mai.
+        // Reporting "unknown" as a band [0,0] turns every positive value into "above the band": that is two
+        // errors at once - a wrong verdict for today and tomorrow's evidence wiped out at the same time.
         val session = HabitSession(1L)
         session.setBands(base, HabitFeature.BAND_FEATURES)
         assertEquals(BandPosition.UNKNOWN, session.observeBand(HabitFeature.YAW, 12f))
@@ -81,7 +81,7 @@ class PersonalBandTest {
         repeat(6) { session.observeBand(HabitFeature.YAW, 0f) }
         repeat(3) { session.observeBand(HabitFeature.YAW, -30f) }
         repeat(1) { session.observeBand(HabitFeature.YAW, 30f) }
-        // Khung NaN và khung của đặc trưng nằm ngoài BAND_FEATURES không được rơi vào "trong dải".
+        // NaN frames and frames of features outside BAND_FEATURES must not fall into "inside the band".
         session.observeBand(HabitFeature.YAW, Float.NaN)
         session.observeBand(HabitFeature.DIST, 999f)
 
@@ -107,9 +107,9 @@ class PersonalBandTest {
         val session = HabitSession(3L)
         session.setBands(fakeBaseline(means, spreads, allOk()), HabitFeature.BAND_FEATURES)
 
-        // -70 độ vượt ngoài khoảng vật lý [-60, 60]. observe() kẹp nó về -60 (đúng, vì kẹp là
-        // việc của trung bình), nhưng chấm dải thì phải thấy BELOW - kẹp trước khi chấm thì
-        // một cái quay đầu quá tay sẽ bị ghi thành "vừa đúng mép trong dải".
+        // -70 degrees is outside the physical range [-60, 60]. observe() clamps it to -60 (correct, clamping is
+        // the averaging job), but band scoring still has to see BELOW - clamping before scoring would record
+        // an over-turned head as "just inside the edge of the band".
         session.observe(HabitFeature.YAW, -70f)
         assertEquals(BandPosition.BELOW, session.observeBand(HabitFeature.YAW, -70f))
         assertEquals(-60f, session.toSummary().mean[HabitFeature.YAW], 0.001f)
@@ -117,8 +117,8 @@ class PersonalBandTest {
 
     @Test
     fun csvCodesSeparateNotScoredFromNoBand() {
-        // -1 (chưa có dải) do toCsvCode(); -2 (khung này không chấm) là hằng ở MainActivity.
-        // Hai mã phải khác nhau, nếu gộp thì CSV không nói được "máy chưa học" hay "em đó vắng".
+        // -1 (no band yet) comes from toCsvCode(); -2 (this frame was not scored) is a constant in MainActivity.
+        // The two codes must differ: merged, the CSV cannot say "the machine has not learned" or "student absent".
         assertEquals(0, BandPosition.BELOW.toCsvCode())
         assertEquals(1, BandPosition.IN.toCsvCode())
         assertEquals(2, BandPosition.ABOVE.toCsvCode())
@@ -130,8 +130,8 @@ class PersonalBandTest {
         val cols = DataLogger().columnNames
         val expected = HabitFeature.BAND_FEATURES.map { "band_" + HabitFeature.KEYS[it] }
 
-        // Nối cuối chứ không chèn giữa: 37 cột cũ phải giữ nguyên thứ tự để file của các phiên
-        // trước vẫn mở được bằng cùng một script phân tích.
+        // Appended at the end rather than inserted in the middle: the 37 old columns keep their order so that
+        // files from earlier sessions still open with the same analysis script.
         assertEquals(expected, cols.takeLast(expected.size))
         assertEquals(cols.size, cols.toSet().size)
         assertFalse(cols.contains("band_distance_cm"))

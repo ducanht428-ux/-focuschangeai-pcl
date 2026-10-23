@@ -8,9 +8,9 @@ import org.junit.Test
 import java.io.File
 
 /**
- * Test hai hàm dựng ra chữ cho người khác đọc: bảng phân tách điểm SEI và bộ đọc dòng cuối
- * file ghi. Lý do tồn tại: hai chỗ này in số, mà số in sai thì không ai phát hiện bằng mắt -
- * nó chỉ âm thầm làm bảng tự mâu thuẫn.
+ * Tests the two functions that build text other people read: the SEI score breakdown table and the tail
+ * reader of the log file. Why they are tested: both print numbers, and a wrongly printed number is not
+ * something anyone catches by eye - it only quietly makes the table contradict itself.
  */
 class ReportFormatterTest {
 
@@ -46,9 +46,9 @@ class ReportFormatterTest {
     )
 
     /**
-     * Tổng có trọng số, các mức trừ và điểm cuối phải khớp nhau. Bản cũ cộng ngược mức trừ
-     * hai lần nên dòng "tổng" in ra cao hơn thực tế đúng bằng số bị trừ - bảng tự mâu thuẫn
-     * mà mắt thường không thấy.
+     * The weighted total, the deductions and the final score must agree with one another. The old version
+     * added a deduction back twice, so the "total" line printed exactly the deducted amount too high - a
+     * table contradicting itself with nothing visible to catch it.
      */
     @Test
     fun totalsAgreeAfterPenalties() {
@@ -62,7 +62,7 @@ class ReportFormatterTest {
         assertTrue(text.contains("mất tập trung kéo dài"))
     }
 
-    /** Không có mức trừ thì bảng không được nhắc tới mức trừ. */
+    /** With no deduction in play the table must not mention deductions at all. */
     @Test
     fun noPenaltyRowsWhenNothingIsSubtracted() {
         val text = breakdown(close = 0f, chronic = 0f, frozen = false, weightedSum = 78.25f, finalRaw = 78.25f)
@@ -71,14 +71,14 @@ class ReportFormatterTest {
         assertFalse(text.contains("chặn ở"))
     }
 
-    /** Ảnh bị nghi là ảnh tĩnh phải hiện đúng mức chặn, không nói chung chung. */
+    /** An image suspected of being static must show the exact clamp level, not a vague phrase. */
     @Test
     fun frozenShowsTheCap() {
         val text = breakdown(close = 0f, chronic = 0f, frozen = true, weightedSum = 78.25f, finalRaw = 30f)
         assertTrue(text.contains("chặn ở 30"))
     }
 
-    /** Sáu dòng thành phần phải cộng lại đúng bằng tổng in ra - đây là bảng giám khảo soi. */
+    /** The six component rows must add up to the printed total - this is the table the judges scrutinise. */
     @Test
     fun componentRowsSumToTheTotal() {
         val text = breakdown(close = 0f, chronic = 0f, frozen = false, weightedSum = 78.25f, finalRaw = 78.25f)
@@ -103,15 +103,15 @@ class ReportFormatterTest {
     }
 
     /**
-     * Đọc phần cuối file và yêu cầu phải đọc được: bộ đọc trả về `null` khi không có gì để đọc,
-     * mà test thì không được phép coi `null` là "rỗng" - như vậy là bỏ sót đúng cái lỗi cần bắt.
+     * Reads the tail of a file and requires that the read actually worked: the reader returns `null` when
+     * there is nothing to read, and a test may not treat `null` as "empty" - that would miss the real bug.
      */
     private fun tailOf(file: File, wanted: Int, windowBytes: Long = 96L * 1024L): List<String> =
         checkNotNull(readTailLines(file, wanted, windowBytes)) {
             "readTailLines trả về null cho ${file.name}"
         }
 
-    /** Đọc đủ số dòng cuối, theo đúng thứ tự chúng xuất hiện trong file. */
+    /** Reads the requested number of last lines, in the order they appear inside the file. */
     @Test
     fun tailReturnsLastLinesInOrder() {
         val lines = (1..25).map { "row_%02d,1,2,3".format(it) }
@@ -120,8 +120,8 @@ class ReportFormatterTest {
     }
 
     /**
-     * Khi cửa sổ đọc bắt đầu giữa một dòng thì dòng bị cắt phải bị loại, không được hiển thị
-     * như một dòng dữ liệu thật - một giá trị cụt trong bảng là đủ để hiểu sai cả phiên.
+     * When the read window starts in the middle of a line, the truncated line has to be dropped rather than
+     * shown as a real data row - one cut-off value in the table is enough to misread the whole session.
      */
     @Test
     fun partialFirstLineOfTheWindowIsDropped() {
@@ -133,7 +133,7 @@ class ReportFormatterTest {
         assertTrue(tail.size <= 6)
     }
 
-    /** File rỗng, file một dòng và yêu cầu đọc không dòng nào đều trả về kết quả an toàn. */
+    /** An empty file, a one-line file and a request for zero lines all return a safe result. */
     @Test
     fun degenerateInputsReturnEmpty() {
         val empty = File.createTempFile("empty", ".csv")
@@ -143,35 +143,35 @@ class ReportFormatterTest {
         assertEquals(listOf("chỉ một dòng"), tailOf(writeTemp(listOf("chỉ một dòng")), 10))
     }
 
-    /** Dòng trống cuối file (do ký tự xuống dòng thừa) không được xuất hiện thành dòng rỗng. */
+    /** A trailing blank line (from an extra line break) must not show up as an empty row. */
     @Test
     fun trailingNewlineDoesNotYieldBlankLine() {
         assertEquals(listOf("a,1", "b,2"), tailOf(writeTemp(listOf("a,1", "b,2")), 10))
     }
 
     /**
-     * Khi cửa sổ đọc bắt đầu đúng vào đầu một dòng thì dòng đó nguyên vẹn và phải được giữ.
-     * Quy tắc "cứ bỏ dòng đầu" trước đây làm mất một dòng thật mỗi khi điểm bắt đầu rơi trúng
-     * ranh giới - với dòng CSV ngắn thì chuyện này xảy ra rất thường.
+     * When the read window starts exactly at the beginning of a line, that line is intact and must be kept.
+     * The old "always drop the first line" rule lost one real row whenever the start landed on a boundary -
+     * with short CSV rows that happens constantly.
      */
     @Test
     fun windowStartingOnALineBoundaryKeepsThatLine() {
-        // Mỗi dòng đúng 6 byte: "ROW" + 2 số + xuống dòng. 20 dòng = 120 byte.
+        // Every row is exactly 6 bytes: "ROW" + 2 digits + line break. 20 rows = 120 bytes.
         val lines = (1..20).map { "ROW%02d".format(it) }
         val f = File.createTempFile("boundary", ".csv")
         f.deleteOnExit()
         f.writeText(lines.joinToString("") { it + "\n" })
         assertEquals(120L, f.length())
-        // Cửa sổ 24 byte -> start = 96 = 16 * 6, ngay đầu dòng ROW17: bốn dòng phải còn đủ.
+        // A 24 byte window -> start = 96 = 16 * 6, exactly at the head of ROW17: four rows must still be there.
         assertEquals(listOf("ROW17", "ROW18", "ROW19", "ROW20"), tailOf(f, 10, windowBytes = 24L))
-        // Cửa sổ 23 byte -> start = 97, cắt giữa dòng ROW17: dòng cụt phải bị bỏ.
+        // A 23 byte window -> start = 97, cutting into ROW17: the truncated row must be dropped.
         assertEquals(listOf("ROW18", "ROW19", "ROW20"), tailOf(f, 10, windowBytes = 23L))
     }
 
     /**
-     * "Không có file" và "file chưa có dòng nào" là hai kết luận khác nhau khi đối chiếu số,
-     * nên hàm đọc phải trả về hai giá trị khác nhau. UI dựa vào `null` để in câu "không đọc
-     * được" thay vì hiện bảng tiêu đề và làm người bấm tưởng app chưa ghi gì.
+     * "There is no file" and "the file has no rows yet" are two different conclusions when reconciling the
+     * numbers, so the reader must return two different values. The UI uses `null` to print "cannot be read"
+     * instead of showing a header-only table that makes whoever tapped think nothing was written.
      */
     @Test
     fun missingFileIsReportedSeparatelyFromAnEmptyOne() {
@@ -183,8 +183,8 @@ class ReportFormatterTest {
     }
 
     /**
-     * Dòng "mất mặt" phải có đúng số cột của tiêu đề, nếu không thì mở file lên Excel sẽ
-     * dồn lệch cả những khung hình tốt đứng phía sau.
+     * A "no face" row must carry exactly the header's column count, otherwise opening the file in Excel
+     * shifts every good frame standing behind it into the wrong column.
      */
     @Test
     fun noFaceRowHasExactlyOneFieldPerHeaderColumn() {
@@ -204,8 +204,8 @@ class ReportFormatterTest {
     }
 
     /**
-     * Giá trị phải nằm ĐÚNG cột, không chỉ đúng số lượng. Đây chính là chỗ vòng lặp đếm
-     * vị trí cũ dễ sai: một cột thêm vào giữa làm `chronic` rơi sang cột `fatigue`.
+     * Values must land in the RIGHT column, not merely the right number of them. This is precisely where
+     * the old position-counting loop went wrong: one column added in the middle pushed `chronic` into `fatigue`.
      */
     @Test
     fun noFaceRowPutsEachValueUnderItsOwnColumnName() {
@@ -225,11 +225,11 @@ class ReportFormatterTest {
         assertEquals("90.00", byName["luma"])
         assertEquals("", byName["fatigue"])
         assertEquals("", byName["quality"])
-        // Tên cột không được trùng nhau, nếu không thì tra tên ở trên vô nghĩa.
+        // Column names must not repeat, otherwise the name lookup above becomes meaningless.
         assertEquals(cols.size, cols.toSet().size)
     }
 
-    /** Cột không đo được thì để trống, không được viết 0 - 0 nghĩa là "mắt nhắm". */
+    /** A column that cannot be measured stays empty, never 0 - 0 would read as "eyes closed". */
     @Test
     fun noFaceRowLeavesUnmeasuredColumnsBlank() {
         assertEquals("", noFaceCsvValue("ear1", 1L, null, 0, 0L, 0f, 0f, 0f))
@@ -239,15 +239,15 @@ class ReportFormatterTest {
         assertEquals("1", noFaceCsvValue("t_ms", 1L, null, 0, 0L, 0f, 0f, 0f))
     }
 
-    /** Số cột phải được kiểm trước khi ghi: một dòng lệch cột làm hỏng cả file đối chiếu. */
+    /** The column count must be checked before writing: one row with shifted columns spoils the audit file. */
     @Test
     fun shapeCheckAcceptsRealRowsAndRejectsShiftedOnes() {
         val cols = DataLogger().columnNames
         assertTrue(csvShapeOk("1,2,3", 3))
         assertFalse(csvShapeOk("1,2,3", 4))
         assertFalse(csvShapeOk("1,2,3,", 3))
-        // Một ô trống vẫn là một dòng hợp lệ của file một cột; điều quan trọng là dòng của cả
-        // tiêu đề thì phải có đúng số dấu phẩy theo cột, thiếu một cái là cả dòng bị chặn.
+        // One empty cell is still a valid row of a single-column file; what matters is that a row of the header
+        // must carry exactly as many commas as there are columns - missing one and the whole row is rejected.
         assertTrue(csvShapeOk("", 1))
         assertFalse(csvShapeOk("", cols.size))
         assertTrue(csvShapeOk("5", 1))
@@ -258,7 +258,7 @@ class ReportFormatterTest {
         assertTrue(csvShapeOk(row, cols.size))
     }
 
-    /** Sei chưa có điểm (chưa đủ khung hình) phải ra ô trống, không phải "0" hay "null". */
+    /** An Sei with no score yet (too few frames) must give an empty cell, not "0" and not "null". */
     @Test
     fun noFaceRowDistinguishesNoSeiFromZeroSei() {
         assertEquals("", noFaceCsvValue("sei", 1L, null, 0, 0L, 0f, 0f, 0f))
@@ -266,13 +266,13 @@ class ReportFormatterTest {
         assertEquals("73", noFaceCsvValue("sei", 1L, 73, 0, 0L, 0f, 0f, 0f))
     }
 
-    /** Số đo môi trường dùng cùng định dạng với dòng có mặt người, để một cột không hai kiểu. */
+    /** Environment measures use the same format as a face-present row so one column never has two styles. */
     @Test
     fun noFaceRowFormatsEnvironmentColumnsLikeTheFullRow() {
         assertEquals("24.5000", noFaceCsvValue("fps", 1L, null, 0, 0L, 24.5f, 0f, 0f))
         assertEquals("33.2500", noFaceCsvValue("proc_ms", 1L, null, 0, 0L, 0f, 33.25f, 0f))
         assertEquals("120.00", noFaceCsvValue("luma", 1L, null, 0, 0L, 0f, 0f, 120f))
-        // NaN mà in ra "NaN" thì Excel hiểu là chữ, cả cột không tính trung bình được.
+        // Printing NaN as "NaN" makes Excel read it as text, so the whole column cannot be averaged.
         assertEquals("", noFaceCsvValue("fps", 1L, null, 0, 0L, Float.NaN, Float.NaN, Float.NaN))
     }
 }

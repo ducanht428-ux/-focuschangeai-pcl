@@ -10,21 +10,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Test lớp Tier 1 (dải dung sai từng đặc trưng). Lớp này CHƯA nối vào pipeline đo của app,
- * nhưng nó đã nằm trong repo và đã push, nên mọi hành vi của nó đều có thể được gọi bất cứ
- * lúc nào. Ba test dưới đây chốt lại ba chỗ mà một sửa đổi vô tình sẽ làm sai số mà không ai
- * nhìn thấy bằng mắt: cổng khoảng vật lý lúc đo, từ chối xuất dải khi dữ liệu toàn NaN, và
- * dải không bị co về 0 khi học sinh ngồi quá yên.
+ * Tests the Tier 1 layer (per-feature tolerance band). This layer is NOT wired into the app measurement
+ * pipeline yet, but it is already in the repo and pushed, so any of its behaviour can be called at any
+ * moment. The three tests below lock the three places where an accidental edit would change the numbers
+ * without anyone seeing it: the physical-range gate while measuring, refusing to emit a band when the
+ * data is all NaN, and a band that must not collapse when a student sits too still.
  */
 class DomainToleranceTest {
 
     private fun spread(center: Double, n: Int) = DoubleArray(n) { center + (it % 5) * 0.1 }
 
     /**
-     * Lúc học, mẫu ngoài khoảng vật lý bị loại. Lúc đo cũng phải vậy: một khung khoảng cách rác
-     * (3 cm hoặc 250 cm do landmark nhảy) là LỖI ĐO, không phải "ngồi quá gần/quá xa". Trước khi
-     * sửa, evaluate chỉ kiểm tra isFinite nên nó trả BELOW/ABOVE_BOUND và biến lỗi đo thành cảnh
-     * báo giả - đúng loại sai số mà falseAlertCount đang đếm.
+     * While learning, samples outside the physical range are dropped. Measuring must do the same: a junk
+     * distance frame (3 cm or 250 cm from jumping landmarks) is a MEASUREMENT ERROR, not "sitting too close
+     * or too far". Before the fix evaluate only checked isFinite, so it returned BELOW/ABOVE_BOUND and turned
+     * a measurement error into an alert - exactly the kind of error falseAlertCount is counting.
      */
     @Test
     fun implausibleLiveReadingIsNotReportedAsAnAlert() {
@@ -37,11 +37,11 @@ class DomainToleranceTest {
         assertEquals(FeatureStatus.INSUFFICIENT_DATA, engine.evaluate(Feature.DISTANCE, Double.NaN).status)
         assertEquals(FeatureStatus.STABLE, engine.evaluate(Feature.DISTANCE, 50.2).status)
 
-        // Giá trị bị từ chối vẫn phải được trả về: người đọc bảng cần thấy cảm biến đã nói gì.
+        // A rejected value must still be returned: the table reader needs to see what the sensor said.
         assertEquals(250.0, engine.evaluate(Feature.DISTANCE, 250.0).value!!, 0.001)
     }
 
-    /** Toàn NaN thì không có dải, và KHÔNG có dải thì không được phép kết luận STABLE hay ABOVE. */
+    /** All NaN means no band, and with NO band there is no licence to conclude STABLE or ABOVE. */
     @Test
     fun allNanCalibrationYieldsNoBandAndNoVerdict() {
         val engine = IndependentFeatureEngine()
@@ -51,9 +51,9 @@ class DomainToleranceTest {
     }
 
     /**
-     * Một học sinh ngồi gần như bất động có sigma ~ 0. Nếu không có sàn minHalfWidth thì dải
-     * co về [mu, mu] và mọi khung sau đó đều bị báo lệch. Đây chính là bẫy khiến học sinh
-     * ngồi ngoan nhất bị gọi tên nhiều nhất.
+     * A student sitting almost motionless has sigma near 0. Without the minHalfWidth floor the band
+     * collapses to [mu, mu] and every later frame is reported as a deviation. This is exactly the trap
+     * that would make the best-behaved student the one called out most often.
      */
     @Test
     fun constantSeriesStillGetsANonDegenerateBand() {

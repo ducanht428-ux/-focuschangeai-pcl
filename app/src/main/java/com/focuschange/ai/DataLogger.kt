@@ -9,14 +9,14 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Bộ ghi dữ liệu nghiên cứu: mỗi khung hình một dòng CSV.
+ * Research data logger: one CSV row per frame.
  *
- * Chỉ ghi chỉ số, không ghi ảnh hay video, nên file không chứa thông tin định danh
- * và vẫn nằm trong thư mục riêng của app (không app nào khác đọc được).
+ * Only numbers are written, never images or video, so the file carries no identifying info
+ * and stays inside the app private directory (no other app can read it).
  *
- * Thread camera chỉ ghép chuỗi rồi bỏ vào hàng đợi; việc đụng flash do thread khác
- * lo. Hàng đợi có giới hạn: khi ghi không kịp thì mất mẫu (có đếm) chứ không làm
- * giật hình, vì mất vài dòng còn phân tích được, còn app đứng thì mất cả phiên.
+ * The camera thread only concatenates strings and pushes them onto the queue; another thread
+ * touches the flash. The queue is bounded: when writing cannot keep up, samples are dropped and
+ * counted instead of stuttering the preview - a few lost rows are still analysable, a freeze is not.
  */
 internal class DataLogger {
 
@@ -31,16 +31,16 @@ internal class DataLogger {
     }
 
     /**
-     * 37 cột đo + 8 cột dải hai phía = 45 cột. Thứ tự phải trùng khớp với chỗ ghép chuỗi
+     * 37 measurement columns + 8 two-sided band columns = 45; the order must match the row builder
      * trong MainActivity.
      *
-     * Để lộ danh sách này (thay vì chỉ chuỗi tiêu đề) để những chỗ phải ghi một dòng
-     * "trống" ghép theo TÊN cột. Đếm vị trí bằng tay thì chỉ cần thêm một cột ở giữa là
-     * toàn bộ dữ liệu phía sau bị dồn lệch, và file đối chiếu sẽ sai mà không ai hay biết.
+     * This list is public (instead of only the header string) so places that must write an "empty"
+     * row can look columns up BY NAME. Counting positions by hand means one column inserted in the
+     * middle shifts every later value, and the audit file becomes wrong without anyone noticing.
      *
-     * Cột dải nằm CUỐI danh sách và mang mã số chứ không phải số đo: -2 = "khung này không được
-     * chấm", -1 = "chưa học được dải cho đặc trưng đó", còn 0/1/2 = dưới/trong/trên. Viết 0 thay
-     * cho -2 hoặc -1 sẽ biến "chưa đo" thành "nằm trong dải", tức là tuyên bố ngược với sự thật.
+     * The band columns sit at the END of the list and carry codes, not measurements: -2 = "this frame
+     * was not scored", -1 = "no band learned for that feature yet", 0/1/2 = below/in/above. Writing 0
+     * instead of -2 or -1 would turn "not measured" into "inside the band", i.e. the opposite claim.
      */
     private val measuredColumns: List<String> = listOf(
         "t_ms", "face", "ear1", "ear2", "openness", "sigma", "eye_valid",
@@ -74,11 +74,11 @@ internal class DataLogger {
         private set
 
     /**
-     * Số dòng bị loại vì số cột không khớp tiêu đề.
+     * Rows dropped because their column count did not match the header.
      *
-     * Thà mất một dòng còn hơn ghi một dòng lệch cột: dòng thiếu cột khiến mọi giá trị phía
-     * sau bị dồn sang cột khác, và khi mở file trên máy tính thì không ai thấy chỗ đó bị
-     * lệch - chỉ thấy số liệu kỳ lạ. Tính vào đây để biết chắc file của phiên này sạch.
+     * Losing one row is better than writing a row with shifted columns: a short row pushes every later
+     * value into the wrong column, and nobody opening the file on a computer can see the shift - they
+     * only see strange numbers. Counted here so this session's file can be proven clean.
      */
     @Volatile var malformedRows = 0L
         private set
@@ -87,18 +87,18 @@ internal class DataLogger {
     private val queued = AtomicInteger(0)
     private var thread: Thread? = null
 
-    /** Trả về đường dẫn file nếu ghi được, null nếu không. */
+    /** Returns the file path when writing worked, null when it did not. */
     fun start(context: Context, meta: String): String? {
         if (isActive) return null
         val dir = dirFor(context) ?: return null
 
-        // Dọn xác của lần ghi trước TRƯỚC khi mở file mới.
-        // stop() chỉ chờ pump cũ tối đa 2 giây; nếu hàng đợi vẫn còn dòng (flash chậm, hoặc
-        // pump chết vì IOException khi file đang ghi), thì những dòng của phiên cũ sẽ bị
-        // viết tiếp vào file của phiên mới - t_ms nhảy ngược về quá khứ và không ai biết dòng
-        // nào thuộc phiên nào.
-        // Tăng số phiên TRƯỚC khi chờ: pump cũ thấy số của nó không còn là hiện hành sẽ tự
-        // dừng ngay thay vì chờ hết 2 giây, và không ai còn ghi vào file của phiên cũ.
+        // Clean up leftovers from the previous write BEFORE opening a new file.
+        // stop() only waits 2 seconds for the old pump; if the queue still holds rows (slow flash, or
+        // the pump died of an IOException while writing), rows from the old session would get
+        // written into the new session's file - t_ms jumps back into the past and nobody knows which
+        // row belongs to which session.
+        // Bump the generation BEFORE waiting: the old pump sees its number is no longer current and
+        // stops at once instead of waiting out the 2 seconds, and nothing writes into the old file.
         val gen = generation.incrementAndGet()
         val old = thread
         thread = null
@@ -111,7 +111,7 @@ internal class DataLogger {
         }
         isActive = false
         while (queue.poll() != null) {
-            // bỏ dòng thừa của phiên cũ
+            // discard leftover rows of the old session
         }
         queued.set(0)
 
@@ -123,8 +123,8 @@ internal class DataLogger {
             w.flush()
             File(dir, META_NAME).writeText(meta)
 
-            // frames.csv bị ghi đè mỗi lần bật ghi, nên false_alerts.csv cũng phải làm lại
-            // từ đầu; nếu không nhãn của phiên hôm trước sẽ dính vào khung hình của phiên này.
+            // frames.csv is overwritten each time logging starts, so false_alerts.csv must also be rebuilt
+            // from scratch; otherwise the previous session's labels would attach to this session's frames.
             try {
                 BufferedWriter(FileWriter(File(dir, ALERTS_NAME), false)).use {
                     it.write(falseAlertHeader)
@@ -177,7 +177,7 @@ internal class DataLogger {
         queued.incrementAndGet()
     }
 
-    /** Ghi ngay khi bấm nút "báo sai" - thưa nên không cần hàng đợi. */
+    /** Written straight away when the false-alert button is pressed - rare, so no queue needed. */
     fun appendFalseAlert(context: Context, line: String): Boolean {
         val dir = dirFor(context) ?: return false
         return try {
@@ -199,12 +199,12 @@ internal class DataLogger {
     }
 
     /**
-     * Số phiên ghi, tăng mỗi lần start(). pump() dùng nó để biết mình còn là người ghi hiện
-     * hành hay đã bị một lần start() mới vượt qua.
+     * Write generation, incremented by every start(). pump() uses it to know whether it is still the
+     * current writer or a newer start() has already overtaken it.
      *
-     * Không có đánh số này thì một pump cũ (ví dụ bị kẹt trong flush() hơn 2 giây nên stop()
-     * hết chờ) sẽ chạy tiếp, ghi dòng cũ vào file mới, rồi khi thoát lại set isActive = false
-     * - tắt luôn việc ghi của phiên mới đang chạy song song.
+     * Without this numbering, an old pump (stuck in flush() for more than 2 seconds so stop() gave
+     * up) would keep running, write old rows into the new file, then set isActive = false on exit
+     * - muting the writing of the new session that is running in parallel.
      */
     private val generation = AtomicInteger(0)
 
@@ -239,9 +239,9 @@ internal class DataLogger {
             } catch (e: Exception) {
                 Log.w(TAG, "Không đóng được file", e)
             }
-            // Chỉ được tắt cờ ghi nếu vẫn là phiên của mình. Nếu một lần start() mới đã xen vào
-            // thì pump cũ thoát ra ở đây mà set isActive = false sẽ âm thầm tắt luôn việc ghi
-            // của phiên mới - màn hình vẫn báo "đang ghi" còn file thì không thêm dòng nào.
+            // Only clear the writing flag if this is still our own generation. If a newer start() squeezed in,
+            // the old pump exiting here and setting isActive = false would silently stop the writing
+            // of the new session - the screen still shows the recording state while the file gains no rows.
             if (generation.get() == gen) {
                 isActive = false
             }
@@ -254,18 +254,18 @@ internal class DataLogger {
         return if (dir.isDirectory || dir.mkdirs()) dir else null
     }
 
-    /** File ảnh đang ghi (hoặc đã ghi lần cuối) để màn hình xem dữ liệu thô đọc lại. */
+    /** Image file currently (or last) written, so the raw-data screen can read it back. */
     fun framesFile(context: Context): File? = dirFor(context)?.let { File(it, FRAMES_NAME) }
 
     fun alertsFile(context: Context): File? = dirFor(context)?.let { File(it, ALERTS_NAME) }
 
     /**
-     * Số dòng DỮ LIỆU đã nằm trên đĩa (không tính dòng tiêu đề), khác với [rows] ở chỗ không
-     * đếm phần còn trong hàng đợi.
+     * DATA rows already on disk (header excluded), unlike [rows] which does not count what is
+     * still sitting in the queue.
      *
-     * Tiêu đề bị trừ ra vì hai con số này được in cạnh nhau để đối chiếu "trong máy đếm bao
-     * nhiêu - trên đĩa bao nhiêu". Nếu để dòng tiêu đề thì một phiên hoàn toàn bình thường
-     * luôn luôn lệch đúng 1, và người xem sẽ tưởng file ghi bị thiếu.
+     * The header is excluded because these two numbers are printed side by side to compare "counted
+     * in memory - written on disk". Counting the header would make a perfectly normal session always
+     * differ by exactly 1, and the reader would think the file was incomplete.
      */
     fun linesOnDisk(context: Context): Long {
         val f = framesFile(context) ?: return -1L

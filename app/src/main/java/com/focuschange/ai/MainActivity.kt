@@ -362,7 +362,7 @@ class MainActivity : ComponentActivity() {
         const val BREAKDOWN_REFRESH_MS = 400L
         const val THRESHOLD_REFRESH_MS = 1_000L
 
-        // Dòng sự kiện 60 giây: mỗi loại một dải nằm ngang, newest ở cạnh phải.
+        // Event line of the last 60 seconds: one horizontal strip per type, newest at the right edge.
         const val TL_BAND_ALERT = 0
         const val TL_BAND_CHRONIC = 1
         const val TL_BAND_NO_FACE = 2
@@ -376,8 +376,8 @@ class MainActivity : ComponentActivity() {
         const val LOG_EVERY_N_FRAMES = 30
     }
 
-    // @Volatile: tạo trên UI thread, đọc trên cameraExecutor, và giờ được set về null bởi
-    // chính cameraExecutor (xem onDestroy) - ba thread cùng chạm vào một con trỏ native.
+    // @Volatile: created on the UI thread, read on cameraExecutor, and now also set back to null by
+    // cameraExecutor itself (see onDestroy) - three threads touching one native pointer.
     @Volatile
     private var faceLandmarker: FaceLandmarker? = null
     private lateinit var cameraExecutor: ExecutorService
@@ -390,10 +390,10 @@ class MainActivity : ComponentActivity() {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
     }
 
-    // ---------------- Thông tin giao diện (chỉ ghi trên UI thread) ----------------
-    // `status` đi qua một property để mỗi lần đổi chữ tự cắm thêm thời gian được giữ: dòng
-    // trạng thái chu kỳ (có mặt / chưa có mặt) chạy mỗi 120 ms và nếu nó cứ ghi đè thẳng thì
-    // bản tóm tắt ghi CSV hay nhắc quyền camera mất hút trước khi người bên cạnh đọc kịp.
+    // ---------------- Interface information (written on the UI thread only) ----------------
+    // `status` goes through a property so each change keeps its own hold timestamp: the cycle
+    // status line (face present / face absent) rewrites every 120 ms, and if it overwrote it
+    // directly the CSV summary or the camera permission hint would vanish before anyone could read it.
     private var statusText by mutableStateOf("Đang khởi tạo MediaPipe...")
     private var statusHoldUntilMs = 0L
     private var status: String
@@ -445,7 +445,7 @@ class MainActivity : ComponentActivity() {
     private var fatigueText by mutableStateOf("--")
     private var signalText by mutableStateOf("--")
     private var seiHistory by mutableStateOf(emptyList<Int>())
-    private var soundMode by mutableStateOf(2) // 0 tắt, 1 chỉ cảnh báo quan trọng, 2 đầy đủ
+    private var soundMode by mutableStateOf(2) // 0 off, 1 important alerts only, 2 full
 
     private var studentName by mutableStateOf("")
     private var habitText by mutableStateOf("--")
@@ -460,16 +460,16 @@ class MainActivity : ComponentActivity() {
     private var habitLearnUi by mutableStateOf(true)
     private var showAddStudent by mutableStateOf(false)
 
-    /** Hồ sơ mà máy này đang gắn (KEY_BOUND_STUDENT), chỉ đổi được qua hộp xác nhận. */
+    /** Profile this phone is bound to (KEY_BOUND_STUDENT), changeable only through the confirm dialog. */
     private var boundStudentId by mutableStateOf("")
     private var showRebind by mutableStateOf(false)
     private var rebindTargetId: String? = null
     private var showResetHabit by mutableStateOf(false)
     private var newStudentName by mutableStateOf("")
 
-    // ---------------- Bảng điều khiển mở rộng ----------------
-    // 0 = thông số theo dõi, 1 = chuẩn bị trình diễn, 2 = chỉ số và ngưỡng,
-    // 3 = diễn giải cho giám khảo, 4 = kịch bản demo.
+    // ---------------- Extended control panel ----------------
+    // 0 = monitoring parameters, 1 = demo preparation, 2 = indices and thresholds,
+    // 3 = explanation for the judges, 4 = demo script.
     private var panelTab by mutableIntStateOf(0)
 
     private var preflightRunning by mutableStateOf(false)
@@ -490,14 +490,14 @@ class MainActivity : ComponentActivity() {
     private var csvTailNote by mutableStateOf("")
     private var timelineMarks by mutableStateOf(emptyList<Pair<Float, Int>>())
 
-    // Dòng sự kiện 60 giây gần nhất: mỗi loại một dải, điểm mới nhất nằm bên phải.
+    // Latest 60-second event line: one strip per type, newest point on the right.
     private class TimedEvent(val second: Long, val band: Int)
 
     private val timelineEvents = ArrayDeque<TimedEvent>()
     private val timelineLastSec = LongArray(TL_BAND_COUNT) { -1L }
 
-    // Máy đếm cho bài kiểm tra 20 giây. Chỉ UI thread chạm vào (gọi từ applySnapshot),
-    // nên không cần @Volatile.
+    // Counters for the 20-second test. Touched by the UI thread only (called from applySnapshot),
+    // so no @Volatile is needed.
     private var pfStartMs = 0L
     private var pfFrames = 0
     private var pfFpsSum = 0f
@@ -517,29 +517,29 @@ class MainActivity : ComponentActivity() {
     private var preflightWatchdog: Runnable? = null
     private var csvReading = false
 
-    // Histogram độ trễ: mảng đệm thường, chỉ bản bất biến mới đưa vào state.
+    // Latency histogram: plain backing array, only an immutable copy is handed to state.
     private val latencyCounts = IntArray(LATENCY_BINS)
 
-    // Ngăn của từng mẫu trong vòng tròn LATENCY_SAMPLES. Có vòng tròn này mới xoá đúng mẫu
-    // cũ nhất; nếu không, histogram chỉ phình to và "trung bình X ms" là trung bình của cả
-    // phiên, không phải của 240 khung gần nhất như chữ trên HUD hứa.
+    // Slots of each sample in the LATENCY_SAMPLES ring. Having the ring is what lets the oldest
+    // sample be deleted correctly; otherwise the histogram only grows and "average X ms" is the
+    // average of the whole session, not of the last 240 frames as the HUD text promises.
     private val latencyBins = IntArray(LATENCY_SAMPLES)
     private var latencyWriteIdx = 0
     private var latencyFilled = 0
 
-    // Bảng phân tách SEI do cameraExecutor dựng, UI thread chỉ đọc tham chiếu chuỗi.
+    // The SEI breakdown table built by cameraExecutor; the UI thread only reads the string reference.
     @Volatile
     private var seiBreakdown = "--"
     private var lastBreakdownMs = 0L
     private var lastThresholdMs = 0L
     private var activeStudentId = ""
 
-    // Trạng thái chỉ dùng trên UI thread
+    // State used on the UI thread only
     private var lastSnapshot: HudSnapshot? = null
     private var lastHistorySecond = 0L
     private var lastUiTextMs = 0L
 
-    // Độ nhạy: 0 thấp, 1 vừa, 2 cao. Ghi từ UI thread, đọc từ cameraExecutor.
+    // Sensitivity: 0 low, 1 medium, 2 high. Written by the UI thread, read by cameraExecutor.
     @Volatile
     private var sensLevel = 1
     private var lastChronicLevelUi = 0
@@ -550,15 +550,15 @@ class MainActivity : ComponentActivity() {
     private val lastToneMs = LongArray(5) { -1_000_000L }
     private var toneGenerator: ToneGenerator? = null
 
-    // ---------------- Trạng thái xử lý (chỉ dùng trên cameraExecutor) ----------------
+    // ---------------- Processing state (cameraExecutor only) ----------------
     @Volatile
     private var recalibrationRequested = false
 
     @Volatile
     private var distanceCalibrationRequested = false
 
-    // Thời điểm bấm "Chỉnh 50 cm" theo đồng hồ elapsedRealtime. Phải @Volatile vì UI thread
-    // ghi còn cameraExecutor đọc để quyết định mẫu còn dùng được hay đã quá cũ.
+    // When the 50 cm calibration button was pressed, on elapsedRealtime. Must be @Volatile because the
+    // UI thread writes it while cameraExecutor reads it to judge whether a sample is still usable.
     @Volatile
     private var distanceCalRequestedMs = 0L
 
@@ -566,14 +566,14 @@ class MainActivity : ComponentActivity() {
     private var distanceScale = 1f
 
     /**
-     * Hệ số đọc từ pref cũ `distance_scale_v2`. Từ bản này hệ số thật sống trong hồ sơ từng em
-     * (HabitProfile.distanceScale); pref cũ chỉ còn là giá trị cứu cho hồ sơ chưa từng hiệu chuẩn
-     * trên bản mới, và bị ghi đè ngay lần hiệu chuẩn kế tiếp.
+     * Factor read from the old `distance_scale_v2` pref. From this version the real factor lives inside
+     * each student's profile (HabitProfile.distanceScale); the old pref only rescues profiles that were
+     * never calibrated on the new build, and it is overwritten at the very next calibration.
      */
     @Volatile
     private var legacyDistanceScale = 1f
 
-    /** Đổi hồ sơ là đổi luôn hệ số + chữ ký bề rộng mặt, không được mang số của em khác sang. */
+    /** Switching profile switches the factor and the face-width signature - never carry numbers across. */
     private fun applyProfileCalibration() {
         val prof = habitProfile
         val stored = prof?.distanceScale
@@ -591,34 +591,34 @@ class MainActivity : ComponentActivity() {
     private val personGuard = PersonGuard()
 
     /**
-     * Dòng nhắc "có vẻ đã đổi người", do cameraExecutor viết và HudSnapshot chép lại.
-     * Không đi qua chuỗi cảnh báo: chọn sai hồ sơ là lỗi vận hành, không phải biểu hiện mất tập
-     * trung, và ghi nó vào máy đếm cảnh báo sẽ làm bẩn số liệu.
+     * The "the person seems to have changed" reminder line, written by cameraExecutor and copied by
+     * HudSnapshot. It never enters the alert chain: choosing the wrong profile is an operational
+     * mistake, not a sign of distraction, and counting it would pollute the research numbers.
      */
     @Volatile
     private var personHintPlain: String? = null
 
-    /** 0 = không nhắc, 1 = phép thử liên tục (mất khi sạch), 2 = hiệu chuẩn vừa lệch (giữ lại). */
+    /** 0 = no reminder, 1 = rolling test (cleared when clean), 2 = calibration just deviated (kept). */
     @Volatile
     private var personHintKind = 0
 
     /**
-     * Mã vị trí dải của 12 đặc trưng tại khung hình đang xử lý. Chỉ cameraExecutor chạm tới,
-     * dùng lại một mảng như csvBuf để không cấp phát 8 object mỗi khung.
+     * Band position codes of the 12 features for the frame being processed. Only cameraExecutor touches
+     * it, and it reuses one array like csvBuf so that no 8 objects are allocated per frame.
      */
     private val bandCodes = IntArray(HabitFeature.COUNT) { CODE_BAND_NOT_SCORED }
 
-    /** Một dòng tóm tắt + một bảng dài, cameraExecutor dựng mỗi giây một lần. */
+    /** One summary line plus one long table, rebuilt by cameraExecutor once per second. */
     @Volatile
     private var bandSummaryPlain = ""
 
     @Volatile
     private var bandTablePlain = ""
 
-    // Hiệu chuẩn EAR + đường cơ sở cá nhân
-    // Ba biến này thường chỉ cameraExecutor chạm tới, NHƯNG loggerMeta() đọc chúng trên UI
-    // thread để viết meta.txt. Không có @Volatile thì file môi trường của phiên ghi CSV có
-    // thể chép lại giá trị của phiên trước - và meta.txt chính là thứ dùng để tái lập số liệu.
+    // EAR calibration + personal baseline
+    // These three are normally cameraExecutor-only, BUT loggerMeta() reads them on the UI
+    // thread to write meta.txt. Without @Volatile the environment file of a CSV session could
+    // copy values from the previous session - and meta.txt is what the numbers are rebuilt from.
     @Volatile
     private var calibrated = false
     private var calFrames = 0
@@ -645,21 +645,21 @@ class MainActivity : ComponentActivity() {
     private var baselineGazeV = 0.5f
     private var baselineBfr = 0.5f
 
-    // Góc tư thế tuyệt đối (độ) tính từ điểm mốc 3D
+    // Absolute pose angles (degrees) computed from the 3D landmarks
     private var poseYawAbs = 0f
     private var posePitchAbs = 0f
     private var poseRollAbs = 0f
 
-    // Bộ lọc One Euro
+    // One Euro filters
     private val yawFilter = OneEuroFilter(1.5f, 0.30f)
     private val pitchFilter = OneEuroFilter(1.5f, 0.30f)
     private val rollFilter = OneEuroFilter(1.5f, 0.30f)
     private val gazeHFilter = OneEuroFilter(1.5f, 5.0f)
     private val gazeVFilter = OneEuroFilter(1.5f, 5.0f)
-    // Khoảng cách thay đổi rất chậm so với góc đầu, nên cutoff thấp hơn nhiều.
+    // Distance changes far slower than head angle, so its cutoff is much lower.
     private val distanceFilter = OneEuroFilter(0.25f, 0.02f)
 
-    // Thông số camera thật (để tính tiêu cự pixel chính xác)
+    // Real camera parameters (to compute the pixel focal length accurately)
     private var sensorFocalMm = 0f
     private var sensorPhysWmm = 0f
     private var sensorPhysHmm = 0f
@@ -670,25 +670,25 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var streamH = 480
 
-    // Cửa sổ trung vị khoảng cách + mẫu hiệu chuẩn khoảng cách
+    // Distance median window + distance calibration samples
     private val distWindow = ArrayDeque<Float>()
     private val distCalSamples = ArrayList<Float>()
 
-    // Công cụ phân tích mắt nâng cấp (kính, góc nghiêng, nheo mắt, lệch hai mắt, chớp không hoàn toàn).
+    // Upgraded eye analysis engine (glasses, tilt, squint, eye asymmetry, incomplete blinks).
     private val eyeEngine = EyeEngine()
 
-    // Xử lý ảnh mức thấp: CLAHE thích ứng và lọc nhiễu nhẹ trên kênh sáng, trước khi chuyển sang RGB.
+    // Low-level image handling: adaptive CLAHE and light denoising on the luminance channel, before RGB.
     private val enhancer = ImageEnhancer()
     private val faceBox = FloatArray(4)
     private var faceBoxMs = 0L
     private var imageDetail = "--"
     private var lastImageDetailMs = 0L
 
-    // 0 = tự động theo ánh sáng, 1 = tắt (để so sánh A/B chất lượng nhận diện)
+    // 0 = automatic by light level, 1 = off (for an A/B comparison of detection quality)
     @Volatile
     private var enhanceMode = 0
 
-    // ---------------- Học thói quen từng học sinh (chỉ dùng trên cameraExecutor) ----------------
+    // ---------------- Per-student habit learning (cameraExecutor only) ----------------
     private lateinit var habitStore: HabitStore
     private var habitProfile: HabitProfile? = null
     private var habitSession: HabitSession? = null
@@ -696,8 +696,8 @@ class MainActivity : ComponentActivity() {
     private var lastHabitStatusMs = 0L
 
     /**
-     * Thời điểm (elapsedRealtime) được phép gửi nhịp hẹn tiếp theo. Đặt lại khi mở phiên để nhịp
-     * đầu tiên đến sau 1 phút, không phải ngay khung hình đầu tiên.
+     * When (elapsedRealtime) the next presence beat may be sent. Reset when a session opens so the
+     * first beat arrives after 1 minute, not on the very first frame.
      */
     private var nextHeartbeatMs = 0L
     private var habitStatus = "Đang nạp hồ sơ học sinh..."
@@ -729,8 +729,8 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var habitResetRequested = false
 
-    // Ngưỡng hiện hành: mặc định, sẽ được thay bằng ngưỡng cá nhân khi hồ sơ đã đủ dữ liệu.
-    // cameraExecutor ghi, UI thread đọc (bảng "Chỉ số"), nên mỗi cái phải là @Volatile.
+    // Current thresholds: defaults, replaced by personal ones once the profile has enough data.
+    // cameraExecutor writes, the UI thread reads (the index table), so each one must be @Volatile.
     @Volatile private var thrLookYaw = LOOK_AWAY_YAW_DEG
     @Volatile private var thrLookPitch = LOOK_AWAY_PITCH_DEG
     @Volatile private var thrGazeH = GAZE_H_DRIFT
@@ -740,12 +740,12 @@ class MainActivity : ComponentActivity() {
     @Volatile private var thrPerclos = PERCLOS_ALERT
     @Volatile private var thrMar = MAR_YAWN
 
-    // Đúng thứ tự sáu thành phần trong buildSeiBreakdown.
+    // Exactly the order of the six components in buildSeiBreakdown.
     private val seiWeights = floatArrayOf(
         W_POSTURE, W_DISTANCE, W_GAZE, W_EYES, W_BPM, W_EXPRESSION
     )
 
-    // Máy trạng thái chớp mắt
+    // Blink state machine
     private var eyesClosed = false
     private var closedStartMs = 0L
     private var lastBlinkMs = 0L
@@ -753,7 +753,7 @@ class MainActivity : ComponentActivity() {
     private val blinkDurations = mutableListOf<Long>()
     private var monitoringStartMs = 0L
 
-    // PERCLOS và tỉ lệ mất tập trung
+    // PERCLOS and the distraction ratio
     private val perclos =
         WindowRatio(RATIO_BUCKETS, RATIO_MIN_SAMPLE_MS, refFrameMs = RATIO_REF_FRAME_MS)
     private val inattention =
@@ -763,31 +763,31 @@ class MainActivity : ComponentActivity() {
     private val perclosP80 =
         WindowRatio(RATIO_BUCKETS, RATIO_MIN_SAMPLE_MS, refFrameMs = RATIO_REF_FRAME_MS)
 
-    // Độ mở mắt thô của khung hình gần nhất, để dành ghi ra CSV. Biến eye chỉ
-    // sống trong một nhánh if nên phải cất tạm ra đây.
+    // Raw eye opening of the most recent frame, kept for the CSV row. The eye value only
+    // lives inside one if-branch, so it has to be parked here.
     private var lastOpenness = Float.NaN
     private var lastSigma = Float.NaN
     private var lastEyeValid = false
 
     private val dataLogger = DataLogger()
 
-    // Nút bấm đổi trên UI thread, vòng khung hình đọc trên cameraExecutor. Không @Volatile thì
-    // máy có thể chạy cả phiên mà không thấy lệnh bật ghi: file CSV trống mà màn hình báo "đang ghi".
+    // The button toggles on the UI thread, the frame loop reads on cameraExecutor. Without @Volatile the
+    // machine could run a whole session without seeing the record command: empty CSV, screen says writing.
     @Volatile
     private var loggingEnabled = false
     private val csvBuf = StringBuilder(256)
 
-    // Khoảng cách
+    // Distance
     private var smoothedDistanceCm: Float? = null
     private var distanceAlertActive = false
 
-    // Tư thế đầu
+    // Head pose
     private var prevNoseX = Float.NaN
     private var prevNoseY = Float.NaN
     private var jitterEma = 0f
     private var lookAwayStartMs = 0L
 
-    // Cửa sổ trượt tư thế đầu (Anti-Spoofing)
+    // Head pose sliding window (anti-spoofing)
     private val poseWindow = ArrayDeque<PoseSample>()
     private val jerkTimestamps = mutableListOf<Long>()
     private var lastJerkMs = 0L
@@ -795,13 +795,13 @@ class MainActivity : ComponentActivity() {
     // Visual Drift
     private var driftStartMs = 0L
 
-    // Vi biểu cảm
+    // Micro-expressions
     private var furrowStartMs = 0L
     private var yawnStartMs = 0L
     private var yawnCounted = false
     private val yawnTimestamps = mutableListOf<Long>()
 
-    // Động cơ mất tập trung tích lũy
+    // Accumulating distraction engine
     private val violationEvents = ArrayDeque<ViolationEvent>()
     private var prevHeadAway = false
     private var prevDrift = false
@@ -811,21 +811,21 @@ class MainActivity : ComponentActivity() {
     private var chronicActive = false
     private var chronicLevelValue = 0
 
-    // Thống kê phiên
+    // Session statistics
     private var violationsTotal = 0
     private var chronicEpisodes = 0
     private var yawnTotal = 0
     private var minSeiValue = Int.MAX_VALUE
 
-    // Chất lượng tín hiệu
+    // Signal quality
     private var lumaMean = 128f
     private var signalNote = "Tốt"
     private var signalReliable = true
 
-    // Chỉ số mệt mỏi
+    // Fatigue index
     private var fatigueEma = 0f
 
-    // Nghỉ giải lao 20-20-20
+    // 20-20-20 break
     private var workStartMs = 0L
     private var faceLostSinceMs = 0L
 
@@ -842,7 +842,7 @@ class MainActivity : ComponentActivity() {
 
     private var frameCounter = 0L
 
-    // Bộ đệm tái sử dụng để giảm GC (chỉ dùng trên cameraExecutor)
+    // Reusable buffers to cut GC (cameraExecutor only)
     private var yBytes = ByteArray(0)
     private var uBytes = ByteArray(0)
     private var vBytes = ByteArray(0)
@@ -863,11 +863,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Giữ màn hình sáng khi đang theo dõi.
+        // Keep the screen awake while monitoring.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Firebase chỉ để đồng bộ bản tổng kết khi một phiên kết thúc. Thiếu file cấu hình thì
-        // start() tự đánh dấu đã tắt và app vẫn đo bình thường.
+        // Firebase only syncs the summary when a session ends. If the config file is missing, start()
+        // marks itself as disabled and the app keeps measuring normally.
         FirebaseSync.start(applicationContext)
         firebaseText = FirebaseSync.statusText()
 
@@ -890,15 +890,15 @@ class MainActivity : ComponentActivity() {
         val bound = prefs.getString(KEY_BOUND_STUDENT, null)
         val wanted = bound?.takeIf { b -> habitStore.students().any { it.id == b } }
         if (wanted != null) {
-            // Máy đã gắn với một em: bỏ qua con trỏ "current" của HabitStore, vì con trỏ đó đổi
-            // mỗi lần ai đó bấm trong danh sách. Nếu không bỏ qua, chỉ cần một lần bấm là máy
-            // học sinh A bắt đầu ghi số liệu dưới tên B.
+            // This phone is bound to one student: ignore HabitStore's "current" pointer, because that
+            // pointer changes every time someone taps in the list. Without this, a single tap would
+            // make student A's phone start writing data under B's name.
             activeStudentId = wanted
             habitStore.setCurrent(wanted)
         } else {
             activeStudentId = habitStore.currentId()
             if (bound == null) {
-                // Lần chạy đầu trên máy: hồ sơ đang được chọn trở thành chủ máy.
+                // First run on this phone: the currently selected profile becomes the owner.
                 prefs.edit().putString(KEY_BOUND_STUDENT, activeStudentId).apply()
             }
         }
@@ -906,8 +906,8 @@ class MainActivity : ComponentActivity() {
         studentName = habitStore.nameOf(activeStudentId)
         studentSwitchRequest = activeStudentId
 
-        // BootReceiver vừa tự mở app sau khi bật máy: ghi vào dòng trạng thái để buổi đo hôm nay
-        // có dấu vết rõ ràng về việc nó bắt đầu bằng cú tự động hay bằng tay.
+        // BootReceiver just reopened the app after the phone booted: note it in the status line so today's
+        // session leaves a clear trace of whether it started automatically or by hand.
         if (intent?.getBooleanExtra(BootReceiver.EXTRA_AUTO_START, false) == true) {
             status = "Tự mở sau khi bật điện thoại " +
                 "(${intent?.getStringExtra(BootReceiver.EXTRA_AUTO_START_SOURCE) ?: "boot"}). " +
@@ -959,7 +959,7 @@ class MainActivity : ComponentActivity() {
                             color = seiColorOf(seiValue)
                         )
 
-                        // Biểu đồ SEI 2 phút gần nhất.
+                        // SEI chart of the last 2 minutes.
                         Canvas(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1028,7 +1028,7 @@ class MainActivity : ComponentActivity() {
 
                         Spacer(Modifier.height(4.dp))
 
-                        // Khu vực thông số có thể cuộn để khung camera luôn đủ lớn.
+                        // Scrollable parameter area so the camera frame stays large enough.
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1258,7 +1258,7 @@ class MainActivity : ComponentActivity() {
 
                             Spacer(Modifier.height(10.dp))
 
-                            // ---- Bảng điều khiển: chọn một trong năm khung ----
+                            // ---- Control panel: pick one of the five frames ----
                             Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                                 PanelTabs.forEachIndexed { index, title ->
                                     TextButton(onClick = { panelTab = index }) {
@@ -1613,11 +1613,11 @@ class MainActivity : ComponentActivity() {
 
                             Button(
                                 onClick = {
-                                    // Phải ghi mốc thời gian TRƯỚC rồi mới bật cờ: hai biến này
-                                    // đọc trên cameraExecutor, và nếu một khung xen giữa hai lần
-                                    // ghi thì nó thấy "đã xin" với mốc của lần xin trước (hoặc 0),
-                                    // kết luận là lời xin quá cũ, tắt cờ - nút bấm biến mất im
-                                    // lặng mà không hề hiệu chuẩn.
+                                    // Write the timestamp FIRST and only then raise the flag: these two variables are
+                                    // read on cameraExecutor, and if a frame lands between the two
+                                    // writes it sees "already requested" stamped with the earlier request (or 0),
+                                    // concludes the request is too old, clears the flag - the button vanishes
+                                    // silently and no calibration happens.
                                     distanceCalRequestedMs = SystemClock.elapsedRealtime()
                                     distanceCalibrationRequested = true
                                     if (faceCount == 0) {
@@ -1656,11 +1656,11 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Button(
                                 onClick = {
-                                    // Đầy đủ -> Chỉ quan trọng -> Tắt -> Đầy đủ
+                                    // Full -> Important only -> Off -> Full
                                     soundMode = if (soundMode == 0) 2 else soundMode - 1
                                     prefs.edit().putInt(KEY_SOUND_MODE, soundMode).apply()
                                     if (soundMode > 0) {
-                                        // Phát thử để học sinh nghe mức âm lượng.
+                                        // Plays a sample so the student can hear the volume level.
                                         playAlertSound(2, SystemClock.elapsedRealtime(), true)
                                     }
                                 }
@@ -1711,7 +1711,7 @@ class MainActivity : ComponentActivity() {
                                 val lm = landmarkPoints
                                 if (lm.count == 0) return@Canvas
 
-                                // Ánh xạ khớp với FILL_CENTER (phóng to + cắt giữa).
+                                // Mapping matches FILL_CENTER (zoom in + centre crop).
                                 val fw = frameWidth.toFloat().coerceAtLeast(1f)
                                 val fh = frameHeight.toFloat().coerceAtLeast(1f)
                                 val scale = max(size.width / fw, size.height / fh)
@@ -1734,7 +1734,7 @@ class MainActivity : ComponentActivity() {
                                             else -> 2f
                                         },
                                         center = Offset(
-                                            // Camera trước: lật gương theo trục X.
+                                            // Front camera: mirror along the X axis.
                                             (if (cameraMirrored) 1f - lm.x(index) else lm.x(index)) * fw * scale + offsetX,
                                             lm.y(index) * fh * scale + offsetY
                                         )
@@ -1804,7 +1804,7 @@ class MainActivity : ComponentActivity() {
                         it.setSurfaceProvider(view.surfaceProvider)
                     }
 
-                // Giảm độ phân giải phân tích để giảm thời gian xử lý.
+                // Lower the analysis resolution to cut processing time.
                 val analysis = ImageAnalysis.Builder()
                     .setTargetResolution(android.util.Size(640, 480))
                     .setBackpressureStrategy(
@@ -1816,8 +1816,8 @@ class MainActivity : ComponentActivity() {
                     analyzeFrame(image)
                 }
 
-                // Ưu tiên camera trước (điện thoại). Thiết bị không có camera trước (máy tính bảng, Chromebook,
-                // giả lập trên máy tính, webcam gắn ngoài) thì dùng camera sau hoặc camera bất kỳ đang có.
+                // Prefer the front camera (phone). A device with no front camera (tablet, Chromebook, desktop
+                // emulator, external webcam) falls back to the rear camera or whichever camera is available.
                 val hasFront = hasCameraSafe(provider, CameraSelector.DEFAULT_FRONT_CAMERA)
                 val hasBack = !hasFront && hasCameraSafe(provider, CameraSelector.DEFAULT_BACK_CAMERA)
                 if (!hasFront && !hasBack && provider.availableCameraInfos.isEmpty()) {
@@ -1857,7 +1857,7 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // ======================= THÔNG SỐ CAMERA THẬT =======================
+    // ======================= REAL CAMERA PARAMETERS =======================
 
     private fun hasCameraSafe(provider: ProcessCameraProvider, selector: CameraSelector): Boolean {
         return try {
@@ -1871,7 +1871,7 @@ class MainActivity : ComponentActivity() {
         try {
             val cm = getSystemService(CAMERA_SERVICE) as CameraManager
 
-            // Lượt 1: camera trước (điện thoại). Lượt 2: camera bất kỳ (máy tính bảng, giả lập, webcam ngoài).
+            // Pass 1: front camera (phone). Pass 2: any camera (tablet, emulator, external webcam).
             for (frontOnly in booleanArrayOf(true, false)) {
                 for (id in cm.cameraIdList) {
                     val c = cm.getCameraCharacteristics(id)
@@ -1896,7 +1896,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Tiêu cự theo pixel của khung đang phân tích (đã tính phần sensor bị crop). */
+    /** Pixel focal length of the frame being analysed (the cropped part of the sensor is included). */
     private fun focalPx(): Float {
         val longPx = max(streamW, streamH).toFloat()
         val shortPx = min(streamW, streamH).toFloat()
@@ -1908,24 +1908,24 @@ class MainActivity : ComponentActivity() {
         val sensorAspect = sensorPhysWmm / sensorPhysHmm
         val streamAspect = longPx / shortPx
         val pxPerMm = if (sensorAspect >= streamAspect) {
-            shortPx / sensorPhysHmm   // sensor rộng hơn: bị cắt hai bên
+            shortPx / sensorPhysHmm   // wider sensor: cropped on the sides
         } else {
-            longPx / sensorPhysWmm    // sensor hẹp hơn: bị cắt trên dưới
+            longPx / sensorPhysWmm    // narrower sensor: cropped top and bottom
         }
         return sensorFocalMm * pxPerMm
     }
 
-    // ======================= HỌC THÓI QUEN THEO TỪNG HỌC SINH =======================
+    // ======================= HABIT LEARNING PER STUDENT =======================
 
-    // ---- Chạy trên UI thread ----
+    // ---- Runs on the UI thread ----
 
     private fun selectStudent(st: HabitStudent) {
         activeStudentId = st.id
         habitStore.setCurrent(st.id)
         studentName = st.name
-        // Chọn hồ sơ trên máy này = gắn máy cho hồ sơ đó. Mọi đường đổi người đều đi qua hàm này,
-        // kể cả hộp xác nhận đổi người và nút Thêm HS, nên không đường nào đổi được ID mà không bị
-        // ghi lại ở đây.
+        // Choosing a profile on this phone = binding the phone to that profile. Every path that can change
+        // the person goes through this function, including the confirm dialog and the add-student button,
+        // so no path can change the ID without being recorded here.
         prefs.edit().putString(KEY_BOUND_STUDENT, st.id).apply()
         boundStudentId = st.id
         studentSwitchRequest = st.id
@@ -1937,9 +1937,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Nút "Đổi HS" KHÔNG đổi ngay như trước. Đổi người dùng trên một chiếc máy đã gắn ID là kết
-     * thúc buổi đo của em đang ngồi, nên nó phải là một hành động có chủ ý của giáo viên, có giải
-     * thích, chứ không phải một cú trượt ngón tay.
+     * The student-switch button does NOT switch immediately like it used to. Changing the user on a
+     * phone already bound to an ID ends the measurement of the student who is sitting there, so it has
+     * to be a deliberate teacher action with an explanation, not a stray swipe of a finger.
      */
     private fun requestSwitchStudent() {
         val list = habitStore.students()
@@ -1966,7 +1966,7 @@ class MainActivity : ComponentActivity() {
         selectStudent(habitStore.addStudent(name))
     }
 
-    /** Thêm hồ sơ luôn là đổi người, nên nó cũng đi qua selectStudent và gắn lại máy. */
+    /** Adding a profile is always a person change, so it goes through selectStudent and rebinds the phone. */
     private fun requestAddStudent() {
         newStudentName = ""
         showAddStudent = true
@@ -1990,9 +1990,9 @@ class MainActivity : ComponentActivity() {
         prefs.edit().putInt(KEY_SENSITIVITY, sensLevel).apply()
     }
 
-    // ---- Chạy trên cameraExecutor ----
+    // ---- Runs on cameraExecutor ----
 
-    /** Xử lý yêu cầu đổi học sinh / xóa hồ sơ do UI gửi sang. */
+    /** Handles a student switch or profile delete request sent over by the UI thread. */
     private fun processHabitRequests() {
         val switchTo = studentSwitchRequest
         if (switchTo != null) {
@@ -2014,9 +2014,9 @@ class MainActivity : ComponentActivity() {
                 val old = habitProfile
                 habitStore.clear(id)
                 habitProfile = habitStore.load(id)
-                // "Xóa hồ sơ" có nghĩa là quên các phiên đã học, không phải quên luôn lần hiệu
-                // chuẩn khoảng cách: đó là phép đo vật lý, xóa xong bắt người dùng hiệu chuẩn lại
-                // bằng tay mà không nói cho họ biết.
+                // "Delete profile" means forgetting the sessions that were learned, not forgetting the distance
+                // calibration as well: that one is a physical measurement, and erasing it would make the user
+                // calibrate again by hand without anyone being told why.
                 old?.let { prev ->
                     if (prev.hasCalibration()) {
                         habitProfile?.distanceScale = prev.distanceScale
@@ -2053,7 +2053,7 @@ class MainActivity : ComponentActivity() {
         lastSeiValue = -1
     }
 
-    /** Thay ngưỡng mặc định bằng ngưỡng cá nhân, trộn theo độ tin cậy c (0..1). */
+    /** Replaces the default thresholds with personal ones, blended by confidence c (0..1). */
     private fun applyPersonalParams(base: HabitBaseline, c: Float) {
         personalThresholdCount = 0
         personalBlend = c
@@ -2129,7 +2129,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Gọi khi hiệu chuẩn xong: mở phiên mới, áp ngưỡng cá nhân, trộn EAR cơ sở. */
+    /** Called when calibration finishes: opens a new session, applies personal thresholds, blends base EAR. */
     private fun beginHabitSession(nowMs: Long) {
         val prof = habitProfile
         resetPersonalParams()
@@ -2145,7 +2145,7 @@ class MainActivity : ComponentActivity() {
         val session = HabitSession(System.currentTimeMillis())
         habitSession = session
 
-        // Ghi lại EAR cơ sở THÔ của phiên này (trước khi trộn) để không tự khuếch đại.
+        // Records the RAW base EAR of this session (before blending) so it cannot amplify itself.
         if (habitLearnEnabled) {
             session.observe(HabitFeature.EAR, (baselineEar1 + baselineEar2) / 2f)
         }
@@ -2157,14 +2157,14 @@ class MainActivity : ComponentActivity() {
         applyPersonalParams(base, c)
         blendEarWithHabit(base, c)
 
-        // Dải hai phía dựng MỘT LẦN cho cả phiên, từ các phiên đã có trước phiên này. Nạp lại
-        // giữa chừng thì một buổi học khác thường sẽ tự nới dải của chính nó.
+        // The two-sided band is built ONCE for the whole session, from the sessions that came before it.
+        // Rebuilding it midway would let one unusual study session widen its own band.
         session.setBands(base, HabitFeature.BAND_FEATURES)
     }
 
     /**
-     * Trộn EAR cơ sở của phiên với EAR điển hình đã học (tối đa 35% khi đủ tin cậy).
-     * Nếu lệch quá 30% thì giữ nguyên giá trị mới (có thể vừa đổi kính hoặc điều kiện sáng).
+     * Blends the session base EAR with the learned typical EAR (up to 35% at full confidence).
+     * If they differ by more than 30% the new value is kept as is (new glasses or new lighting).
      */
     private fun blendEarWithHabit(base: HabitBaseline, c: Float) {
         val learned = base.mean(HabitFeature.EAR) ?: return
@@ -2192,9 +2192,9 @@ class MainActivity : ComponentActivity() {
     private fun endHabitSession() {
         val session = habitSession
         val summary = session?.toSummary()
-        // Dải phải đọc TRƯỚC khi phiên bị vứt. Nó không được lưu vào hồ sơ (dải của hôm nay mà
-        // nạp vào hồ sơ ngày mai thì một buổi học khác thường sẽ tự nới dải của chính nó), nên
-        // chỗ này là cơ hội duy nhất để giữ nó lại cho CSV và bản ghi trên mây.
+        // The band must be read BEFORE the session is discarded. It is not stored in the profile (today's
+        // band loaded into tomorrow's profile would let one unusual session widen its own band), so this
+        // point is the only chance to keep it for the CSV and the cloud record.
         val bands = session?.bandOutcomes() ?: emptyList()
         commitHabitSession()
         habitSession = null
@@ -2202,10 +2202,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Kết thúc một phiên là gửi ĐÚNG MỘT bản ghi lên Firestore, chứa số trung bình của cả phiên
-     * chứ không phải từng khung hình. Phiên không đủ điều kiện vào hồ sơ vẫn được gửi và bị đánh
-     * dấu không đủ điều kiện kèm lý do: dữ liệu loại ra cũng là dữ liệu, giấu đi thì bảng tổng
-     * hợp trên đám mây sẽ chỉ còn những phiên đẹp.
+     * Ending a session sends EXACTLY ONE record to Firestore, carrying the averages of the whole
+     * session rather than individual frames. A session that fails the profile bar is still sent and
+     * marked ineligible with its reason: excluded data is still data, and hiding it would leave only
+     * the beautiful sessions in the summary table on the cloud.
      */
     private fun uploadSessionToCloud(s: SessionSummary, bands: List<BandOutcome>) {
         if (!FirebaseSync.enabled) return
@@ -2227,7 +2227,7 @@ class MainActivity : ComponentActivity() {
             bandOutcomes = bands
         )
         FirebaseSync.upload(report) { ok ->
-            // Firestore báo kết quả trên luồng chính nên chạm thẳng vào state của HUD được.
+            // Firestore reports the result on the main thread, so it may touch the HUD state directly.
             firebaseText = FirebaseSync.statusText()
             if (!ok) {
                 status = "Không gửi được lên Firebase (${FirebaseSync.lastError}) - " +
@@ -2236,7 +2236,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Lưu định kỳ và làm mới dòng trạng thái (mỗi giây một lần). */
+    /** Saves periodically and refreshes the status line (once per second). */
     private fun maintainHabit(nowMs: Long) {
         if (nowMs - lastHabitSaveMs >= HABIT_AUTOSAVE_MS) {
             lastHabitSaveMs = nowMs
@@ -2252,23 +2252,23 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Nhịp hẹn: báo cho màn hình giáo viên biết "em này đang được đo, tới phút thứ bao nhiêu".
+     * Presence beat: tells the teacher screen "this student is being measured, up to minute N".
      *
-     * Chỉ chạy trong luồng camera, nên nó chỉ có thể gửi khi camera thật sự đang chạy - tức là
-     * màn hình đang bật và app ở tiền cảnh. Vì vậy `beat_at_wall_ms` đứng yên nghĩa là
-     * "KHÔNG ĐO ĐƯỢC", không bao giờ nghĩa là "học sinh đang làm việc khác": Android 9+ cấm app
-     * nền dùng camera, tắt màn hình là hết dữ liệu. Ghi rõ điều này ở đây vì nó chính là chỗ dễ
-     * bị diễn giải sai nhất trên bảng theo dõi.
+     * Only runs inside the camera thread, so it can only be sent while the camera really runs: screen on
+     * and the app in the foreground. A frozen `beat_at_wall_ms` therefore means "NOT MEASURED", never
+     * "the student is doing something else" - Android 9+ forbids a background app from using the camera,
+     * so switching the screen off ends the data. This is spelled out here because it is the cell most
+     * easily misread on the monitoring board.
      *
-     * Nhịp đầu sau HEARTBEAT_FIRST_MS, sau đó mỗi HEARTBEAT_MS - không phải mỗi khung hình: một
-     * phiên 40 phút thêm 8 lần ghi, còn gửi theo khung thì sẽ chạm hạn mức ghi của Firestore
-     * ngay trong buổi đo đầu tiên.
+     * First beat after HEARTBEAT_FIRST_MS, then every HEARTBEAT_MS - not every frame: a 40 minute
+     * session adds 8 writes, while sending per frame would hit the Firestore write quota during
+     * the very first measurement session.
      */
     private fun refreshHeartbeat(nowMs: Long) {
         val session = habitSession ?: return
         if (!FirebaseSync.enabled) return
-        // Nút "Học thói quen" tắt thì tick()/observe() không chạy, số liệu giữa phiên toàn số 0
-        // và giáo viên đọc thành "em này đo ra 0". Thà để bảng presence đứng yên còn trung thực.
+        // With the habit-learning button off, tick()/observe() do not run, mid-session numbers are all zeros
+        // and the teacher reads "this student measured 0". A frozen presence table is the honest option.
         if (!habitLearnEnabled) return
         if (nowMs < nextHeartbeatMs) return
         nextHeartbeatMs = nowMs + HEARTBEAT_MS
@@ -2292,8 +2292,8 @@ class MainActivity : ComponentActivity() {
                 studentId = prof.id,
                 studentName = studentName,
                 sessionId = session.id,
-                // HabitSession được tạo bằng System.currentTimeMillis() nên id và giờ bắt đầu là
-                // một. Truyền riêng hai cột để bản ghi tự giải thích, không bắt người đọc suy.
+                // HabitSession is built with System.currentTimeMillis(), so the id and the start moment are the
+                // same number. Both are passed as separate columns so the record explains itself without guessing.
                 startedAtWallMs = session.id,
                 beatAtWallMs = System.currentTimeMillis(),
                 activeMs = session.activeMs,
@@ -2307,24 +2307,24 @@ class MainActivity : ComponentActivity() {
                 appVersion = appVersionName()
             )
         ) {
-            // Firestore báo kết quả trên luồng chính nên đổi chữ trên bảng được luôn.
+            // Firestore reports the result on the main thread, so the panel text can be changed right away.
             firebaseText = FirebaseSync.statusText()
         }
     }
 
-    /** Nhãn bản dựng, để bảng trên mây phân biệt được máy nào đang chạy bản cũ. */
+    /** Build label, so the cloud table can tell which phone is still running an old build. */
     private fun appVersionName(): String =
         packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
 
     /**
-     * Dựng chữ cho dải hai phía: một dòng cho màn hình chính, một bảng cho tab "Chỉ số".
-     * Chạy trên cameraExecutor cùng nhịp 1 giây với [habitStatus]; bảng dài chỉ được đọc khi
-     * người xem mở tab đó nên không tốn công vô ích.
+     * Builds the two-sided band text: one line for the main screen, one table for the index tab.
+     * Runs on cameraExecutor on the same 1-second tick as [habitStatus]; the long table is only read
+     * when the viewer opens that tab, so no effort is wasted on it.
      *
-     * Hai điều phải in thẳng ra màn hình, không để người xem tự suy ra:
-     * (1) dải chỉ MÔ TẢ, nó không đổi một ngưỡng cảnh báo nào, và
-     * (2) "chưa có dải" khác với "luôn nằm trong dải": hồ sơ chưa đủ phiên thì bảng phải nói là
-     * chưa có gì, chứ không được báo 0% lọt dải.
+     * Two facts are printed straight onto the screen instead of being left for the reader to infer:
+     * (1) the band only DESCRIBES, it changes not one alert threshold, and
+     * (2) "no band yet" differs from "always inside the band": while the profile has too few sessions
+     * the table must say there is nothing, not report a 0% out-of-band rate.
      */
     private fun refreshBandText() {
         val totalFeatures = HabitFeature.BAND_FEATURES.size
@@ -2462,7 +2462,7 @@ class MainActivity : ComponentActivity() {
         return sb.toString()
     }
 
-    // ======================= BÁO CÁO & ÂM BÁO (UI thread) =======================
+    // ======================= REPORTS & SOUNDS (UI thread) =======================
 
     private fun buildReport(): String {
         val s = lastSnapshot ?: return "Chưa có dữ liệu phiên làm việc."
@@ -2512,7 +2512,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Mức âm của từng loại cảnh báo: 1 nhắc nhẹ, 2 cảnh báo, 3 khẩn cấp, 4 nghỉ giải lao. */
+    /** Volume level per alert type: 1 gentle reminder, 2 warning, 3 urgent, 4 break time. */
     private fun alertLevelOf(kind: Int): Int = when (kind) {
         KIND_DROWSY, KIND_CHRONIC -> 3
         KIND_PERCLOS, KIND_YAWN, KIND_TOO_CLOSE -> 2
@@ -2521,8 +2521,8 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Số lần cảnh báo phải xuất hiện thì mới kêu.
-     * Buồn ngủ, mất tập trung kéo dài và nhắc nghỉ giải lao kêu ngay từ lần đầu.
+     * How many times an alert must appear before it makes a sound.
+     * Sleepiness, prolonged distraction and the break reminder sound from the first occurrence.
      */
     private fun alertSoundAfter(kind: Int): Int = when (kind) {
         KIND_DROWSY, KIND_CHRONIC, KIND_BREAK -> 1
@@ -2530,7 +2530,7 @@ class MainActivity : ComponentActivity() {
         else -> ALERT_SOUND_AFTER_NORMAL
     }
 
-    /** Ghi nhận một lần xuất hiện; trả về true nếu đã đủ số lần để kêu. */
+    /** Records one occurrence; returns true once the number of occurrences is enough to sound. */
     private fun registerAlertOccurrence(kind: Int, nowMs: Long): Boolean {
         val window = if (kind == KIND_LOW_PERSONAL) ALERT_COUNT_WINDOW_HABIT_MS
         else ALERT_COUNT_WINDOW_MS
@@ -2549,9 +2549,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Âm báo theo mức độ, mỗi mức một âm khác nhau để nghe là biết loại cảnh báo:
-     * 1 nhắc nhẹ, 2 cảnh báo (bíp đôi), 3 khẩn cấp (âm dài), 4 nghỉ giải lao (âm dịu).
-     * Mỗi mức có khoảng nghỉ riêng để không kêu liên tục làm phiền cả lớp.
+     * Sound by severity, one distinct tone per level so the alert type is recognisable by ear:
+     * 1 gentle reminder, 2 warning (double beep), 3 urgent (long tone), 4 break (soft tone).
+     * Each level has its own quiet period so it cannot nag the whole class continuously.
      */
     private fun playAlertSound(level: Int, nowMs: Long, force: Boolean = false) {
         if (level !in 1..4) return
@@ -2571,7 +2571,7 @@ class MainActivity : ComponentActivity() {
                 else -> 60_000L
             }
             if (nowMs - lastToneMs[level] < minGap) return
-            // Tránh hai âm chồng lên nhau; âm khẩn cấp luôn được phép chen vào.
+            // Avoids two tones overlapping; the urgent level is always allowed to cut in.
             if (level < 3 && nowMs - lastAnyToneMs < 2_000L) return
         }
 
@@ -2594,32 +2594,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ======================= ĐỘ NHẠY =======================
+    // ======================= SENSITIVITY =======================
 
-    /** Hệ số thời gian xác nhận: càng nhạy càng báo sớm (0.6 nghĩa là chỉ cần 60% thời gian). */
+    /** Confirmation time factor: the higher the sensitivity the earlier it alerts (0.6 = 60% of the time). */
     private fun sensTime(): Float = when (sensLevel) {
         0 -> 1.5f
         2 -> 0.6f
         else -> 1.0f
     }
 
-    /** Hệ số ngưỡng góc đầu / hướng nhìn: càng nhạy càng báo với độ lệch nhỏ hơn. */
+    /** Head angle / gaze threshold factor: the higher the sensitivity the smaller the deviation it alerts on. */
     private fun sensThr(): Float = when (sensLevel) {
         0 -> 1.15f
         2 -> 0.85f
         else -> 1.0f
     }
 
-    /** Hệ số làm mượt SEI: càng nhạy chỉ số càng bám sát diễn biến tức thời. */
+    /** SEI smoothing factor: the higher the sensitivity the closer the index tracks the instant value. */
     private fun sensSmooth(): Float = when (sensLevel) {
         0 -> 0.7f
         2 -> 1.6f
         else -> 1.0f
     }
 
-    // ======================= TOÁN HỌC HÌNH HỌC =======================
+    // ======================= GEOMETRY MATH =======================
 
-    /** Khoảng cách Euclid trong không gian pixel (tránh méo do ảnh không vuông). */
+    /** Euclidean distance in pixel space (avoids distortion from non-square images). */
     private fun pixelDistance(
         lm: Landmarks,
         a: Int,
@@ -2648,22 +2648,22 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Khoảng cách (cm), CHƯA nhân hệ số người dùng.
+     * Distance in cm, NOT yet multiplied by the user factor.
      *
-     * Chỉ dùng MỘT thước đo là khoảng hai khóe mắt, bù triệt phối cảnh bằng 1/cos(yaw).
-     * Mống mắt không còn tham gia tính trung bình — nó chỉ được dùng làm cổng loại
-     * khung hình nhiễu. Lý do: ở 640x480 và 50 cm, khóe mắt trải ra ~89 px (nhiễu điểm
-     * ~1,6%) trong khi mống mắt chỉ ~12 px (~12%). Trước đây hai nguồn được trộn đều
-     * trọng số, nên thước nhiễu hơn lại chi phối; và khi mắt nhắm hàm trả về riêng mống
-     * mắt, làm cửa sổ trung vị nhảy qua lại giữa hai ước lượng có sai lệch hệ thống khác nhau.
+     * Uses ONE ruler only, the span between the two eye corners, cancelling perspective with 1/cos(yaw).
+     * The iris no longer takes part in the average - it only serves as a gate that drops noisy frames.
+     * Reason: at 640x480 and 50 cm the eye corners span about 89 px (landmark noise ~1.6%) while the
+     * iris is only about 12 px (~12%). Both sources used to be blended with equal weight, so the
+     * noisier ruler dominated; and when the eyes close the function returns the iris alone, making
+     * the median window jump between two estimates with different systematic bias.
      *
-     * `yawAbsDeg` phải là góc quay ĐẦU TUYỆT ĐỐI so với trục ống kính, không phải độ lệch
-     * khỏi tư thế nghỉ của em đó. Số hạng cos ở dưới bù đúng cái phần bị ngắn đi vì phối
-     * cảnh, mà phần đó chỉ tồn tại khi mặt thật sự quay so với máy ảnh. Trước đây nó nhận
-     * `yawRawDev`, nên một em ngồi quay đầu 20 độ vĩnh viễn không được bù gì cả: khoảng cách
-     * ước lượng THỪA 6,4% (1,9 cm ở mốc 30 cm), to hơn cả dải trễ 30->32 cm, nghĩa là cảnh
-     * báo "quá gần" không bao giờ bắn dù em đó đang ngồi rất gần. Đổi sang góc tuyệt đối còn
-     * sửa được một lỗi nữa: quay đầu 30 độ từng làm con số nhảy 15% dù em đó không dời chỗ.
+     * `yawAbsDeg` must be the ABSOLUTE head rotation relative to the lens axis, not the deviation from
+     * that student's resting pose. The cosine term below compensates exactly the shortening caused by
+     * perspective, and that shortening only exists when the face really turns relative to the camera.
+     * It used to receive `yawRawDev`, so a student sitting permanently turned 20 degrees got nothing:
+     * the estimated distance is 6.4% TOO HIGH (1.9 cm at the 30 cm mark), larger than the whole 30->32
+     * cm hysteresis band, so the "too close" alert could never fire even while sitting very close.
+     * Absolute angle fixed one more bug: a 30 degree turn used to move the number 15% in place.
      */
     private fun estimateDistanceCm(
         lm: Landmarks,
@@ -2677,16 +2677,16 @@ class MainActivity : ComponentActivity() {
         val cornerPx = pixelDistance(lm, LM_OUTER_RIGHT_EYE, LM_OUTER_LEFT_EYE, imgW, imgH)
         if (cornerPx < 1f) return null
 
-        // Cổng loại khung cũng phải xét góc tuyệt đối: chính số hạng 1/cos này phóng đại sai số
-        // landmark khi quay sâu, nên góc nào KHÔNG được bù mới là góc cần chặn.
+        // The frame rejection gate has to consider the absolute angle too: this very 1/cos term magnifies
+        // landmark error during a deep turn, so the angle that is NOT compensated is the one to block.
         val yaw = abs(yawAbsDeg)
         if (yaw > DIST_MAX_YAW_DEG) return null
 
-        // Kẹp ở 0.3f: cos(72 độ) ~ 0.31, chặn chia cho 0 nếu ai đó gọi hàm ngoài cổng ở trên.
+        // Clamped at 0.3f: cos(72 deg) ~ 0.31, blocking a division by zero if anyone calls this above the gate.
         val dCorner = EYE_OUTER_WIDTH_CM * f / (cornerPx / cos(yaw / RAD_TO_DEG).coerceAtLeast(0.3f))
 
-        // Đối chiếu bằng mống mắt: hai mắt phải cho kích thước gần nhau và phải
-        // khớp khóe mắt trong ~35%. Lệch nghĩa là landmark đang nhiễu -> bỏ khung này.
+        // Cross-check with the iris: the two eyes must report similar sizes and must agree
+        // with the eye corners within ~35%. A mismatch means the landmarks are noisy -> drop this frame.
         if (lm.count >= IRIS_LANDMARKS && eyesOpen) {
             val r = pixelDistance(lm, LM_R_IRIS_H1, LM_R_IRIS_H2, imgW, imgH)
             val l = pixelDistance(lm, LM_L_IRIS_H1, LM_L_IRIS_H2, imgW, imgH)
@@ -2706,8 +2706,8 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Chiếu điểm p lên trục a->b trong không gian pixel.
-     * Trả về 0 tại a, 1 tại b (dùng cho vị trí mống mắt trong hốc mắt).
+     * Projects point p onto the a->b axis in pixel space.
+     * Returns 0 at a and 1 at b (used for the iris position inside the eye socket).
      */
     private fun axisRatio(
         lm: Landmarks,
@@ -2727,10 +2727,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Góc Euler từ pháp tuyến mặt phẳng khuôn mặt (dùng cả toạ độ z của MediaPipe).
-     * R = vector ngang (má trái-phải), U = vector dọc (cằm-trán), N = R x U hướng về camera.
-     * Quy ước: yaw dương = quay sang trái của người dùng, pitch dương = cúi xuống.
-     * Giá trị được dùng chủ yếu dưới dạng độ lệch so với đường cơ sở hiệu chuẩn.
+     * Euler angles from the face-plane normal (uses the z coordinates of MediaPipe as well).
+     * R = horizontal vector (left-right cheek), U = vertical vector (chin-forehead), N = R x U pointing
+     * at the camera. Convention: yaw positive = turned toward the user's left, pitch positive = bending
+     * down. The values are used mostly as deviations from the calibration baseline.
      */
     private fun computeHeadPose(lm: Landmarks, width: Int, height: Int) {
         val wf = width.toFloat()
@@ -2762,11 +2762,11 @@ class MainActivity : ComponentActivity() {
 
     private fun clamp01(v: Float): Float = v.coerceIn(0f, 1f)
 
-    // ======================= CHẤT LƯỢNG TÍN HIỆU =======================
+    // ======================= SIGNAL QUALITY =======================
 
     /**
-     * Chất lượng tín hiệu 0-100. Cập nhật signalReliable (ánh sáng + kích thước mặt)
-     * dùng để chặn các cảnh báo kém tin cậy, và signalNote (lý do chính).
+     * Signal quality 0-100. Updates signalReliable (light + face size) used to block the
+     * less trustworthy alerts, and signalNote (the main reason).
      */
     private fun computeSignalQuality(
         faceWidthPx: Float,
@@ -2796,7 +2796,7 @@ class MainActivity : ComponentActivity() {
             if (note == "Tốt") note = "Khuôn mặt hơi xa"
         }
 
-        // Ngược sáng (mặt tối hơn nền nhiều) hoặc mặt cháy sáng: landmark mắt kém tin cậy.
+        // Backlight (face much darker than the background) or a blown-out face: eye landmarks are unreliable.
         if (enhancer.backlit) {
             q -= 15f
             if (note == "Tốt") note = "Ngược sáng, mặt bị tối"
@@ -2821,7 +2821,7 @@ class MainActivity : ComponentActivity() {
         return q.coerceIn(0f, 100f).roundToInt()
     }
 
-    // ======================= TƯ THẾ ĐẦU: CỬA SỔ TRƯỢT & BẤT THƯỜNG =======================
+    // ======================= HEAD POSE: SLIDING WINDOW & ANOMALY =======================
 
     private fun clearPoseState() {
         poseWindow.clear()
@@ -2878,8 +2878,8 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Độ lệch chuẩn của tư thế đầu (độ) và của EAR trên cửa sổ trượt.
-     * Trả về null nếu chưa đủ dữ liệu.
+     * Standard deviation of head pose (degrees) and of EAR over the sliding window.
+     * Returns null when there is not enough data yet.
      */
     private fun poseWindowStats(): Pair<Float, Float>? {
         val n = poseWindow.size
@@ -2929,7 +2929,7 @@ class MainActivity : ComponentActivity() {
         return poseStd to earStd
     }
 
-    // ======================= ĐỘNG CƠ MẤT TẬP TRUNG TÍCH LŨY =======================
+    // ======================= ACCUMULATING DISTRACTION ENGINE =======================
 
     private fun registerViolation(nowMs: Long, weight: Float) {
         violationEvents.addLast(ViolationEvent(nowMs, weight))
@@ -2980,7 +2980,7 @@ class MainActivity : ComponentActivity() {
         return total.toFloat() / blinkDurations.size.toFloat()
     }
 
-    // ======================= HIỆU CHUẨN & SEI 2.0 =======================
+    // ======================= CALIBRATION & SEI 2.0 =======================
 
     private fun resetCalibration() {
         endHabitSession()
@@ -3052,7 +3052,7 @@ class MainActivity : ComponentActivity() {
         baselineEar1 = calSumEar1 / n
         baselineEar2 = calSumEar2 / n
 
-        // Mở phiên học thói quen và (nếu đã có hồ sơ) trộn EAR cơ sở với giá trị đã học.
+        // Opens the habit session and, when a profile exists, blends the base EAR with the learned value.
         val earBefore = (baselineEar1 + baselineEar2) / 2f
         beginHabitSession(nowMs)
         val earAfter = (baselineEar1 + baselineEar2) / 2f
@@ -3109,7 +3109,7 @@ class MainActivity : ComponentActivity() {
 
     private fun bpmScore(bpm: Float, reliable: Boolean): Float {
         if (!reliable) return 85f
-        // Vùng lý tưởng bám theo ngưỡng hiện hành (mặc định 12..25, cá nhân hóa khi đã học).
+        // Ideal zone follows the current thresholds (default 12..25, personalised once the profile has learned).
         val lo = thrBlinkLow + 4f
         val hi = thrBlinkHigh - 5f
         return when {
@@ -3169,7 +3169,7 @@ class MainActivity : ComponentActivity() {
         return (100f - mouthPenalty - furrowPenalty).coerceIn(0f, 100f)
     }
 
-    /** Chỉ số mệt mỏi tổng hợp 0-100 (PERCLOS, thời lượng chớp, ngáp, BPM, nhắm lâu). */
+    /** Composite fatigue index 0-100 (PERCLOS, blink duration, yawn, BPM, long closures). */
     private fun updateFatigue(
         perclosValue: Float,
         avgBlink: Float?,
@@ -3238,9 +3238,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Hệ số làm mượt theo thời gian thực. perFrameAt30fps là hệ số quen thuộc khi máy chạy 30 FPS;
-     * hàm này trả về hệ số tương đương cho khoảng thời gian thực tế giữa hai khung, để SEI và chỉ số
-     * mệt mỏi phản ứng cùng tốc độ dù máy chạy 12 hay 30 khung/giây.
+     * Time-based smoothing coefficient. perFrameAt30fps is the familiar coefficient when the machine
+     * runs at 30 FPS; this returns the equivalent coefficient for the real interval between two frames,
+     * so SEI and the fatigue index react at the same speed whether the phone does 12 or 30 frames/s.
      */
     private fun frameAlpha(perFrameAt30fps: Float): Float {
         val a = perFrameAt30fps.coerceIn(0.001f, 0.99f)
@@ -3251,12 +3251,12 @@ class MainActivity : ComponentActivity() {
     private fun updateFps(nowMs: Long) {
         if (prevFrameTimeMs != 0L) {
             val dt = nowMs - prevFrameTimeMs
-            // updateFps chạy cho MỌI khung được gửi tới, kể cả khung không có mặt, nên khoảng
-            // cách lớn hơn WINDOW_STALL_MS nghĩa là máy chẳng nhận được khung nào: app bị đẩy
-            // xuống nền, CameraX dừng, có thể hàng chục phút. Đồng hồ phiên (HUD, cột
-            // session_s, đồng hồ nhắc nghỉ 20 phút) phải nhảy qua khoảng chết đó, nếu không
-            // một lần tắt màn hình giữa giờ ra báo cáo "theo dõi 40 phút" mà chỉ vài phút là
-            // có ảnh thật.
+            // updateFps runs for EVERY frame delivered, including frames with no face, so a gap larger than
+            // WINDOW_STALL_MS means the machine received no frame at all: the app was pushed to the
+            // background, CameraX stopped, possibly for tens of minutes. The session clock (HUD, the
+            // session_s column, the 20 minute break reminder) must jump over that dead span, otherwise
+            // one screen-off in the middle of a lesson reports "monitored for 40 minutes" when only a few
+            // minutes had real images.
             if (dt > WINDOW_STALL_MS && monitoringStartMs != 0L) {
                 monitoringStartMs += dt - RATIO_REF_FRAME_MS
             }
@@ -3273,9 +3273,9 @@ class MainActivity : ComponentActivity() {
         prevFrameTimeMs = nowMs
     }
 
-    // ======================= XỬ LÝ KHUNG HÌNH =======================
+    // ======================= FRAME PROCESSING =======================
 
-    /** Xóa các bộ đếm tức thời khi mất khuôn mặt (tránh sự kiện giả khi quay lại). */
+    /** Clears the instant counters when the face is lost (avoids a fake event when it returns). */
     private fun clearTransientState() {
         eyesClosed = false
         prevNoseX = Float.NaN
@@ -3291,14 +3291,14 @@ class MainActivity : ComponentActivity() {
         prevDrowsy = false
         prevConfused = false
         smoothedDistanceCm = null
-        // Cờ "quá gần" là kết luận TỪ một phép đo khoảng cách. Mất mặt rồi thì không còn phép
-        // đo nào nữa, nên nó phải tắt theo: nếu giữ, mấy khung hình đầu sau khi mặt quay lại
-        // chưa kịp có khoảng cách vẫn bị trừ 15 điểm SEI với lý do "đứng quá gần", dù app đang
-        // không biết học sinh cách màn hình bao xa.
+        // The "too close" flag is a CONCLUSION drawn from a distance measurement. Once the face is gone
+        // there is no measurement left, so it has to switch off too: if it stayed, the first frames after
+        // the face returns would still lose 15 SEI points for "standing too close" while the app has no
+        // idea how far the student actually sits from the screen.
         distanceAlertActive = false
-        // Mẫu hiệu chuẩn khoảng cách chỉ so sánh được với nhau khi khuôn mặt liên tục ở cùng
-        // một tư thế. Mất mặt giữa chừng là vứt đi: nếu giữ, trung vị sẽ tính lai hai lần ngồi
-        // cách màn hình khác nhau và cho ra một hệ số không mô tả lần nào.
+        // Distance calibration samples are only comparable with each other while the face stays
+        // continuously in one pose. Losing the face midway throws them away: keeping them would blend
+        // two different sitting distances into a median that describes neither of them.
         distCalSamples.clear()
         calWaitStartMs = 0L
         clearPoseState()
@@ -3310,7 +3310,7 @@ class MainActivity : ComponentActivity() {
         eyeEngine.pause()
     }
 
-    /** Cập nhật hộp bao khuôn mặt (tọa độ chuẩn hóa của ảnh đã xoay), có làm mượt để ROI ổn định. */
+    /** Updates the face bounding box (normalized coordinates of the rotated image), smoothed so the ROI holds. */
     private fun updateFaceBox(lm: Landmarks, nowMs: Long) {
         var x0 = 1f
         var y0 = 1f
@@ -3326,7 +3326,7 @@ class MainActivity : ComponentActivity() {
         }
         if (x1 <= x0 || y1 <= y0) return
 
-        // Nới 35% mỗi phía để ROI gồm cả tóc, cằm, kính và một phần cổ.
+        // Widened by 35% on each side so the ROI includes hair, chin, glasses and part of the neck.
         val mw = (x1 - x0) * 0.35f
         val mh = (y1 - y0) * 0.35f
         val nx0 = (x0 - mw).coerceIn(0f, 1f)
@@ -3357,7 +3357,7 @@ class MainActivity : ComponentActivity() {
         clearTransientState()
         if (habitLearnEnabled) habitSession?.tick(nowMs, false, false)
 
-        // Rời khỏi màn hình đủ lâu được tính là đã nghỉ giải lao.
+        // Leaving the screen for long enough counts as having taken a break.
         if (faceLostSinceMs == 0L) {
             faceLostSinceMs = nowMs
         }
@@ -3365,8 +3365,8 @@ class MainActivity : ComponentActivity() {
             workStartMs = 0L
         }
 
-        // Mất khuôn mặt không phải là "tập trung bằng 0": giữ "--" thay vì để đồ thị rơi về 0,
-        // vì SEI giả thấp này sẽ bị tính vào trung bình/thấp nhất và vào hồ sơ thói quen.
+        // Losing the face is not "focus equals zero": the chart keeps "--" instead of falling to 0,
+        // because this fake low SEI would enter the average, the minimum and the habit profile.
         val sei: Int? = null
 
         if (loggingEnabled) {
@@ -3425,11 +3425,11 @@ class MainActivity : ComponentActivity() {
             alertCode = 0,
             eyeDetail = "--",
             imageDetail = imageDetail,
-            // Nhắc "mới hiệu chuẩn lệch 20%" là chuyện của người vận hành, nó phải còn hiện trên
-            // HUD khi em đó đứng dậy; chỉ phép thử liên tục là hết giá trị khi mất khuôn mặt.
+            // The "calibration just deviated by 20%" reminder is an operator matter, so it must still be on the
+            // HUD after that student stands up; only the rolling test loses its value when the face is lost.
             personHint = if (personHintKind == 2) personHintPlain else null,
-            // Dòng dải giữ nguyên khi mất mặt: nó mô tả cả phiên chứ không mô tả riêng khung này.
-            // Nếu để nó biến mất mỗi lần em đó quay đi thì HUD sẽ nhấp nháy vô nghĩa.
+            // The band line stays as is when the face is lost: it describes the session, not this frame.
+            // Letting it vanish on every turn of the head would only make the HUD flicker.
             bandSummary = bandSummaryPlain
         )
     }
@@ -3456,7 +3456,7 @@ class MainActivity : ComponentActivity() {
             return noFaceSnapshot(imgW, imgH, nowMs, processingMs)
         }
 
-        // Khuôn mặt đã quay lại.
+        // The face came back.
         faceLostSinceMs = 0L
         updateFaceBox(lm, nowMs)
         if (calibrated && workStartMs == 0L) {
@@ -3467,16 +3467,16 @@ class MainActivity : ComponentActivity() {
         val ear1 = calculateEAR(lm, RIGHT_EYE, imgW, imgH)
         val ear2 = calculateEAR(lm, LEFT_EYE, imgW, imgH)
 
-        // ---- Tư thế đầu 3D (đưa lên trước để hiệu chỉnh khoảng cách theo góc quay) ----
+        // ---- 3D head pose (moved earlier so distance can be corrected for the turn angle) ----
         computeHeadPose(lm, imgW, imgH)
         val yawRawDev = poseYawAbs - baselineYawDeg
         val pitchRawDev = posePitchAbs - baselinePitchDeg
 
-        // ---- Khoảng cách (tiêu cự thật + mống mắt + khóe mắt, trung vị rồi One Euro) ----
+        // ---- Distance (real focal length + iris + eye corners, median then One Euro) ----
         val faceWidthPx = pixelDistance(lm, LM_OUTER_RIGHT_EYE, LM_OUTER_LEFT_EYE, imgW, imgH)
-        // Ngưỡng đóng phải lấy từ hiệu chuẩn của chính người này (baselineEar x 0,68,
-        // thường 0,17-0,22). Hằng số 0,16 cũ thấp hơn ngưỡng thật nên vẫn cho qua
-        // những khung mắt đã khép - đúng lúc điểm mốc mống mắt bị sập.
+        // The eye-closed threshold must come from this person's own calibration (baselineEar x 0.68,
+        // usually 0.17-0.22). The old 0.16 constant sat below the real threshold, so it still let
+        // through frames with nearly closed eyes - exactly when the iris landmarks collapse.
         val eyesOpenForDist = if (calibrated) {
             ear1 > closeThreshold1 && ear2 > closeThreshold2
         } else {
@@ -3490,13 +3490,13 @@ class MainActivity : ComponentActivity() {
             eyesOpenForDist
         )
 
-        // Hiệu chuẩn: lấy trung vị của nhiều khung thay vì 1 khung nhiễu.
+        // Calibration: takes the median of many frames instead of trusting one noisy frame.
         if (rawUnscaled != null && distanceCalibrationRequested) {
             if (nowMs - distanceCalRequestedMs > DIST_CAL_WINDOW_MS) {
-                // Lời xin hiệu chuẩn quá cũ: DIST_CAL_SAMPLES mẫu thu rải trong
-                // DIST_CAL_WINDOW_MS (8 giây), ở những tư thế khác nhau, không còn mô tả "ngồi
-                // cách màn hình 50 cm" nữa. Lấy chúng sẽ đổi hệ số khoảng cách sai một cách im
-                // lặng rồi mọi con số sau đó trong phiên đều sai theo.
+                // A calibration request that is too old: its DIST_CAL_SAMPLES were spread over
+                // DIST_CAL_WINDOW_MS (8 seconds), in different poses, no longer describes "sitting
+                // 50 cm from the screen". Using them would change the distance factor silently and every
+                // later number in the session would be wrong along with it.
                 distanceCalibrationRequested = false
                 distCalSamples.clear()
                 Log.i(TAG, "Bỏ hiệu chuẩn khoảng cách: quá ${DIST_CAL_WINDOW_MS}ms không đủ mẫu")
@@ -3511,22 +3511,22 @@ class MainActivity : ComponentActivity() {
                     distCalSamples.clear()
                     distWindow.clear()
                     smoothedDistanceCm = null
-                    // Đổi hệ số là đổi luôn thang đo đang dựng nên cờ "quá gần", nên cờ phải tắt:
-                    // nếu giữ, em ngồi đúng 50 cm vẫn bị còi báo tiếp vì cờ học từ thang cũ.
+                    // Changing the factor changes the very scale that raises the "too close" flag, so the flag must
+                    // go off: if it stayed, a student sitting correctly at 50 cm would keep hearing the siren.
                     distanceAlertActive = false
                     distanceFilter.reset()
                     personGuard.reset()
                     personHintPlain = null
                     personHintKind = 0
 
-                    // Hệ số giờ thuộc về hồ sơ, không thuộc về chiếc điện thoại. Ghi vào
-                    // HabitProfile và lưu file luôn: nếu chỉ nhớ trong bộ nhớ thì lần mở app sau
-                    // vẫn dùng số của em khác.
+                    // The factor now belongs to the profile, not to the phone. It is written into
+                    // HabitProfile and saved to file right away: kept only in memory, the next time the app
+                    // opens it would still use another student's number.
                     val prof = habitProfile
                     val storedScale = prof?.distanceScale
-                    // storedScale có giá trị thì prof cũng có (nó vừa được lấy từ prof), nên không
-                    // kiểm tra prof lần nữa: điều kiện luôn đúng khiến người đọc không nhận ra điều
-                    // kiện nào thật sự quyết định, và compiler đã báo warning vì chỗ này.
+                    // When storedScale is valid, prof is valid too (it was just read from prof), so prof is not
+                    // checked a second time: an always-true condition hides which test actually decides, and the
+                    // compiler was already warning about this exact spot.
                     val calDev = if (storedScale != null && prof.hasCalibration()) {
                         PersonGuard.calibrationDeviation(newScale, storedScale)
                     } else {
@@ -3540,9 +3540,9 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (calDev.isFinite() && abs(calDev) > PersonGuard.CALIBRATION_REJECT_RATIO) {
-                        // Đây là trigger đáng tin nhất: hiệu chuẩn diễn ra ở khoảng cách ĐÃ BIẾT,
-                        // nên hệ số nhảy 20% chỉ có thể nghĩa là khuôn mặt khác, hoặc em này ngồi
-                        // sai chỗ so với hướng dẫn.
+                        // This is the most trustworthy trigger: calibration takes place at a distance that is ALREADY
+                        // KNOWN, so a factor jumping 20% can only mean a different face, or this student sitting in
+                        // the wrong place relative to the instructions.
                         personHintPlain = String.format(
                             Locale.US,
                             "Vừa hiệu chuẩn ra hệ số x%.2f, lệch %.0f%% so với hồ sơ %s (x%.2f). " +
@@ -3569,7 +3569,7 @@ class MainActivity : ComponentActivity() {
         }
         val distance = smoothedDistanceCm
 
-        // ---- Nghi đã đổi người (nhắc người vận hành, không phải cảnh báo mất tập trung) ----
+        // ---- Suspected person change (operator reminder, not a distraction alert) ----
         val suspectPerson = personGuard.observe(
             nowMs,
             rawUnscaled,
@@ -3600,7 +3600,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // ---- Góc tư thế đã lọc cho điểm số ----
+        // ---- Filtered pose angles used for scoring ----
         val yawDeg = yawFilter.filter(yawRawDev, nowMs)
         val pitchDeg = pitchFilter.filter(pitchRawDev, nowMs)
         val rollDeg = rollFilter.filter(poseRollAbs, nowMs)
@@ -3619,7 +3619,7 @@ class MainActivity : ComponentActivity() {
         prevNoseX = noseX
         prevNoseY = noseY
 
-        // ---- Hướng nhìn thô từ mống mắt (468-477), lọc One Euro ----
+        // ---- Raw gaze from the iris (468-477), One Euro filtered ----
         val irisAvailable = lm.count >= IRIS_LANDMARKS
         var gazeHRaw = 0.5f
         var gazeVRaw = 0.5f
@@ -3634,7 +3634,7 @@ class MainActivity : ComponentActivity() {
         val gazeH = gazeHFilter.filter(gazeHRaw, nowMs)
         val gazeV = gazeVFilter.filter(gazeVRaw, nowMs)
 
-        // ---- Vi biểu cảm thô: BFR và MAR ----
+        // ---- Raw micro-expressions: BFR and MAR ----
         val bfr = pixelDistance(lm, LM_BROW_INNER_R, LM_BROW_INNER_L, imgW, imgH) /
                 faceWidthPx.coerceAtLeast(1f)
 
@@ -3645,7 +3645,7 @@ class MainActivity : ComponentActivity() {
             pixelDistance(lm, LM_MOUTH_UP, LM_MOUTH_LOW, imgW, imgH) / mouthWidthPx
         }
 
-        // ---- Chất lượng tín hiệu ----
+        // ---- Signal quality ----
         val signalQuality = computeSignalQuality(
             faceWidthPx,
             if (calibrated) abs(yawDeg) else 0f,
@@ -3671,7 +3671,7 @@ class MainActivity : ComponentActivity() {
         var eyeDetail = "Đang hiệu chuẩn"
 
         if (!calibrated) {
-            // ---- Pha hiệu chuẩn: chỉ nhận khung hợp lệ và tín hiệu đủ tốt ----
+            // ---- Calibration phase: only valid frames and a signal good enough ----
             if (calWaitStartMs == 0L) {
                 calWaitStartMs = nowMs
             }
@@ -3679,8 +3679,8 @@ class MainActivity : ComponentActivity() {
                     nowMs - calWaitStartMs >= CAL_RELAX_AFTER_MS
             val minEar = if (relaxed) CAL_RELAXED_MIN_EAR else CALIBRATION_MIN_EAR
 
-            // Đầu phải đứng yên tương đối so với các khung đã nhận, để đường cơ sở (tư thế, hướng nhìn)
-            // không bị lệch khi học sinh vừa quay đi hoặc đang cúi trong lúc hiệu chuẩn.
+            // The head must stay reasonably still relative to the frames already accepted, so the baseline (pose,
+            // gaze) is not dragged off when the student is turning away or bowing during calibration.
             val poseStable = calFrames < 8 ||
                     (abs(poseYawAbs - calSumYawDeg / calFrames) < 10f &&
                             abs(posePitchAbs - calSumPitchDeg / calFrames) < 10f)
@@ -3701,7 +3701,7 @@ class MainActivity : ComponentActivity() {
                     finishCalibration(nowMs)
                 }
             } else if (reliable) {
-                // Bị loại liên tục khoảng 3 giây (đổi tư thế ngồi): bỏ dữ liệu cũ và hiệu chuẩn lại từ đầu.
+                // Rejected for about 3 straight seconds (a seating change): drop the old data and calibrate anew.
                 calRejected++
                 if (calRejected > 90) {
                     calRejected = 0
@@ -3722,7 +3722,7 @@ class MainActivity : ComponentActivity() {
             val sH = sensThr()
             eyeEngine.setSensitivity(sensLevel)
 
-            // ---- Phân tích mắt nâng cấp: hợp nhất hình học 5 cặp mí + blendshape, bù góc nghiêng/cúi ----
+            // ---- Upgraded eye analysis: merges the 5 eyelid point pairs + blendshape, compensates tilt and bow ----
             val poseOkForEyes = reliable &&
                     abs(yawDeg) <= EYE_MAX_YAW_DEG && abs(pitchDeg) <= EYE_MAX_PITCH_DEG
             val eye = eyeEngine.update(
@@ -3758,7 +3758,7 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            // ---- PERCLOS: ba ngưỡng song song ----
+            // ---- PERCLOS: three thresholds in parallel ----
             if (eye.valid) {
                 perclos.record(nowMs, eyesClosed)
                 perclosP70.record(nowMs, eye.openness <= PERCLOS_P70_OPEN)
@@ -3768,15 +3768,15 @@ class MainActivity : ComponentActivity() {
                 perclosP70.pause()
                 perclosP80.pause()
             }
-            // PERCLOS chưa đủ mẫu thì để null: HUD phải hiện "--" chứ không được hiện "0.0 %",
-            // vì 0% nghe như "đang tỉnh" trong khi thực ra là chưa đo được gì.
+            // PERCLOS stays null while there are too few samples: the HUD must show "--", not "0.0 %",
+            // because 0% sounds like "wide awake" when in reality nothing has been measured yet.
             val perclosSample = perclos.percentOrNull(nowMs)
             val perclosValue = perclosSample ?: 0f
             perclosOut = perclosSample
             perclosP70Out = perclosP70.percentOrNull(nowMs)
             perclosP80Out = perclosP80.percentOrNull(nowMs)
 
-            // ---- Cửa sổ trượt 60 giây (BPM) ----
+            // ---- 60 second sliding window (BPM) ----
             pruneBlinks(nowMs)
 
             val elapsed = nowMs - monitoringStartMs
@@ -3796,7 +3796,7 @@ class MainActivity : ComponentActivity() {
                 else -> "Đang mở hoặc chuyển trạng thái"
             }
 
-            // ---- Đầu quay lệch khỏi màn hình ----
+            // ---- Head turned away from the screen ----
             val headAwayNow =
                 abs(yawDeg) > thrLookYaw * sH || abs(pitchDeg) > thrLookPitch * sH
             if (headAwayNow) {
@@ -3809,7 +3809,7 @@ class MainActivity : ComponentActivity() {
             val lookAwayLong =
                 lookAwayStartMs != 0L && nowMs - lookAwayStartMs >= (LOOK_AWAY_MS * sT).toLong()
 
-            // ---- Cửa sổ trượt tư thế (góc thô): đóng băng / giật bất thường ----
+            // ---- Pose sliding window (raw angles): frozen or sudden jerk ----
             updatePoseWindow(nowMs, yawRawDev, pitchRawDev, poseRollAbs, (ear1 + ear2) / 2f)
             val stats = poseWindowStats()
             val noBlinkMs = nowMs - max(lastBlinkMs, monitoringStartMs)
@@ -3825,7 +3825,7 @@ class MainActivity : ComponentActivity() {
                 else -> null
             }
 
-            // ---- Hướng nhìn và Visual Drift ----
+            // ---- Gaze and Visual Drift ----
             val eyesOpenForGaze = eye.valid && eye.openness >= 0.75f
             val offH = gazeH - baselineGazeH
             val offV = gazeV - baselineGazeV
@@ -3862,7 +3862,7 @@ class MainActivity : ComponentActivity() {
                 else -> "Nhìn vào màn hình"
             }
 
-            // ---- Vi biểu cảm: nhíu mày (BFR) và ngáp (MAR) ----
+            // ---- Micro-expressions: frown (BFR) and yawn (MAR) ----
             val furrowNow = abs(yawDeg) < HEAD_FRONTAL_YAW_DEG &&
                     bfr < baselineBfr * BFR_FURROW_RATIO
             if (furrowNow) {
@@ -3875,7 +3875,7 @@ class MainActivity : ComponentActivity() {
             val confusedSustained =
                 furrowStartMs != 0L && nowMs - furrowStartMs >= (BFR_SUSTAIN_MS * sT).toLong()
 
-            // Miệng mở rộng (blendshape jawOpen) cũng tính là ngáp: nhận ra cử chỉ nhanh và chắc hơn hình học.
+            // A wide open mouth (blendshape jawOpen) counts as a yawn too: faster and firmer than geometry.
             val jawOpen = if (blend != null && blend.size > 4) blend[4] else 0f
             val yawnNow = mar > thrMar || jawOpen > 0.55f
             if (yawnNow) {
@@ -3903,7 +3903,7 @@ class MainActivity : ComponentActivity() {
                 else -> "Bình thường"
             }
 
-            // ---- Ghi nhận vi phạm theo sườn lên (mỗi đợt tính một lần) ----
+            // ---- Violations recorded on the rising edge (each burst counted once) ----
             if (lookAwayLong && !prevHeadAway) registerViolation(nowMs, V_HEAD_AWAY)
             prevHeadAway = lookAwayLong
 
@@ -3919,7 +3919,7 @@ class MainActivity : ComponentActivity() {
             if (confusedSustained && !prevConfused) registerViolation(nowMs, V_CONFUSED)
             prevConfused = confusedSustained
 
-            // ---- Động cơ mất tập trung tích lũy ----
+            // ---- Accumulating distraction engine ----
             val inattentiveNow = headAwayNow || driftNow || yawnConfirmed ||
                     (eyesClosed && closedDuration >= 500L)
             inattention.record(nowMs, inattentiveNow)
@@ -3945,7 +3945,7 @@ class MainActivity : ComponentActivity() {
                 else -> 0
             }
 
-            // ---- Chỉ số mệt mỏi tổng hợp ----
+            // ---- Composite fatigue index ----
             fatigueOut = updateFatigue(
                 perclosValue,
                 averageBlinkMs(),
@@ -3955,7 +3955,7 @@ class MainActivity : ComponentActivity() {
                 drowsyNow
             )
 
-            // ---- Nhắc nghỉ 20-20-20 ----
+            // ---- 20-20-20 break reminder ----
             val workMs = if (workStartMs == 0L) 0L else nowMs - workStartMs
             var breakReminder = false
             if (workMs >= BREAK_REMINDER_MS) {
@@ -3966,7 +3966,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // ---- Chỉ số SEI 2.0 ----
+            // ---- SEI 2.0 index ----
             val posture = headScore(yawDeg, pitchDeg, rollDeg, jitterEma)
             val dist = distanceScore(distance)
             val gaze = gazeScore(irisAvailable && reliable, eyesOpenForGaze, offH, offV, driftLong)
@@ -3991,8 +3991,8 @@ class MainActivity : ComponentActivity() {
                     blinkRate * W_BPM +
                     expression * W_EXPRESSION
 
-            // Giữ lại tổng trước khi trừ: nếu không, bảng phân tách in ra số đã bị trừ hai lần
-            // khi có hình phạt, và bị chặn khi phát hiện ảnh đứng yên.
+            // Keeping the total from before the subtraction: otherwise the breakdown table prints numbers that
+            // were subtracted twice whenever a penalty applies, and were blocked by the still-image check.
             val weightedSum = raw
 
             if (distanceAlertActive) {
@@ -4012,8 +4012,8 @@ class MainActivity : ComponentActivity() {
             sei = seiNow
             lastSeiValue = seiNow
 
-            // Công khai cách điểm được tính: bảng phân tách chỉ dựng 2,5 lần/giây để không
-            // sinh chuỗi mới mỗi khung.
+            // The way the score is computed is made public: the breakdown table is rebuilt only 2.5 times per
+            // second so it does not allocate a new string every frame.
             if (nowMs - lastBreakdownMs >= BREAKDOWN_REFRESH_MS) {
                 lastBreakdownMs = nowMs
                 val chronicPenalty = when (chronicLevelValue) {
@@ -4039,7 +4039,7 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            // ---- So với thói quen: SEI tụt thấp hơn mức thường ngày của chính học sinh ----
+            // ---- Compared with habit: SEI falling below this student's own usual level ----
             val belowPersonal = reliable && !personalSeiMean.isNaN() &&
                     seiNow < personalSeiMean - LOW_VS_PERSONAL_K * personalSeiSpread
             if (belowPersonal) {
@@ -4050,17 +4050,17 @@ class MainActivity : ComponentActivity() {
             val lowVsPersonal =
                 lowVsPersonalStartMs != 0L && nowMs - lowVsPersonalStartMs >= LOW_VS_PERSONAL_MS
 
-            // ---- Học thói quen: chỉ lấy khung hợp lệ, không bất thường, không trong đợt mất tập trung kéo dài ----
+            // ---- Habit learning: only valid frames, no anomaly, no ongoing long distraction burst ----
             val hs = habitSession
-            // Mã dải phải reset MỖI KHUNG. Nếu không, một khung không được chấm sẽ mang mã của
-            // khung trước, và người mở file CSV không phân biệt được "khung này không đo" với
-            // "vẫn y như khung trước" - hai kết luận hoàn toàn khác nhau khi đối chiếu số.
+            // The band codes must be reset EVERY FRAME. Otherwise a frame that is not scored carries the code of
+            // the frame before, and whoever opens the CSV cannot tell "this frame was not measured" from
+            // "same as the frame before" - two completely different conclusions when reconciling the numbers.
             for (f in HabitFeature.BAND_FEATURES) bandCodes[f] = CODE_BAND_NOT_SCORED
             if (hs != null && habitLearnEnabled) {
-                // `eye.valid` ở đây là chữ "không chớp lỗi" mà bảng Diễn giải đã hứa. Thiếu nó thì
-                // một khung mà EyeEngine báo "tôi không kết luận được về mắt" (landmark nhảy, góc quá
-                // nghiêng) vẫn được cộng vào validMs, nên tỉ lệ "khung hợp lệ" phình lên đúng lúc
-                // tín hiệu kém - và PERCLOS đã được chặn bằng eye.valid từ trước, chỉ còn thời gian là lọt.
+                // `eye.valid` here is the "no bad blink" wording that the explanation table promises. Without it,
+                // a frame where EyeEngine itself says "I cannot conclude about these eyes" (jumping landmarks, too
+                // steep an angle) still adds to validMs, so the valid-frame ratio inflates exactly when the signal
+                // is poor - and PERCLOS had already been gated by eye.valid; only the time accounting was leaking.
                 val habitValid = eye.valid && reliable && !frozen && !jerky &&
                         chronicLevelValue < 2 && !drowsyNow && !eyesClosed
                 hs.tick(nowMs, true, habitValid)
@@ -4076,15 +4076,15 @@ class MainActivity : ComponentActivity() {
                     }
                     hs.observe(HabitFeature.MAR, mar)
                     if (abs(yawDeg) < HEAD_FRONTAL_YAW_DEG) hs.observe(HabitFeature.BFR, bfr)
-                    // Chỉ học PERCLOS khi cửa sổ đã đủ mẫu: những giây đầu còn trống mà ghi 0%
-                    // thì hồ sơ dạy rằng em này "luôn tỉnh", kéo ngưỡng cảnh báo xuống thấp.
+                    // PERCLOS is only learned once the window holds enough samples: writing 0% during the first
+                    // empty seconds teaches the profile that this student is "always awake", pulling alerts down.
                     perclosSample?.let { hs.observe(HabitFeature.PERCLOS, it) }
                     hs.observe(HabitFeature.SEI, seiNow.toFloat())
                     hs.addQuality(signalQuality.toFloat())
 
-                    // Đối chiếu hai phía với dải quen thuộc của chính em này. Dùng lại đúng điều
-                    // kiện lấy mẫu ở trên: BPM không đáng tin thì dải cũng không được chấm - nếu
-                    // không, cột dải sẽ đầy mã trên chính những khung mà chỉ số gốc đã bị bỏ.
+                    // Two-sided comparison against this student's own familiar band. Reuses exactly the sampling
+                    // condition above: when BPM is not reliable the band must not be scored either - otherwise the
+                    // band columns fill with codes on the very frames where the source index was skipped.
                     fun scoreBand(f: Int, sampled: Boolean, value: Float) {
                         bandCodes[f] = if (sampled) hs.observeBand(f, value).toCsvCode()
                         else CODE_BAND_NOT_SCORED
@@ -4100,7 +4100,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // ---- Cảnh báo ưu tiên (khoảng cách / mãn tính / bất thường có dòng riêng) ----
+            // ---- Priority alerts (distance / chronic / anomaly, each with its own line) ----
             alert = when {
                 !reliable ->
                     "⚠ Tín hiệu kém ($signalNote) - kết quả có thể không chính xác."
@@ -4135,7 +4135,7 @@ class MainActivity : ComponentActivity() {
                 else -> null
             }
 
-            // Loại cảnh báo đang hiện (0 = không có / không kêu), cùng thứ tự ưu tiên với chuỗi alert.
+            // Alert type currently showing (0 = none / silent), with the same priority order as the alert chain.
             alertCode = when {
                 !reliable -> 0
                 drowsyNow -> KIND_DROWSY
@@ -4220,12 +4220,12 @@ class MainActivity : ComponentActivity() {
             b.append(sessionSeconds(nowMs)).append(',')            // 34
             b.num(fpsEma)                                          // 35
             b.num(processingMs)                                    // 36
-            // luma là cột đo cuối: không có dấu phẩy nối tiếp, và để trống khi độ sáng không hữu hạn.
+            // luma is the last measured column: no trailing comma, and left empty when brightness is not finite.
             if (lumaMean.isFinite()) {
                 b.append(String.format(Locale.US, "%.2f", lumaMean))
             }
-            // Tám cột dải nối SAU luma, không chèn vào giữa, nên 37 cột đo giữ nguyên thứ tự và
-            // file của những phiên trước vẫn mở được bằng cùng một script phân tích.
+            // The eight band columns come AFTER luma, never inserted in the middle, so the 37 measured columns
+            // keep their order and files from earlier sessions still open with the same analysis script.
             for (f in HabitFeature.BAND_FEATURES) {
                 b.append(',').append(bandCodes[f])
             }
@@ -4289,7 +4289,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    /** Chạy trên UI thread: cập nhật các dòng chữ của khung thông số (đã giới hạn tần suất). */
+    /** Runs on the UI thread: refreshes the text lines of the parameter panel (already rate limited). */
     private fun applyHudText(s: HudSnapshot) {
         ear1Text = s.ear1?.let {
             String.format(Locale.US, "%.3f", it)
@@ -4413,8 +4413,8 @@ class MainActivity : ComponentActivity() {
             "--"
         }
 
-        // Dòng này chạy theo nhịp 120 ms: chỉ được thay chữ khi không còn thông báo nào
-        // đang được giữ, nếu không nó xoá sạch mọi cảnh báo ngắn vừa in ra.
+        // This line runs on the 120 ms tick: it may only replace the text when no message is being held,
+        // otherwise it erases every short alert line that was just printed.
         if (SystemClock.elapsedRealtime() >= statusHoldUntilMs) {
             val detection = if (s.faceDetected) {
                 "Đã phát hiện khuôn mặt."
@@ -4427,7 +4427,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Chạy trên UI thread: áp dụng ảnh chụp trạng thái lên giao diện. */
+    /** Runs on the UI thread: applies the state snapshot onto the interface. */
     private fun applySnapshot(s: HudSnapshot) {
         lastSnapshot = s
 
@@ -4440,14 +4440,14 @@ class MainActivity : ComponentActivity() {
             blinkCount++
         }
 
-        // Chữ chỉ cần làm mới ~8 lần/giây; vẽ lại toàn bộ khung thông số 30 lần/giây là lãng phí pin.
+        // Text only needs refreshing about 8 times per second; redrawing the whole panel 30 times per second wastes battery.
         val nowText = SystemClock.elapsedRealtime()
         if (nowText - lastUiTextMs >= UI_TEXT_REFRESH_MS) {
             lastUiTextMs = nowText
             applyHudText(s)
         }
 
-        // Lịch sử SEI: mỗi giây một mẫu, giữ HISTORY_SIZE mẫu gần nhất.
+        // SEI history: one sample per second, keeping the most recent HISTORY_SIZE samples.
         val nowUi = SystemClock.elapsedRealtime()
         val seiNow = s.sei
         val currentSecond = nowUi / 1000L
@@ -4462,10 +4462,10 @@ class MainActivity : ComponentActivity() {
             seiHistory = trimmed + seiNow
         }
 
-        // Âm báo khi vừa bước vào trạng thái nghiêm trọng.
+        // Sound played when a severe state is entered.
         val chronicRising = s.chronicLevel == 2 && lastChronicLevelUi != 2
         val tooCloseRising = s.tooClose && !lastTooCloseUi
-        // Đếm số lần xuất hiện của từng loại cảnh báo, đủ số lần mới kêu.
+        // Counts occurrences per alert type; only enough occurrences make a sound.
         val code = s.alertCode
         if (code > 0) {
             val isNew = nowUi - lastKindActiveMs[code] > ALERT_REARM_MS
@@ -4475,7 +4475,7 @@ class MainActivity : ComponentActivity() {
                     playAlertSound(alertLevelOf(code), nowUi)
                 }
             } else if (code == KIND_DROWSY) {
-                // Vẫn đang nhắm mắt lâu: nhắc lại theo chu kỳ.
+                // Still closing the eyes for a long time: repeat the reminder on a cycle.
                 playAlertSound(3, nowUi)
             }
         }
@@ -4495,7 +4495,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Dựng chuỗi hiệu chuẩn chỉ từ snapshot (an toàn khi chạy trên UI thread). */
+    /** Builds the calibration string from the snapshot only (safe to run on the UI thread). */
     private fun calibrationLabelFrom(s: HudSnapshot): String {
         return if (s.calibrated && s.baselineEar != null && s.closeThreshold != null) {
             String.format(
@@ -4515,12 +4515,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Chuyển danh sách điểm mốc của MediaPipe sang mảng phẳng tái sử dụng bộ đệm. */
+    /** Converts the MediaPipe landmark list into a flat array that reuses the buffer. */
     private fun toLandmarks(
         list: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>
     ): Landmarks {
         val needed = list.size * 3
-        // Mảng mới mỗi khung (UI thread đọc song song); chỉ một lần cấp phát phẳng thay cho ~1.400 đối tượng.
+        // A fresh array every frame (the UI thread reads it in parallel); one flat allocation instead of ~1,400 objects.
         val data = FloatArray(needed)
         for (i in list.indices) {
             val p = list[i]
@@ -4532,9 +4532,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Lấy 5 hệ số blendshape: [nháy trái, nháy phải, nheo trái, nheo phải, mở hàm].
-     * Trả về null nếu FaceLandmarker chưa bật setOutputFaceBlendshapes(true) -
-     * khi đó phân tích mắt tự rơi về chế độ hình học.
+     * Takes 5 blendshape coefficients: [left blink, right blink, left squint, right squint, jaw open].
+     * Returns null when FaceLandmarker has not been given setOutputFaceBlendshapes(true) - then the eye
+     * analysis falls back to the geometry-only mode by itself.
      */
     private fun extractBlend(
         result: com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
@@ -4573,7 +4573,7 @@ class MainActivity : ComponentActivity() {
         try {
             val landmarker = faceLandmarker ?: return
 
-            // Chuyển YUV trực tiếp sang Bitmap RGB, không nén JPEG.
+            // Converts YUV directly into an RGB Bitmap, without JPEG compression.
             val source = imageProxyToBitmap(imageProxy)
             bitmap = source
 
@@ -4628,7 +4628,7 @@ class MainActivity : ComponentActivity() {
                 EMPTY_LANDMARKS
             }
 
-            // Toàn bộ phép toán khoảng cách / EAR / tư thế / gaze / SEI chạy tại đây (cameraExecutor).
+            // All the distance / EAR / pose / gaze / SEI math runs here (cameraExecutor).
             val snapshot = buildSnapshot(
                 lm = landmarks,
                 imgW = imgW,
@@ -4680,13 +4680,13 @@ class MainActivity : ComponentActivity() {
         return target
     }
 
-    // Đọc YUV_420_888 có xét rowStride và pixelStride.
-    // Không tạo JPEG trung gian.
+    // Reads YUV_420_888 taking rowStride and pixelStride into account.
+    // No intermediate JPEG is created.
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
         val width = image.width
         val height = image.height
 
-        // Ghi kích thước khung gốc để tính tiêu cự pixel.
+        // Records the raw frame size to compute the pixel focal length.
         streamW = width
         streamH = height
 
@@ -4694,7 +4694,7 @@ class MainActivity : ComponentActivity() {
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
 
-        // Sao chép mỗi plane một lần vào mảng tái sử dụng (nhanh hơn get() từng byte).
+        // Copies each plane once into a reused array (faster than calling get() byte by byte).
         yBytes = readPlane(yPlane.buffer, yBytes)
         uBytes = readPlane(uPlane.buffer, uBytes)
         vBytes = readPlane(vPlane.buffer, vBytes)
@@ -4710,8 +4710,8 @@ class MainActivity : ComponentActivity() {
         val vRowStride = vPlane.rowStride
         val vPixelStride = vPlane.pixelStride
 
-        // Xử lý ảnh mức thấp trên kênh sáng (đo ánh sáng ở vùng mặt, CLAHE thích ứng khi thiếu sáng).
-        // lumaMean là độ sáng GỐC (trước khi tăng cường) nên phản ánh đúng điều kiện chiếu sáng thật.
+        // Low-level image work on the luminance channel (light measured over the face, adaptive CLAHE when dark).
+        // lumaMean is the ORIGINAL brightness (before enhancement) so it reflects the real lighting condition.
         val frameMs = SystemClock.elapsedRealtime()
         val boxFresh = faceBoxMs != 0L && frameMs - faceBoxMs < 1_000L
         lumaMean = enhancer.process(
@@ -4770,10 +4770,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        // Lưu phiên đang học khi rời màn hình (chạy trên cameraExecutor để không tranh chấp dữ
-        // liệu), và gửi luôn bản tổng kết: với người dùng, tắt màn hình mới là lúc một buổi đo
-        // kết thúc - endHabitSession chỉ chạy khi đổi học sinh hoặc hiệu chuẩn lại. Hai lần gửi
-        // cùng một phiên vẫn chỉ thành MỘT bản ghi trên Firestore vì tên tài liệu là tất định.
+        // Saves the session being learned when leaving the screen (runs on cameraExecutor so it does not race
+        // the data), and sends the summary right away: for the user, switching the screen off is when a
+        // measurement ends - endHabitSession only runs on a student switch or a recalibration. Two sends
+        // of the same session still collapse into ONE Firestore record because the document name is deterministic.
         if (::cameraExecutor.isInitialized && !cameraExecutor.isShutdown) {
             try {
                 cameraExecutor.execute {
@@ -4792,9 +4792,9 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         previewView = null
 
-        // Ba hàng chục dòng cuối nằm trong bộ đệm của BufferedWriter. Nếu app bị huỷ mà không
-        // stop() thì số liệu của phiên vừa đo mất luôn phần đó - đúng phần quan trọng nhất
-        // vì nó là những phút cuối phiên.
+        // The last few dozen rows are still inside the BufferedWriter buffer. If the app is destroyed without
+        // stop(), that part of the session just measured is lost - and it is the most important part,
+        // because it is the final minutes of the session.
         if (loggingEnabled) {
             dataLogger.stop()
             loggingEnabled = false
@@ -4807,11 +4807,11 @@ class MainActivity : ComponentActivity() {
         if (::cameraExecutor.isInitialized) {
             try {
                 cameraExecutor.execute { endHabitSession() }
-                // Đóng model bằng một task xếp CUỐI hàng đợi, không đóng ngay trên UI thread.
-                // awaitTermination chỉ chờ hữu hạn, trong khi một khung nặng có thể lâu hơn; nếu
-                // close() chạy lúc native vẫn đang detect thì app nhận SIGSEGV - nghĩa là crash
-                // đúng lúc quay sang màn hình khác trên sân khấu. Executor một luồng nên task này
-                // chắc chắn chạy sau khung cuối cùng.
+                // Closes the model with a task queued LAST, instead of closing it right on the UI thread.
+                // awaitTermination only waits a bounded time while one heavy frame can take longer; running
+                // close() while native is still detecting gives the process a SIGSEGV - that is a crash exactly
+                // when switching to the other screen on stage. A single-thread executor means this task
+                // is certain to run after the very last frame.
                 cameraExecutor.execute {
                     try {
                         faceLandmarker?.close()
@@ -4826,9 +4826,9 @@ class MainActivity : ComponentActivity() {
             cameraExecutor.shutdown()
             try {
                 if (!cameraExecutor.awaitTermination(1_200, TimeUnit.MILLISECONDS)) {
-                    // Vẫn còn khung đang chạy sau 1,2 giây: bỏ qua việc đóng model (để process tự
-                    // giải phóng) còn hơn đóng khi native đang dùng - thủng một lần dùng model
-                    // chỉ tốn RAM, còn SIGSEGV là mất cả phiên đang ghi CSV.
+                    // Frames still running after 1.2 seconds: skip closing the model and let the process free it
+                    // rather than close while native is using it - a leaked model only costs RAM, while a
+                    // SIGSEGV loses the whole session that is being written to CSV.
                     cameraExecutor.shutdownNow()
                     Log.w(TAG, "CameraExecutor chưa xong, để model đóng khi process kết thúc")
                 }
@@ -4847,12 +4847,12 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    // ==================== GHI DỮ LIỆU NGHIÊN CỨU ====================
+    // ==================== RESEARCH DATA LOGGING ====================
 
-    /** Một cột số trong CSV. Ô trống nghĩa là "không đo được", khác với 0. */
+    /** One numeric column in the CSV. An empty cell means "not measurable", which is not the same as 0. */
     private fun StringBuilder.num(v: Float?) {
-        // isFinite chứ không phải !isNaN: "Infinity" trong ô CSV không chứa dấu phẩy nên lọt qua
-        // kiểm tra số cột, và Excel đọc thành chữ - cả cột trung bình ra lỗi mà không báo.
+        // isFinite rather than !isNaN: "Infinity" in a CSV cell holds no comma so it slips through the
+        // column count check, and Excel reads it as text - the whole column average then fails silently.
         if (v != null && v.isFinite()) {
             append(String.format(Locale.US, "%.4f", v))
         }
@@ -4867,9 +4867,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Bỏ dấu phẩy, nháy kép và ký tự xuống dòng khỏi chữ, để không phá cấu trúc CSV.
-     * Xuống dòng quan trọng như dấu phẩy: một dòng nhắn có `\n` là file bị tách đôi, nửa sau
-     * Excel đọc thành một bản ghi rag với số cột sai - và không có dấu hiệu nào báo lỗi đó.
+     * Strips commas, double quotes and line breaks out of any text so it cannot break the CSV shape.
+     * A line break matters as much as a comma: one message row containing `\n` splits the file in two, and
+     * Excel reads the second half as a ragged record with the wrong column count - nothing signals the error.
      */
     private fun csvSafe(text: String?): String =
         (text ?: "")
@@ -4911,8 +4911,8 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Thông tin môi trường của phiên ghi, viết riêng ra meta.txt vì CSV phải sạch
-     * để máy đọc được. Thiếu mấy con số này thì số liệu không tái lập được.
+     * Environment information of the recording session, written separately into meta.txt because the CSV
+     * must stay clean for a machine. Without these numbers the data cannot be reproduced.
      */
     private fun loggerMeta(): String = buildString {
         append("device=").append(android.os.Build.MODEL).append('\n')
@@ -4931,8 +4931,8 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Ghi lại một cảnh báo mà người bị theo dõi cho là sai, kèm toàn bộ chỉ số của
-     * khung hình đó. Đây là nguồn dữ liệu thật rẻ nhất để chỉnh ngưỡng.
+     * Records an alert that the person being monitored believes was wrong, together with every index of
+     * that frame. This is the cheapest real data source there is for tuning the thresholds.
      */
     private fun logFalseAlert(): Boolean {
         val s = lastSnapshot ?: return false
@@ -4954,7 +4954,7 @@ class MainActivity : ComponentActivity() {
         return dataLogger.appendFalseAlert(applicationContext, b.toString())
     }
 
-    /** Dòng CSV cho khung hình mất mặt: chỉ thì giờ, sei và môi trường còn nghĩa. */
+    /** CSV row for a frame without a face: only elapsed time, sei and the environment still mean anything. */
     private fun noFaceCsvLine(nowMs: Long, processingMs: Float, seiValue: Int?): String =
         buildNoFaceCsvRow(
             columns = dataLogger.columnNames,
@@ -4968,19 +4968,19 @@ class MainActivity : ComponentActivity() {
             luma = lumaMean
         ).toString()
 
-    // Bảng phân tách SEI và bộ đọc dòng cuối file nằm trong FocusCore.kt (mã thuần, test
-    // được trên máy tính bằng HabitTimingTest).
+    // The SEI breakdown table and the tail-of-file reader live in FocusCore.kt (pure code, testable
+    // on a computer through HabitTimingTest).
 
-    // ==================== BÀI KIỂM TRA TRƯỚC BUỔI TRÌNH DIỄN ====================
+    // ==================== PRE-DEMO CHECK ====================
 
     /**
-     * Bấm một lần: đặt điện thoại đúng chỗ sẽ đặt trên bàn, ngồi yên 20 giây.
-     * App đo đúng những thứ hay hỏng trên sân khấu (máy chậm, thiếu sáng, chưa hiệu chuẩn,
-     * hết pin, không ghi được file) thay vì đoán.
+     * Press once: set the phone where it will sit on the table, then stay still for 20 seconds.
+     * The app measures the things that actually break on stage (slow device, low light, no calibration,
+     * flat battery, file not writable) instead of letting anyone guess.
      */
     private fun startPreflight() {
-        // Bấm liên tiếp không được khởi động lại phép đo: mỗi lần bấm xoá sạch 20 giây đã tích
-        // luỹ, và trên sân khấu thì người bấm chỉ thấy "Đang đo..." mãi không ra kết quả.
+        // Pressing repeatedly must not restart the measurement: every press would wipe the 20 seconds already
+        // accumulated, and on stage the person pressing would only ever see a progress line that never ends.
         if (preflightRunning) {
             return
         }
@@ -5005,8 +5005,8 @@ class MainActivity : ComponentActivity() {
         preflightLines = emptyList()
         preflightVerdict = "Đang đo trong 20 giây - cứ ngồi thẳng, nhìn màn hình..."
 
-        // Máy đếm chỉ tiến khi có khung hình mới. Nếu camera chết giữa chừng thì trọng tài
-        // này chốt kết quả, để bảng không treo chữ "Đang đo..." ngay trên sân khấu.
+        // The counters only advance when a new frame arrives. If the camera dies midway this referee
+        // finalises the result, so the table cannot hang on "measuring..." right on stage.
         cancelPreflightWatchdog()
         val watchdog = Runnable {
             preflightWatchdog = null
@@ -5048,8 +5048,8 @@ class MainActivity : ComponentActivity() {
         if (s.processingMs > pfProcMax) {
             pfProcMax = s.processingMs
         }
-        // Chất lượng tín hiệu chỉ có nghĩa khi thấy khuôn mặt; khung mất mặt được gắn 0 điểm,
-        // tính gộp vào thì chỉ cần quay đi vài giây là bài kiểm tra báo "thiếu sáng" sai.
+        // Signal quality only means something while a face is visible; frames without a face are stamped 0,
+        // and averaging them in means a few seconds turned away makes the check falsely report low light.
         if (s.faceDetected) {
             pfQualSum += s.signalQuality
             pfQualN++
@@ -5071,7 +5071,7 @@ class MainActivity : ComponentActivity() {
             pfSeiSum += sei.toLong()
             pfSeiN++
         }
-        // null nghĩa là cửa sổ chưa đủ mẫu; 0% thật (ngồi tỉnh, mở mắt to) cũng là đã đo được.
+        // null means the window has too few samples; a real 0% (awake, eyes wide) still counts as measured.
         if (s.perclosPercent != null) {
             pfPerclosReady = true
         }
@@ -5085,7 +5085,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Một dòng kết quả: kind = 0 ổn, 1 cần lưu ý, 2 không đạt. */
+    /** One result row: kind = 0 fine, 1 worth noting, 2 failing. */
     private fun preflightRow(kind: Int, text: String): String {
         val mark = when (kind) {
             0 -> "OK  "
@@ -5109,7 +5109,7 @@ class MainActivity : ComponentActivity() {
             if (kind == 2) fails++ else if (kind == 1) warns++
         }
 
-        // Phần đo được trong 20 giây vừa rồi.
+        // The part that really got measured during those 20 seconds.
         if (pfFrames == 0) {
             add(2, "Không nhận được khung hình nào - camera chưa chạy hoặc chưa được cấp quyền.")
         } else {
@@ -5221,9 +5221,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Phần môi trường: kiểm lại tại thời điểm kết thúc. Những mục này cũng phải được
-        // tính vào kết luận - nếu chỉ in ra thì có thể đỏ "chưa cấp quyền camera" ngay dưới
-        // dòng "SẴN SÀNG TRÌNH DIỄN".
+        // The environment part: re-checked at the moment the run ends. These items must also feed the
+        // conclusion - printing them only would allow a red "camera permission not granted" directly
+        // under the "READY FOR THE DEMO" row.
         add(0, "---- Kiểm tra máy và thiết bị ----")
         preflightStaticChecks { kind, text -> add(kind, text) }
 
@@ -5236,7 +5236,7 @@ class MainActivity : ComponentActivity() {
         status = "Kiểm tra trước trình diễn: ${if (fails > 0) "$fails mục không đạt" else "đạt"}."
     }
 
-    /** Những mục không phụ thuộc nhịp khung hình: quyền, model, chỗ trống, pin, âm báo. */
+    /** Items independent of the frame cadence: permissions, model, free space, battery, alert sounds. */
     private fun preflightStaticChecks(emit: (Int, String) -> Unit) {
         var kind = 0
 
@@ -5328,18 +5328,18 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    // ==================== HISTOGRAM ĐỘ TRỄ ====================
+    // ==================== LATENCY HISTOGRAM ====================
 
-    /** Đếm mẫu vào 12 ngăn x 15 ms, giữ đúng 240 khung gần nhất. */
+    /** Counts samples into 12 buckets of 15 ms, holding exactly the last 240 frames. */
     private fun addLatencySample(ms: Float) {
         if (!ms.isFinite() || ms < 0f) {
             return
         }
         val bin = (ms / LATENCY_BIN_MS).toInt().coerceIn(0, LATENCY_BINS - 1)
         if (latencyFilled == LATENCY_SAMPLES) {
-            // Vòng tròn đã đầy: mẫu nằm ở vị trí latencyWriteIdx chính là mẫu cũ nhất, phải
-            // trừ đúng nó. Trừ bừa ở ngăn nào cũng được thì ngăn thấp luôn đầy sớm nên luôn
-            // bị xoá trước, histogram tự lệch dần sang phía chậm.
+            // Ring already full: the sample sitting at latencyWriteIdx is precisely the oldest one and must be
+            // the one subtracted. Subtracting from any bucket looks fine, but the lowest bucket fills first and
+            // is always cleared first, so the histogram drifts steadily toward the slow side.
             latencyCounts[latencyBins[latencyWriteIdx]]--
         } else {
             latencyFilled++
@@ -5379,16 +5379,16 @@ class MainActivity : ComponentActivity() {
         return bars to summary
     }
 
-    // ==================== NGƯỠNG HIỆN HÀNH ====================
+    // ==================== CURRENT THRESHOLDS ====================
 
     /**
-     * Liệt kê từng con số đang chi phối kết quả, kèm nguồn (mặc định hay hồ sơ riêng) và
-     * tình trạng kiểm chứng. Viết ra để không ai - kể cả tôi - nói quá được độ tin của nó.
+     * Lists every number currently driving the result, with its source (default or personal profile) and
+     * its verification status. Written down so that nobody - including me - can overstate how trustworthy it is.
      */
     private fun buildThresholdRows(): String = buildString {
         fun line(name: String, current: Float, default: Float, note: String, unit: String = "") {
-            // "hồ sơ riêng" một mình là chữ dễ gây hiểu nhầm nhất trong toàn bộ bảng này: ngưỡng
-            // trộn thì không phải 100% số của em đó, nên phải in kèm đúng phần trăm trọng số.
+            // "personal profile" on its own is the most misleading phrase in this whole table: the blended
+            // threshold is not 100% that student's numbers, so the exact blend percentage must be printed too.
             val src = when {
                 current == default -> "mặc định"
                 personalBlend <= 0f -> "hồ sơ riêng"
@@ -5425,8 +5425,8 @@ class MainActivity : ComponentActivity() {
         appendLine(String.format(Locale.US, "  Nhắm mắt liên tục %.2f s thì báo buồn ngủ", DROWSY_CLOSURE_MS / 1000f))
         appendLine(String.format(Locale.US, "  P70/P80: độ mở <= %.2f / %.2f so với đường cơ sở", PERCLOS_P70_OPEN, PERCLOS_P80_OPEN))
         appendLine(String.format(Locale.US, "  Ngưỡng nheo mắt %.0f%%, lệch hai mắt %.0f%%", EyeEngine.SQUINT_ALERT_PCT, EyeEngine.ASYM_ALERT_PCT))
-        // Đổi số khung ra giây phải dùng nhịp thật của máy. Giả sử 30 FPS thì trên máy chạy
-        // 18 FPS sẽ ghi "2 s" trong khi học sinh phải ngồi 3,3 s.
+        // Converting frame counts into seconds must use the real cadence of the machine. Assuming 30 FPS, a
+        // phone running at 18 FPS would print "2 s" while the student actually sat there for 3.3 s.
         val calFps = fpsEma
         if (calFps > 1f) {
             appendLine(
@@ -5461,8 +5461,8 @@ class MainActivity : ComponentActivity() {
         append("Độ tin của hồ sơ xem ở dòng 'Hồ sơ cá nhân' phía trên. Chưa ngưỡng nào được đối chiếu với quan sát của giáo viên.")
         appendLine()
         appendLine()
-        // Bảng dải được cameraExecutor dựng mỗi giây, đọc sang đây như mọi dòng chữ HUD khác.
-        // Nó đứng SAU các ngưỡng vì nó chỉ mô tả: không ngưỡng nào trong app đổi vì nó.
+        // The band table is built by cameraExecutor every second and read across like any other HUD text line.
+        // It stands AFTER the thresholds because it only describes: no threshold in the app changes because of it.
         val bandTable = bandTablePlain
         if (bandTable.isNotEmpty()) {
             append(bandTable)
@@ -5470,15 +5470,15 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Làm mới các số chỉ sống trong bảng phụ. Gọi từ applyHudText nên đã được kẹp nhịp
-     * ~8 lần/giây; bảng ngưỡng và histogram chỉ dựng khi đang xem tab "Chỉ số" để không
-     * tốn công cho màn hình đang bị che.
+     * Refreshes the numbers that only live in the side panel. Called from applyHudText so it is already
+     * clamped to about 8 times per second; the threshold table and the histogram are only built while the
+     * index tab is open, so no effort goes to a screen that is currently covered.
      */
     private fun refreshPanelExtras() {
         if (panelTab != 2) {
             return
         }
-        // applyHudText chạy ~8 lần/giây; bảng chữ dài chỉ cần một lần/giây.
+        // applyHudText runs about 8 times per second; the long text table only needs one pass per second.
         val nowUi = SystemClock.elapsedRealtime()
         if (nowUi - lastThresholdMs < THRESHOLD_REFRESH_MS) {
             return
@@ -5493,8 +5493,8 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Ghi lại sự kiện theo giây. Mỗi loại chỉ một điểm trong một giây: nếu không, một cơn
-     * buồn ngủ kéo dài sẽ vẽ 1800 vạch chồng lên nhau và biểu đồ thành một mảng màu.
+     * Records events by second. Each type gets only one point within a second: otherwise one long
+     * sleepiness spell draws 1800 overlapping bars and the chart becomes a solid block of colour.
      */
     private fun recordTimelineEvent(s: HudSnapshot) {
         val sec = SystemClock.elapsedRealtime() / 1000L
@@ -5516,7 +5516,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Đổi sự kiện thành vị trí 0..1 trên trục thời gian, bỏ những gì đã ngoài cửa sổ. */
+    /** Turns an event into a 0..1 position on the time axis, dropping anything outside the window. */
     private fun buildTimelineMarks(): List<Pair<Float, Int>> {
         val nowSec = SystemClock.elapsedRealtime() / 1000L
         val out = ArrayList<Pair<Float, Int>>()
@@ -5529,11 +5529,11 @@ class MainActivity : ComponentActivity() {
         return out
     }
 
-    // ==================== XEM DỮ LIỆU THÔ ====================
+    // ==================== RAW DATA VIEWER ====================
 
     /**
-     * Đọc vài dòng cuối của file ghi. Việc này đụng vào flash nên làm trên thread riêng rồi
-     * đưa kết quả về UI thread; nếu đọc ngay trong khung vẽ thì mỗi lần bấm là máy khựng.
+     * Reads the last few rows of the log file. This touches flash, so it runs on a separate thread and hands
+     * the result back to the UI thread; reading inside the draw frame would freeze the phone on every tap.
      */
     private fun toggleCsvTail() {
         showCsvTail = !showCsvTail
@@ -5559,8 +5559,8 @@ class MainActivity : ComponentActivity() {
                     else -> {
                         val lines = readTailLines(f, CSV_TAIL_LINES)
                         when (lines) {
-                            // null = file có tồn tại nhưng đụng vào không được. Nói thẳng là không
-                            // đọc được còn hơn để bảng trống trơn - dễ bị hiểu thành "chưa ghi gì".
+                            // null = the file exists but cannot be touched. Saying plainly that it cannot be read is better than
+                            // leaving the table empty - an empty table is easily read as "nothing has been written yet".
                             null -> emptyList<String>() to
                                 "Không đọc được ${f.name}. File có thể vừa bị xoá hoặc quyền truy cập " +
                                 "bị thu hồi giữa chừng. Thử tắt bật lại nút ghi."
@@ -5605,7 +5605,7 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    /** Chữ giải thích cho từng cột, viết ra để không ai phải đoán khi mở file trên máy tính. */
+    /** Explanation for every column, written so nobody has to guess when opening the file on a computer. */
     private fun csvColumnLegend(): String = buildString {
         appendLine("Đơn vị và ý nghĩa của các cột hay bị đọc sai:")
         appendLine("  t_ms          thời gian từ lúc bật máy, không phải giờ tường thuật")
@@ -5636,15 +5636,15 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    // ==================== KỊCH BẢN TRÌNH DIỄN ====================
+    // ==================== DEMO SCRIPT ====================
 
     private fun toggleDemoStep(index: Int) {
         demoDone = demoDone xor (1 shl index)
     }
 
-    // ==================== DIỄN GIẢI CHỈ SỐ ====================
+    // ==================== INDEX EXPLANATION ====================
 
-    /** Bảng chụp nhanh mọi con số đang hiển thị, để dán vào bài thuyết minh. */
+    /** Snapshot of every number currently on screen, for pasting into the written report. */
     private fun buildPanelReport(): String = buildString {
         appendLine("FOCUSCHANGEAI - BẢNG KIỂM ĐỊNH NHANH")
         appendLine("Học sinh: $studentName")
@@ -5690,12 +5690,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Năm khung của bảng điều khiển, thứ tự khớp với when (panelTab). */
+/** The five frames of the control panel, in the same order as when (panelTab). */
 private val PanelTabs = listOf("Theo dõi", "Chuẩn bị", "Chỉ số", "Diễn giải", "Kịch bản")
 
 /**
- * Kịch bản demo: mỗi dòng là một thao tác và phản ứng đúng mà HUD phải thể hiện.
- * Dùng để tập trước và để đối chiếu khi có gì đó không như dự kiến trên sân khấu.
+ * Demo script: each row is one action and the exact reaction the HUD must show.
+ * Used for rehearsing beforehand and for comparing notes when something on stage differs.
  */
 private val PanelDemoSteps: List<Pair<String, String>> = listOf(
     "Ngồi thẳng, cách màn hình 40-50 cm, đủ sáng" to
@@ -5717,8 +5717,8 @@ private val PanelDemoSteps: List<Pair<String, String>> = listOf(
 )
 
 /**
- * Diễn giải từng chỉ số cho giám khảo. Mỗi mục nói rõ cái gì đo được, cái gì chỉ là giả định,
- * vì nói quá một câu ở đây dễ hơn sửa lại một thuật toán.
+ * Explains every index for the judges. Each entry states what is actually measured and what is only an
+ * assumption, because overstating one sentence here is easier than fixing an algorithm later.
  */
 private val PanelGlossary: List<Pair<String, String>> = listOf(
     "SEI 2.0 (điểm chú ý)" to
@@ -5802,7 +5802,7 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm nút tạo ra."
 )
 
-/** Dải màu cho dòng sự kiện, thứ tự khớp với TL_BAND_* ở trên. */
+/** Colour bands for the event rows, in the same order as the TL_BAND_* constants above. */
 private val TimelineBands: List<Pair<String, Color>> = listOf(
     "Cảnh báo" to Color(0xFFE53935),
     "Kéo dài" to Color(0xFF8E24AA),

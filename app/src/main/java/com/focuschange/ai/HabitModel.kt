@@ -17,13 +17,13 @@ internal object HabitConfig {
     /** A session is only saved when it has at least this much "valid" time. */
     const val MIN_SESSION_MS = 2L * 60L * 1000L
 
-    /** Tỉ lệ thời gian thấy khuôn mặt tối thiểu trong phiên. */
+    /** Minimum share of session time with a face visible. */
     const val MIN_FACE_RATIO = 0.70f
 
-    /** Tỉ lệ khung hợp lệ / khung thấy mặt tối thiểu. */
+    /** Minimum ratio of valid frames / frames with a face. */
     const val MIN_VALID_RATIO = 0.50f
 
-    /** Chất lượng tín hiệu trung bình tối thiểu (0-100). */
+    /** Minimum average signal quality (0-100). */
     const val MIN_QUALITY = 60f
 
     /** Minimum average SEI: below this the session does not reflect normal studying. */
@@ -48,7 +48,7 @@ internal object HabitConfig {
     const val MAX_FRAME_GAP_MS = 700L
 
     /**
-     * Multiplier for [ToleranceBand]: band = typical level ± BAND_K * natural spread.
+     * Multiplier for [ToleranceBand]: band = typical level +/- BAND_K * natural spread.
      * 2.5 is the figure currently used by the personal alert thresholds (head turn, eye glance),
      * so the band and the alerts cannot contradict each other. Kept public so the HUD, the CSV and
      * the Firebase record all multiply by one factor - if each picked its own number, the same
@@ -363,7 +363,7 @@ internal class HabitBaseline(
     }
 
     /**
-     * Two-sided allowed band of one feature: mean ± k*spread, clamped into its own physical LO/HI
+     * Two-sided allowed band of one feature: mean +/- k*spread, clamped into its own physical LO/HI
      * range. Returns null when nothing was learned for this feature - "not known yet" must differ
      * from "band of width zero".
      *
@@ -382,26 +382,26 @@ internal class HabitBaseline(
     }
 }
 
-/** Hồ sơ thói quen của một học sinh: danh sách các phiên đạt chuẩn. */
+/** One student's habit profile: the list of qualifying sessions. */
 internal class HabitProfile(val id: String, var name: String) {
     val sessions = ArrayList<SessionSummary>()
 
     /**
-     * Kết quả hiệu chuẩn khoảng cách, lưu THEO HỒ SƠ chứ không theo chiếc điện thoại.
+     * Distance calibration result, stored PER PROFILE rather than per phone.
      *
-     * Trước đây hệ số chỉ là một pref của máy (`distance_scale_v2`), nên khi em thứ hai bấm hiệu
-     * chuẩn thì mọi con số cm của em thứ nhất đổi theo mà không ai thấy.
+     * The factor used to be a device-level pref (`distance_scale_v2`), so when a second student
+     * pressed calibrate, every cm number of the first one changed with nobody seeing why.
      *
-     * Hai giá trị này cũng là chữ ký hình học duy nhất mà ứng dụng có, vì hiệu chuẩn diễn ra ở
-     * khoảng cách tham chiếu đã biết trước: `distanceScale = REF / calRawDistanceCm` chỉ còn biến
-     * số là bề rộng mặt thật của người ngồi, và [PersonGuard] dùng đúng cái đó để nghi đã đổi người.
+     * These two values are also the only geometric signature the app has, because calibration runs at
+     * a reference distance that is already known: `distanceScale = REF / calRawDistanceCm` leaves one
+     * variable, the real face width of whoever is sitting there, and [PersonGuard] uses exactly that.
      */
     var distanceScale: Float = Float.NaN
 
-    /** Trung vị khoảng cách THÔ (chưa nhân hệ số) của các khung được dùng để hiệu chuẩn. */
+    /** Median RAW distance (before the factor) of the frames used for calibration. */
     var calRawDistanceCm: Float = Float.NaN
 
-    /** Giây mà máy tính thiết bị (`System.currentTimeMillis`) của lần hiệu chuẩn gần nhất. */
+    /** Device clock second (`System.currentTimeMillis`) of the most recent calibration. */
     var calibratedAtMs: Long = 0L
 
     fun hasCalibration(): Boolean = distanceScale.isFinite() && distanceScale > 0f
@@ -431,7 +431,7 @@ internal class HabitProfile(val id: String, var name: String) {
         return ((sessions.size - HabitConfig.MIN_SESSIONS + 1) / 5f).coerceIn(0.2f, 1f)
     }
 
-    /** Lý do phiên chưa đủ điều kiện để học (null nếu đạt). */
+    /** Why the session does not qualify for learning (null when it does). */
     fun ineligibleReason(s: SessionSummary): String? = when {
         s.validMs < HabitConfig.MIN_SESSION_MS ->
             "chưa đủ ${HabitConfig.MIN_SESSION_MS / 60000L} phút hợp lệ"
@@ -447,9 +447,9 @@ internal class HabitProfile(val id: String, var name: String) {
     }
 
     /**
-     * Thêm hoặc cập nhật phiên (cùng id thì ghi đè, vì phiên được lưu định kỳ).
-     * Phiên không đạt chuẩn sẽ bị gỡ nếu trước đó đã lưu.
-     * Trả về true nếu hồ sơ có thay đổi.
+     * Add or update a session (same id overwrites, because sessions are saved periodically).
+     * A session that fails the bar is removed if it had been stored earlier.
+     * Returns true if the profile changed.
      */
     fun commit(s: SessionSummary): Boolean {
         val pos = sessions.indexOfFirst { it.id == s.id }
@@ -466,9 +466,9 @@ internal class HabitProfile(val id: String, var name: String) {
     }
 
     /**
-     * SEI trung bình trên [fromIdx, toIdx) kèm SỐ PHIÊN thực sự đóng góp.
-     * Con số thứ hai là phần quan trọng: một "xu hướng" rút ra từ một phiên trước và ba phiên
-     * sau thì không nói được gì về học sinh, chỉ nói về may rủi của buổi hôm đó.
+     * Mean SEI over [fromIdx, toIdx) plus the NUMBER OF SESSIONS that actually contributed.
+     * The second number is the important part: a "trend" drawn from one earlier session and three
+     * later ones says nothing about the student, only about the luck of that particular afternoon.
      */
     internal fun avgSei(fromIdx: Int, toIdx: Int): Pair<Float, Int>? {
         var sum = 0f
@@ -486,9 +486,9 @@ internal class HabitProfile(val id: String, var name: String) {
     }
 
     /**
-     * Mức cơ sở: trung bình có trọng số (phiên dài hơn và gần đây hơn nặng hơn),
-     * loại phiên ngoại lai (MAD) khi đã có từ 5 phiên.
-     * spread = căn(phương sai giữa các phiên + phương sai trong phiên).
+     * Baseline: weighted mean (longer and more recent sessions count more), outlier sessions
+     * removed by MAD once there are at least 5 - this gate is a hard-coded 5, not MIN_SESSIONS.
+     * spread = sqrt(between-session variance + within-session variance).
      */
     fun baseline(): HabitBaseline {
         val c = HabitFeature.COUNT
