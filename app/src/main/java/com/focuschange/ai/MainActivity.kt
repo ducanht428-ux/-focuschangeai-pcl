@@ -83,6 +83,13 @@ class MainActivity : ComponentActivity() {
         const val PREFS_NAME = "focus_change_prefs"
         // Đổi key: bỏ hệ số cũ đã được hiệu chuẩn theo công thức sai.
         const val KEY_DISTANCE_SCALE = "distance_scale_v2"
+
+        /**
+         * Hồ sơ mà chiếc điện thoại này được dùng cho MỘT học sinh. Trước khi có khoá này, ai cầm
+         * máy cũng đổi được hồ sơ, nên một buổi đo có thể âm thầm mang nhãn của người khác - và
+         * toàn bộ ý nghĩa "ngưỡng riêng của em" mất tác dụng.
+         */
+        const val KEY_BOUND_STUDENT = "bound_student_id"
         const val KEY_SOUND = "sound_enabled"
         const val KEY_SOUND_MODE = "sound_mode"
         const val KEY_SENSITIVITY = "sensitivity_level"
@@ -427,6 +434,11 @@ class MainActivity : ComponentActivity() {
     private var imageDetailText by mutableStateOf("--")
     private var habitLearnUi by mutableStateOf(true)
     private var showAddStudent by mutableStateOf(false)
+
+    /** Hồ sơ mà máy này đang gắn (KEY_BOUND_STUDENT), chỉ đổi được qua hộp xác nhận. */
+    private var boundStudentId by mutableStateOf("")
+    private var showRebind by mutableStateOf(false)
+    private var rebindTargetId: String? = null
     private var showResetHabit by mutableStateOf(false)
     private var newStudentName by mutableStateOf("")
 
@@ -830,9 +842,32 @@ class MainActivity : ComponentActivity() {
         habitStore = HabitStore(this)
         habitLearnEnabled = prefs.getBoolean(KEY_HABIT_LEARN, true)
         habitLearnUi = habitLearnEnabled
-        activeStudentId = habitStore.currentId()
+        val bound = prefs.getString(KEY_BOUND_STUDENT, null)
+        val wanted = bound?.takeIf { b -> habitStore.students().any { it.id == b } }
+        if (wanted != null) {
+            // Máy đã gắn với một em: bỏ qua con trỏ "current" của HabitStore, vì con trỏ đó đổi
+            // mỗi lần ai đó bấm trong danh sách. Nếu không bỏ qua, chỉ cần một lần bấm là máy
+            // học sinh A bắt đầu ghi số liệu dưới tên B.
+            activeStudentId = wanted
+            habitStore.setCurrent(wanted)
+        } else {
+            activeStudentId = habitStore.currentId()
+            if (bound == null) {
+                // Lần chạy đầu trên máy: hồ sơ đang được chọn trở thành chủ máy.
+                prefs.edit().putString(KEY_BOUND_STUDENT, activeStudentId).apply()
+            }
+        }
+        boundStudentId = activeStudentId
         studentName = habitStore.nameOf(activeStudentId)
         studentSwitchRequest = activeStudentId
+
+        // BootReceiver vừa tự mở app sau khi bật máy: ghi vào dòng trạng thái để buổi đo hôm nay
+        // có dấu vết rõ ràng về việc nó bắt đầu bằng cú tự động hay bằng tay.
+        if (intent?.getBooleanExtra(BootReceiver.EXTRA_AUTO_START, false) == true) {
+            status = "Tự mở sau khi bật điện thoại " +
+                "(${intent?.getStringExtra(BootReceiver.EXTRA_AUTO_START_SOURCE) ?: "boot"}). " +
+                "Nếu máy này có công tắc Autostart riêng thì vẫn nên kiểm tra nó."
+        }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         loadCameraIntrinsics()
@@ -973,18 +1008,51 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
+                            Text(
+                                text = "Máy này đang gắn với: $studentName",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button(onClick = { switchStudent() }) {
-                                    Text("Đổi HS")
+                                Button(onClick = { requestSwitchStudent() }) {
+                                    Text("Đổi người dùng trên máy này")
                                 }
-                                Button(
-                                    onClick = {
-                                        newStudentName = ""
-                                        showAddStudent = true
-                                    }
-                                ) {
+                                Button(onClick = { requestAddStudent() }) {
                                     Text("Thêm HS")
                                 }
+                            }
+
+                            if (showRebind) {
+                                val target = rebindTargetId?.let { id -> habitStore.nameOf(id) } ?: ""
+                                AlertDialog(
+                                    onDismissRequest = {
+                                        showRebind = false
+                                        rebindTargetId = null
+                                    },
+                                    title = { Text("Đổi người dùng?") },
+                                    text = {
+                                        Text(
+                                            "Máy này đang theo dõi $studentName. Đổi sang $target sẽ " +
+                                                "kết thúc phiên của $studentName và gửi bản tổng kết " +
+                                                "của em đó, đồng thời mọi ngưỡng riêng và hệ số hiệu " +
+                                                "chuẩn khoảng cách sẽ chuyển sang của $target. " +
+                                                "Nếu hai em chỉ ngồi cạnh nhau thì đừng đổi."
+                                        )
+                                    },
+                                    confirmButton = {
+                                        Button(onClick = { applyRebind() }) {
+                                            Text("Đổi sang $target")
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = {
+                                            showRebind = false
+                                            rebindTargetId = null
+                                        }) {
+                                            Text("Giữ nguyên")
+                                        }
+                                    }
+                                )
                             }
 
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1804,6 +1872,11 @@ class MainActivity : ComponentActivity() {
         activeStudentId = st.id
         habitStore.setCurrent(st.id)
         studentName = st.name
+        // Chọn hồ sơ trên máy này = gắn máy cho hồ sơ đó. Mọi đường đổi người đều đi qua hàm này,
+        // kể cả hộp xác nhận đổi người và nút Thêm HS, nên không đường nào đổi được ID mà không bị
+        // ghi lại ở đây.
+        prefs.edit().putString(KEY_BOUND_STUDENT, st.id).apply()
+        boundStudentId = st.id
         studentSwitchRequest = st.id
         resetAlertCounters()
         blinkCount = 0
@@ -1812,18 +1885,40 @@ class MainActivity : ComponentActivity() {
         calibrationText = "Đang hiệu chuẩn lại..."
     }
 
-    private fun switchStudent() {
+    /**
+     * Nút "Đổi HS" KHÔNG đổi ngay như trước. Đổi người dùng trên một chiếc máy đã gắn ID là kết
+     * thúc buổi đo của em đang ngồi, nên nó phải là một hành động có chủ ý của giáo viên, có giải
+     * thích, chứ không phải một cú trượt ngón tay.
+     */
+    private fun requestSwitchStudent() {
         val list = habitStore.students()
         if (list.size < 2) {
             status = "Mới có 1 hồ sơ học sinh, hãy bấm Thêm HS."
             return
         }
-        val idx = list.indexOfFirst { it.id == activeStudentId }
-        selectStudent(list[(idx + 1).mod(list.size)])
+        val idx = list.indexOfFirst { it.id == boundStudentId }
+        rebindTargetId = list[(idx + 1).mod(list.size)].id
+        showRebind = true
+    }
+
+    private fun applyRebind() {
+        val target = rebindTargetId
+        showRebind = false
+        rebindTargetId = null
+        if (target == null) return
+        val st = habitStore.students().firstOrNull { it.id == target } ?: return
+        status = "Máy này giờ theo dõi ${st.name}. Phiên của $studentName đã được kết thúc và gửi đi."
+        selectStudent(st)
     }
 
     private fun addStudent(name: String) {
         selectStudent(habitStore.addStudent(name))
+    }
+
+    /** Thêm hồ sơ luôn là đổi người, nên nó cũng đi qua selectStudent và gắn lại máy. */
+    private fun requestAddStudent() {
+        newStudentName = ""
+        showAddStudent = true
     }
 
     private fun toggleHabitLearn() {
