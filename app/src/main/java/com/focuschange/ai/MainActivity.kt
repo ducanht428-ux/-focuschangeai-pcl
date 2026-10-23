@@ -445,7 +445,6 @@ class MainActivity : ComponentActivity() {
     private var latencySummary by mutableStateOf("--")
     private var demoDone by mutableIntStateOf(0)
     private var glossaryOpen by mutableIntStateOf(-1)
-    private var qaOpen by mutableIntStateOf(-1)
     private var presenterMode by mutableStateOf(false)
     private var showCsvTail by mutableStateOf(false)
     private var csvTailLines by mutableStateOf(emptyList<String>())
@@ -1355,34 +1354,6 @@ class MainActivity : ComponentActivity() {
                                         if (glossaryOpen == index) {
                                             Text(
                                                 entry.second,
-                                                style = MaterialTheme.typography.bodySmall
-                                            )
-                                        }
-                                    }
-
-                                    Spacer(Modifier.height(8.dp))
-
-                                    Text(
-                                        "Câu hỏi ban giám khảo có thể hỏi",
-                                        style = MaterialTheme.typography.titleSmall
-                                    )
-                                    PanelQA.forEachIndexed { index, qa ->
-                                        TextButton(
-                                            onClick = {
-                                                qaOpen = if (qaOpen == index) -1 else index
-                                            }
-                                        ) {
-                                            Text(
-                                                text = if (qaOpen == index) {
-                                                    "- ${qa.first}"
-                                                } else {
-                                                    "? ${qa.first}"
-                                                }
-                                            )
-                                        }
-                                        if (qaOpen == index) {
-                                            Text(
-                                                qa.second,
                                                 style = MaterialTheme.typography.bodySmall
                                             )
                                         }
@@ -4893,7 +4864,13 @@ class MainActivity : ComponentActivity() {
         } else {
             appendLine("  Giữ khuôn mặt $CALIBRATION_FRAMES khung để hoàn tất hiệu chuẩn (chưa có nhịp khung hình để đổi ra giây).")
         }
-        appendLine(String.format(Locale.US, "  Quét lại mỗi %.0f ms, trần dt %.0f ms, khoảng dừng %.0f ms", UI_TEXT_REFRESH_MS, RATIO_REF_FRAME_MS, WINDOW_STALL_MS))
+        appendLine(
+            String.format(
+                Locale.US,
+                "  Quét lại mỗi %d ms, trần dt %d ms, khoảng dừng %d ms",
+                UI_TEXT_REFRESH_MS, RATIO_REF_FRAME_MS, WINDOW_STALL_MS
+            )
+        )
         appendLine()
         appendLine("Cửa sổ PERCLOS: $RATIO_BUCKETS bucket x 1 giây, đủ $RATIO_MIN_SAMPLE_MS ms mẫu mới hiện số.")
         appendLine("Trọng số SEI: tư thế ${(W_POSTURE * 100).toInt()}% | khoảng cách ${(W_DISTANCE * 100).toInt()}% | hướng nhìn ${(W_GAZE * 100).toInt()}% | mắt ${(W_EYES * 100).toInt()}% | chớp ${(W_BPM * 100).toInt()}% | biểu cảm ${(W_EXPRESSION * 100).toInt()}%")
@@ -5222,54 +5199,4 @@ private val TimelineBands: List<Pair<String, Color>> = listOf(
     "Mất mặt" to Color(0xFF757575),
     "Chớp mắt" to Color(0xFF00897B),
     "Quá gần" to Color(0xFFEF6C00)
-)
-
-/**
- * Những câu hỏi thật sự hay bị hỏi ở hội thi, kèm câu trả lời đúng bằng mức chứng cứ của đề tài.
- * Viết ra để trả lời ngắn và không nói quá - phần lớn tranh luận bị mất điểm ở câu "sai số bao nhiêu".
- */
-private val PanelQA: List<Pair<String, String>> = listOf(
-    "Em đo được buồn ngủ hay chỉ đoán?" to
-        "PERCLOS là đại lượng đo được và có tài liệu chuẩn: tỉ lệ thời gian mí che đồng tử, tính trên " +
-        "cửa sổ 60 giây. Còn SEI là điểm tổng hợp do em tự trọng số, nên em coi nó là chỉ số tham chiếu " +
-        "chứ không phải kết luận y khoa.",
-    "Sai số của app là bao nhiêu?" to
-        "Em chưa có ground truth nên chưa được phép đưa ra một con số. Việc em đang làm là ghi CSV, " +
-        "đối chiếu với tình huống chủ động (nhắm mắt 5 giây, quay đầu 30 độ) và với quan sát của người " +
-        "thứ hai, rồi mới nói đến sai số.",
-    "Sao không dùng cảm biến điện cực?" to
-        "Điện cực chính xác hơn nhưng một học sinh không đeo được trong giờ học và chi phí cao. App " +
-        "chỉ cần camera trước của điện thoại, chạy hoàn toàn trên máy, không lên mạng.",
-    "Nếu em đưa ảnh thật của người khác vào thì sao?" to
-        "Có một lớp kiểm tra đơn giản: nếu 60 khung liên tiếp góc đầu và độ mở mắt gần như không đổi " +
-        "mà không có lần chớp nào, app coi khả năng cao là ảnh tĩnh và chặn điểm ở mức thấp. Đây không " +
-        "phải chống giả mạo chuyên nghiệp, chỉ để số liệu không bị một bức ảnh đánh lừa.",
-    "App phân biệt hai mắt hay một người?" to
-        "App chỉ phân tích khuôn mặt lớn nhất trong khung và nói rõ ở HUD là 'Số khuôn mặt'. Trong lớp " +
-        "thì mỗi máy chỉ theo dõi một người ngồi trước nó.",
-    "Sao ngưỡng lại là 15% PERCLOS?" to
-        "Đó là mức tài liệu buồn ngủ hay dùng làm mốc cảnh báo, nhưng em đặt nó cho máy của em và chưa " +
-        "kiểm chứng trên lớp học. Bảng 'Chỉ số' liệt kê đầy đủ từng ngưỡng, nguồn của nó (mặc định hay " +
-        "hồ sơ riêng) và đánh dấu những ngưỡng chưa được đối chiếu.",
-    "Chạy trên máy yếu thì sao?" to
-        "App quy mọi khoảng khung hình về cùng một trọng số và loại hẳn khoảng dừng trên 700 ms, nên " +
-        "máy chậm làm giảm số mẫu chứ không làm lệch tỉ lệ. Bài kiểm tra 20 giây đo đúng cái đó: nhịp " +
-        "khung, độ trễ, số khung mất mặt.",
-    "Học sinh có bị điểm xấu vì shape mắt không?" to
-        "Vì độ mở mắt tính theo đường cơ sở của chính người đó, kéo mí một hay đeo kính không bị kết " +
-        "luận là buồn ngủ. Đây là lý do app bắt đầu mỗi phiên bằng bước hiệu chuẩn.",
-    "Dữ liệu có gửi về cô giáo không?" to
-        "Không có lời gọi mạng nào trong app. Chỉ khi bấm 'Chia sẻ báo cáo' thì văn bản do chính em " +
-        "tạo mới đi, và tên trong văn bản là tên em tự đặt. Sao lưu dự phòng của hệ thống cũng đã tắt.",
-    "Sao phải học thói quen từng người?" to
-        "Có người chớp 12 lần một phút là bình thường, có người 12 lần là khác hẳn ngày thường của họ. " +
-        "Hồ sơ riêng chỉ bật sau ba phiên đủ điều kiện (và tối thiểu 15 phút hợp lệ cộng lại). HUD luôn " +
-        "nói rõ có bao nhiêu trên tám ngưỡng là của riêng em, bao nhiêu vẫn là mặc định.",
-    "Nếu camera bị che hoặc tắt đèn?" to
-        "Chất lượng tín hiệu tụt xuống dưới 50 thì app ngừng báo buồn ngủ và mất tập trung, vì lúc đó " +
-        "là lỗi đo chứ không phải lỗi của người học.",
-    "Điểm mạnh nhất và yếu nhất của đề tài là gì?" to
-        "Mạnh: toàn bộ pipeline chạy trên thiết bị, đo được PERCLOS thật và có thể xuất dữ liệu thô để " +
-        "người khác kiểm chứng. Yếu: chưa có dữ liệu đối chiếu trên nhiều lớp, và trọng số SEI là do em " +
-        "chọn chứ chưa học được từ quan sát."
 )
