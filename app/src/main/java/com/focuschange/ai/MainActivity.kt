@@ -81,13 +81,13 @@ class MainActivity : ComponentActivity() {
     private companion object {
         const val TAG = "FocusChangeAI"
         const val PREFS_NAME = "focus_change_prefs"
-        // Đổi key: bỏ hệ số cũ đã được hiệu chuẩn theo công thức sai.
+        // Changed the key: drop the old scale factor that was calibrated with the wrong formula.
         const val KEY_DISTANCE_SCALE = "distance_scale_v2"
 
         /**
-         * Hồ sơ mà chiếc điện thoại này được dùng cho MỘT học sinh. Trước khi có khoá này, ai cầm
-         * máy cũng đổi được hồ sơ, nên một buổi đo có thể âm thầm mang nhãn của người khác - và
-         * toàn bộ ý nghĩa "ngưỡng riêng của em" mất tác dụng.
+         * The profile that this phone is being used for ONE student. Before this lock existed,
+         * anyone holding the phone could switch the profile, so a measurement session could quietly
+         * carry another person's label - and the whole "this student's own threshold" idea is lost.
          */
         const val KEY_BOUND_STUDENT = "bound_student_id"
         const val KEY_SOUND = "sound_enabled"
@@ -98,28 +98,41 @@ class MainActivity : ComponentActivity() {
         const val HABIT_AUTOSAVE_MS = 30_000L
         const val HABIT_STATUS_REFRESH_MS = 1_000L
 
-        // SEI thấp hơn mức thường ngày của chính học sinh (độ lệch 1.5 lần dao động riêng) trong 45 giây.
+        /**
+         * Heartbeat cadence for the teacher screen: the FIRST beat after 1 minute (soon enough to
+         * see the phone has entered a measurement shift), then one beat every 5 minutes.
+         *
+         * 5 minutes is to fit Firestore's write budget, not to fit the human eye: a 40-minute
+         * session only adds 8 more writes. The beat is timed off elapsedRealtime because it must
+         * keep counting even while the phone is snoozing, while the timestamp inside the record is
+         * a wall-clock reading so that two machines read it the same way.
+         */
+        const val HEARTBEAT_FIRST_MS = 60_000L
+        const val HEARTBEAT_MS = 5 * 60_000L
+
+        // SEI below the student's own everyday level (deviation of 1.5x their own spread) for 45 seconds.
         const val LOW_VS_PERSONAL_MS = 45_000L
         const val LOW_VS_PERSONAL_K = 1.5f
         const val PERSONAL_SEI_MIN_SPREAD = 8f
 
-        /** Tổng số ngưỡng có thể thay bằng ngưỡng cá nhân (để HUD nói rõ bao nhiêu cái là mặc định).
-         *  Chính bằng số lần gọi mix() trong applyPersonalParams: 4 tư thế/hướng nhìn + 2 nhịp chớp
-         *  + PERCLOS + MAR. Nếu thêm ngưỡng cá nhân mới thì phải sửa con số này theo. */
+        /** Total number of thresholds that can be replaced by a personal one (so the HUD can say
+         *  how many are still defaults). Exactly equal to the number of mix() calls in
+         *  applyPersonalParams: 4 posture/gaze + 2 blink cadence + PERCLOS + MAR. If a new personal
+         *  threshold is added, this number must be updated to match. */
         const val TOTAL_PERSONAL_THRESHOLDS = 8
 
         /**
-         * Mã cột dải trong CSV cho khung hình KHÔNG được chấm đặc trưng đó (mất mặt, tín hiệu
-         * kém, hoặc học thói quen đang tắt). Khác -1 của BandPosition.toCsvCode(): -1 nghĩa là
-         * "có chấm nhưng chưa học được dải". Gộp hai mã này thì không còn phân biệt được giữa
-         * "thiết bị chưa đủ dữ liệu" và "hôm nay em đó vắng mặt".
+         * The CSV band-column code for a frame where that feature was NOT scored (face lost, poor
+         * signal, or habit learning is off). Different from BandPosition.toCsvCode()'s -1: -1 means
+         * "scored but the band has not been learned yet". Merging the two codes would make it
+         * impossible to tell apart "the device lacks enough data" from "that student was absent today".
          */
         const val CODE_BAND_NOT_SCORED = -2
 
-        /** Tỷ lệ khung lọt ra ngoài dải để bảng "Chỉ số" đánh dấu một dòng bằng mũi tên. */
+        /** Percentage of frames falling outside the band before the metrics panel flags a row with an arrow. */
         const val BAND_MARK_OUT_PCT = 5f
 
-        // Loại cảnh báo (dùng để đếm số lần xuất hiện trước khi kêu).
+        // Alert kind (used to count how many times it appears before a sound fires).
         const val KIND_DROWSY = 1
         const val KIND_PERCLOS = 2
         const val KIND_DRIFT = 3
@@ -135,22 +148,22 @@ class MainActivity : ComponentActivity() {
         const val KIND_INCOMPLETE_BLINK = 13
         const val KIND_HIGH_BLINK = 14
 
-        // Chỉ phân tích mắt khi góc đầu đủ nhỏ (ngoài ngưỡng này landmark mắt kém tin cậy).
+        // Only analyse the eyes when the head angle is small enough (beyond it eye landmarks are unreliable).
         const val EYE_MAX_YAW_DEG = 45f
         const val EYE_MAX_PITCH_DEG = 35f
 
-        // Chỉ kêu khi cảnh báo đã xuất hiện đủ số lần trong khung thời gian.
-        const val ALERT_SOUND_AFTER_NORMAL = 2          // cảnh báo thường: kêu từ lần thứ 2
-        const val ALERT_SOUND_AFTER_HABIT = 4           // cảnh báo so với thói quen: kêu từ lần thứ 4
+        // Only sound an alert once it has appeared enough times within the counting window.
+        const val ALERT_SOUND_AFTER_NORMAL = 2          // normal alert: sounds from the 2nd occurrence
+        const val ALERT_SOUND_AFTER_HABIT = 4           // vs-habit alert: sounds from the 4th occurrence
         const val ALERT_COUNT_WINDOW_MS = 10L * 60L * 1000L
         const val ALERT_COUNT_WINDOW_HABIT_MS = 30L * 60L * 1000L
-        const val ALERT_REARM_MS = 5_000L               // tắt quá 5 giây rồi hiện lại mới tính là lần mới
+        const val ALERT_REARM_MS = 5_000L               // must stay off for over 5 seconds and reappear to count as a new occurrence
 
-        // Chỉ số điểm mốc mắt (giữ nguyên theo code gốc).
+        // Eye landmark indices (kept unchanged from the original code).
         val RIGHT_EYE = intArrayOf(33, 160, 158, 133, 153, 144)
         val LEFT_EYE = intArrayOf(362, 385, 387, 263, 373, 380)
 
-        // Điểm mốc dùng cho khoảng cách và tư thế đầu.
+        // Landmarks used for distance and head pose.
         const val LM_OUTER_RIGHT_EYE = 33
         const val LM_OUTER_LEFT_EYE = 263
         const val LM_NOSE_TIP = 1
@@ -161,13 +174,13 @@ class MainActivity : ComponentActivity() {
         const val MIN_LANDMARKS = 468
         const val IRIS_LANDMARKS = 478
 
-        // Mặt nạ vẽ mắt (tra cứu O(1), không tạo đối tượng khi vẽ).
+        // Eye drawing mask (O(1) lookup, allocates nothing while drawing).
         val EYE_MASK = BooleanArray(IRIS_LANDMARKS).also { mask ->
             for (i in RIGHT_EYE) mask[i] = true
             for (i in LEFT_EYE) mask[i] = true
         }
 
-        // Mống mắt (Iris): 468-472 mắt phải, 473-477 mắt trái.
+        // Iris: 468-472 right eye, 473-477 left eye.
         const val LM_RIGHT_IRIS = 468
         const val LM_LEFT_IRIS = 473
         const val LM_R_EYE_OUTER = 33
@@ -179,13 +192,13 @@ class MainActivity : ComponentActivity() {
         const val LM_L_LID_UP = 386
         const val LM_L_LID_LOW = 374
 
-        // Hai điểm ngang của mống mắt (đo đường kính).
+        // The two horizontal iris points (measures the iris diameter).
         const val LM_R_IRIS_H1 = 469
         const val LM_R_IRIS_H2 = 471
         const val LM_L_IRIS_H1 = 474
         const val LM_L_IRIS_H2 = 476
 
-        // Chân mày và miệng.
+        // Eyebrows and mouth.
         const val LM_BROW_INNER_R = 55
         const val LM_BROW_INNER_L = 285
         const val LM_MOUTH_UP = 13
@@ -681,6 +694,12 @@ class MainActivity : ComponentActivity() {
     private var habitSession: HabitSession? = null
     private var lastHabitSaveMs = 0L
     private var lastHabitStatusMs = 0L
+
+    /**
+     * Thời điểm (elapsedRealtime) được phép gửi nhịp hẹn tiếp theo. Đặt lại khi mở phiên để nhịp
+     * đầu tiên đến sau 1 phút, không phải ngay khung hình đầu tiên.
+     */
+    private var nextHeartbeatMs = 0L
     private var habitStatus = "Đang nạp hồ sơ học sinh..."
     private var habitDetail = ""
     private var habitHistory = ""
@@ -2115,6 +2134,7 @@ class MainActivity : ComponentActivity() {
         resetPersonalParams()
         lastHabitSaveMs = nowMs
         lastHabitStatusMs = 0L
+        nextHeartbeatMs = nowMs + HEARTBEAT_FIRST_MS
 
         if (prof == null) {
             habitSession = null
@@ -2200,7 +2220,7 @@ class MainActivity : ComponentActivity() {
             csvRows = dataLogger.rows,
             avgFps = fpsEma,
             device = android.os.Build.MODEL,
-            appVersion = packageManager.getPackageInfo(packageName, 0).versionName ?: "?",
+            appVersion = appVersionName(),
             endedAtWallMs = System.currentTimeMillis(),
             ineligibleReason = prof.ineligibleReason(s),
             bandOutcomes = bands
@@ -2226,8 +2246,74 @@ class MainActivity : ComponentActivity() {
             habitStatus = buildHabitStatus()
             habitHistory = habitProfile?.historyText(5) ?: ""
             refreshBandText()
+            refreshHeartbeat(nowMs)
         }
     }
+
+    /**
+     * Nhịp hẹn: báo cho màn hình giáo viên biết "em này đang được đo, tới phút thứ bao nhiêu".
+     *
+     * Chỉ chạy trong luồng camera, nên nó chỉ có thể gửi khi camera thật sự đang chạy - tức là
+     * màn hình đang bật và app ở tiền cảnh. Vì vậy `beat_at_wall_ms` đứng yên nghĩa là
+     * "KHÔNG ĐO ĐƯỢC", không bao giờ nghĩa là "học sinh đang làm việc khác": Android 9+ cấm app
+     * nền dùng camera, tắt màn hình là hết dữ liệu. Ghi rõ điều này ở đây vì nó chính là chỗ dễ
+     * bị diễn giải sai nhất trên bảng theo dõi.
+     *
+     * Nhịp đầu sau HEARTBEAT_FIRST_MS, sau đó mỗi HEARTBEAT_MS - không phải mỗi khung hình: một
+     * phiên 40 phút thêm 8 lần ghi, còn gửi theo khung thì sẽ chạm hạn mức ghi của Firestore
+     * ngay trong buổi đo đầu tiên.
+     */
+    private fun refreshHeartbeat(nowMs: Long) {
+        val session = habitSession ?: return
+        if (!FirebaseSync.enabled) return
+        // Nút "Học thói quen" tắt thì tick()/observe() không chạy, số liệu giữa phiên toàn số 0
+        // và giáo viên đọc thành "em này đo ra 0". Thà để bảng presence đứng yên còn trung thực.
+        if (!habitLearnEnabled) return
+        if (nowMs < nextHeartbeatMs) return
+        nextHeartbeatMs = nowMs + HEARTBEAT_MS
+        sendHeartbeat(session)
+    }
+
+    private fun sendHeartbeat(session: HabitSession) {
+        val prof = habitProfile ?: return
+        var alerts = 0
+        for (list in alertOccurrences) alerts += list.size
+        var bandFrames = 0
+        var bandBelow = 0
+        var bandAbove = 0
+        for (o in session.bandOutcomes()) {
+            bandFrames += o.samples
+            bandBelow += o.below
+            bandAbove += o.above
+        }
+        FirebaseSync.uploadHeartbeat(
+            HeartbeatReport(
+                studentId = prof.id,
+                studentName = studentName,
+                sessionId = session.id,
+                // HabitSession được tạo bằng System.currentTimeMillis() nên id và giờ bắt đầu là
+                // một. Truyền riêng hai cột để bản ghi tự giải thích, không bắt người đọc suy.
+                startedAtWallMs = session.id,
+                beatAtWallMs = System.currentTimeMillis(),
+                activeMs = session.activeMs,
+                summary = session.toSummary(),
+                alertsTotal = alerts,
+                falseAlerts = falseAlertCount,
+                bandFrames = bandFrames,
+                bandBelow = bandBelow,
+                bandAbove = bandAbove,
+                device = android.os.Build.MODEL,
+                appVersion = appVersionName()
+            )
+        ) {
+            // Firestore báo kết quả trên luồng chính nên đổi chữ trên bảng được luôn.
+            firebaseText = FirebaseSync.statusText()
+        }
+    }
+
+    /** Nhãn bản dựng, để bảng trên mây phân biệt được máy nào đang chạy bản cũ. */
+    private fun appVersionName(): String =
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
 
     /**
      * Dựng chữ cho dải hai phía: một dòng cho màn hình chính, một bảng cho tab "Chỉ số".
@@ -5691,18 +5777,28 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "trung bình của cả phiên che mất. Bảng này MÔ TẢ, không cắt cảnh báo: alert_code không đổi " +
         "vì nó. Khoảng cách tới màn hình, độ dài một cái chớp, BFR và EAR cố ý không có dải riêng - " +
         "xem mục 'Học thói quen theo hồ sơ'.",
+    "Giáo viên thấy gì lúc đang học" to
+        "60 giây sau khi một phiên bắt đầu và mỗi 5 phút sau đó, app ghi đè lên một bản ghi nhỏ " +
+        "tên là 'presence' của riêng em đó: tên, nhịp lúc nào, phiên dài tới đâu, SEI trung bình " +
+        "tới thời điểm đó và vài con số khác. Màn hình giáo viên vì thế thấy 'em này đang được đo' " +
+        "mà không phải chờ tới lúc phiên kết thúc. Một phiên 40 phút thêm khoảng 8 lần ghi. " +
+        "Điều quan trọng nhất để đọc đúng bảng này: nhịp hẹn CHỈ gửi được khi camera đang chạy, " +
+        "tức là màn hình bật và app ở tiền cảnh. Vì vậy một nhịp đứng yên nghĩa là 'không đo được' " +
+        "(tắt màn hình, app bị Android cấm chạy nền, hết pin), KHÔNG phải 'em đó đang làm việc khác'.",
     "Mất khuôn mặt thì sao" to
         "App giữ nguyên dấu '--' cho SEI và không tính khoảng trống đó là thời gian mở mắt hay mất " +
         "tập trung. Trước đây khoảng trống bị suy diễn thành 'bằng chứng không chú ý', gây báo đỏ " +
         "giả khi học sinh với sách hoặc quay sang bạn - nay đã sửa: mất tín hiệu là thiếu dữ liệu.",
     "Quyền riêng tư và dữ liệu" to
-        "Toàn bộ suy luận chạy trên máy; ảnh không được lưu và không rời khỏi điện thoại. Khi một " +
-        "phiên kết thúc, app gửi đúng MỘT bản tổng kết lên Cloud Firestore: tên học sinh, các giá " +
-        "trị trung bình của phiên, số cảnh báo và số lần bấm 'cảnh báo sai'. Mất mạng thì lệnh ghi " +
-        "nằm trong hàng đợi ngoài luồng của Firestore và tự gửi lại khi có mạng. Ngoài bản tổng kết " +
-        "đó không có lời gọi mạng nào khác. Sao lưu dự phòng của hệ thống đã tắt (allowBackup=false), " +
-        "dữ liệu nằm trong thư mục riêng của app, và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm " +
-        "nút tạo ra."
+        "Toàn bộ suy luận chạy trên máy; ảnh không được lưu và không rời khỏi điện thoại. Có đúng " +
+        "hai loại dữ liệu được gửi đi, cả hai đều là bản tổng kết chứ không phải khung hình: " +
+        "(1) khi một phiên kết thúc, app ghi MỘT bản tổng kết lên Cloud Firestore - tên học sinh, " +
+        "các giá trị trung bình của phiên, số cảnh báo và số lần bấm 'cảnh báo sai'; (2) giữa " +
+        "chừng phiên, mỗi 5 phút app ghi đè một bản 'presence' nhỏ để giáo viên biết em đang được " +
+        "đo. Ngoài hai loại bản ghi đó, app không tự gửi thêm dữ liệu nào khác. Mất mạng thì lệnh " +
+        "ghi nằm trong hàng đợi ngoài luồng của Firestore và tự gửi lại khi có mạng. Sao lưu dự " +
+        "phòng của hệ thống đã tắt (allowBackup=false), dữ liệu nằm trong thư mục riêng của app, " +
+        "và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm nút tạo ra."
 )
 
 /** Dải màu cho dòng sự kiện, thứ tự khớp với TL_BAND_* ở trên. */
