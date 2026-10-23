@@ -6,15 +6,15 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sqrt
 // =====================================================================
-// HỒ SƠ THÓI QUEN TỪNG HỌC SINH (gộp chung vào một file)
+// PER-STUDENT HABIT PROFILE (several classes folded into one file)
 // =====================================================================
 
 /**
- * Cấu hình học thói quen. Muốn thử nhanh khi phát triển: hạ MIN_SESSION_MS xuống 20_000L
- * và MIN_TOTAL_MS xuống 60_000L.
+ * Habit-learning configuration. To test quickly during development: lower MIN_SESSION_MS to
+ * 20_000L and MIN_TOTAL_MS to 60_000L.
  */
 internal object HabitConfig {
-    /** Một phiên chỉ được lưu khi có ít nhất ngần này thời gian "hợp lệ". */
+    /** A session is only saved when it has at least this much "valid" time. */
     const val MIN_SESSION_MS = 2L * 60L * 1000L
 
     /** Tỉ lệ thời gian thấy khuôn mặt tối thiểu trong phiên. */
@@ -26,13 +26,14 @@ internal object HabitConfig {
     /** Chất lượng tín hiệu trung bình tối thiểu (0-100). */
     const val MIN_QUALITY = 60f
 
-    /** SEI trung bình tối thiểu: thấp hơn nghĩa là phiên không phản ánh việc học bình thường. */
+    /** Minimum average SEI: below this the session does not reflect normal studying. */
     const val MIN_SESSION_SEI = 40f
 
     /**
-     * Số phiên đạt chuẩn tối thiểu và tổng thời gian hợp lệ tối thiểu để coi là "đã có hồ sơ".
-     * Hai con số này đi cặp: 4 phiên x MIN_SESSION_MS (2 phút) mới ra 8 phút, nên trần tổng 10
-     * phút buộc các phiên phải dài trung bình 2,5 phút chứ không được bốn phiên 2 phút liền.
+     * Minimum number of qualifying sessions and minimum total valid time to count as "profile
+     * established". The two numbers come as a pair: 4 sessions x MIN_SESSION_MS (2 minutes) only gives
+     * 8 minutes, so the 10-minute total cap forces sessions to average 2.5 minutes rather than
+     * allowing four back-to-back 2-minute sessions.
      */
     const val MIN_SESSIONS = 4
     const val MIN_TOTAL_MS = 10L * 60L * 1000L
@@ -42,19 +43,20 @@ internal object HabitConfig {
     const val RECENCY_DECAY = 0.9
     const val MAX_WEIGHT_MINUTES = 30.0
 
-    /** Khoảng cách giữa hai khung lớn hơn mức này: coi như đứng máy, không tính là thời gian học. */
+    /** A gap between two frames larger than this: treat as a stall, not counted as study time. */
     const val MAX_FRAME_GAP_MS = 700L
 
     /**
-     * Bội số của [ToleranceBand]: dải = mức điển hình ± BAND_K * độ dao động.
-     * 2.5 là con số đang dùng cho các ngưỡng cảnh báo cá nhân (quay đầu, liếc mắt) nên dải và
-     * cảnh báo không tự mâu thuẫn với nhau. Đưa ra ngoài để HUD, CSV và bản ghi Firebase cùng
-     * nhân một hệ số - nếu mỗi nơi tự chọn một con số thì cùng một hành vi sẽ hai kết luận.
+     * Multiplier for [ToleranceBand]: band = typical level ± BAND_K * natural spread.
+     * 2.5 is the figure currently used by the personal alert thresholds (head turn, eye glance),
+     * so the band and the alerts cannot contradict each other. Kept public so the HUD, the CSV and
+     * the Firebase record all multiply by one factor - if each picked its own number, the same
+     * behaviour would get two different conclusions.
      */
     const val BAND_K = 2.5f
 }
 
-/** Các đặc trưng được học riêng cho từng học sinh. */
+/** Features that are learned individually per student. */
 internal object HabitFeature {
     const val BPM = 0
     const val BLINK_MS = 1
@@ -71,39 +73,39 @@ internal object HabitFeature {
     const val COUNT = 12
 
     /**
-     * Năm đặc trưng KHÔNG có ngưỡng cá nhân, ghi lại để không ai (kể cả tôi) gọi 7 cái còn lại
-     * là "mọi chỉ số đều học theo từng em":
+     * Five features that have NO personal threshold, recorded here so that nobody (including me)
+     * calls the other seven "every metric is learned per student":
      *
-     * - DIST: 30 cm là chuẩn vệ sinh học đường áp dụng cho mọi người, không phải thói quen. Cá
-     *   nhân hóa thành "em này quen ngồi 25 cm" sẽ biến một thói quen có hại thành mức bình thường
-     *   của riêng em đó - đúng điều dự án đang muốn sửa.
-     * - BLINK_MS / BFR: chưa có bằng chứng rằng độ dài một lần chớp hay tỉ lệ nhắm một mắt mang ý
-     *   nghĩa hành vi ở độ phân giải này; BFR chủ yếu phản ánh landmark trượt khi nghiêng đầu.
-     * - EAR: đã được cá nhân hóa bằng đường riêng (`blendEarWithHabit`, tối đa 35%) và ngưỡng đóng
-     *   mắt của phiên lấy từ chính hiệu chuẩn của em đó, nên đưa thêm vào mix() là nhân đôi hiệu
-     *   chuẩn trên cùng một con số.
-     * - SEI: dùng làm MỨC SO SÁNH ("thấp hơn thường ngày của bạn", LOW_VS_PERSONAL_K), không đặt
-     *   thành ngưỡng cảnh báo trực tiếp vì SEI đã là tổ hợp có trọng số của sáu thứ khác.
+     * - DIST: 30 cm is a classroom-hygiene standard applied to everyone, not a habit.
+     *   Personalising it into "this student is used to sitting at 25 cm" would turn a harmful
+     *   habit into that student's own normal - exactly the thing the project wants to fix.
+     * - BLINK_MS / BFR: there is no evidence yet that one blink's duration or the one-eye closure
+     *   ratio carries behavioural meaning at this resolution; BFR mostly reflects landmark slip when the head tilts.
+     * - EAR: already personalised through its own path (`blendEarWithHabit`, at most 35%) and the
+     *   session's eye-closure threshold comes from that student's own calibration, so adding it to
+     *   mix() would double-count the calibration on the same number.
+     * - SEI: used as a COMPARISON LEVEL ("lower than your usual", LOW_VS_PERSONAL_K), not set as a
+     *   direct alert threshold because SEI is already a weighted combination of six other things.
      */
 
-    /** Giới hạn cắt (winsorize) từng quan sát để một khung nhiễu không làm lệch hồ sơ. */
+    /** Per-observation clipping (winsorize) so one noisy frame cannot drag the profile off. */
     val LO = floatArrayOf(0f, 40f, 10f, -60f, -60f, -0.5f, -0.6f, 0f, 0.1f, 0f, 0f, 0f)
     val HI = floatArrayOf(60f, 1000f, 150f, 60f, 60f, 0.5f, 0.6f, 1.2f, 1.5f, 0.6f, 100f, 100f)
 
-    /** Độ rộng tối thiểu để ngưỡng không bị "co" về 0 khi dữ liệu còn ít. */
+    /** Minimum width so the threshold cannot "shrink" to 0 while data is still scarce. */
     val MIN_SPREAD = floatArrayOf(2f, 20f, 3f, 2f, 2f, 0.02f, 0.03f, 0.02f, 0.01f, 0.01f, 1.5f, 3f)
 
     /**
-     * Tên miền của 12 đặc trưng, theo đúng thứ tự chỉ mục. Dùng chung cho tiêu đề CSV và khóa
-     * trong bản ghi Firebase: hai chỗ tự liệt kê thì sớm muộn cũng lệch nhau một chữ và không
-     * ai đọc lại được dữ liệu cũ.
+     * Key names of the 12 features, in exact index order. Shared by the CSV header and the keys in
+     * the Firebase record: two hand-maintained lists will sooner or later drift by one word and no
+     * one will be able to read the old data any more.
      */
     val KEYS = arrayOf(
         "blink_bpm", "avg_blink_ms", "distance_cm", "yaw_deg", "pitch_deg", "gaze_h",
         "gaze_v", "mar", "bfr", "ear", "perclos_p60", "sei"
     )
 
-    /** Chữ ngắn để in lên bảng, cùng đơn vị và số chữ thập phân đáng tin của từng đặc trưng. */
+    /** Short labels printed on the table, plus each feature's unit and trustworthy decimals. */
     val NAMES = arrayOf(
         "Chớp mắt", "Độ dài một cái chớp", "Khoảng cách", "Đầu quay ngang", "Đầu cúi/ngửa",
         "Liếc ngang", "Liếc dọc", "Độ mở miệng (MAR)", "Một mắt nhắm (BFR)", "Độ mở mắt (EAR)",
@@ -113,18 +115,18 @@ internal object HabitFeature {
     val DECIMALS = intArrayOf(0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 0, 0)
 
     /**
-     * Tám đặc trưng được đối chiếu hai phía mỗi khung hình.
+     * The eight features that are checked two-sided on every frame.
      *
-     * Có mặt ở đây để HUD, CSV, bản ghi Firebase và bảng "Chỉ số" dùng đúng một danh sách.
-     * Năm đặc trưng còn lại bị loại vì lý do đã ghi ở khối chú thích trên [LO]: DIST (ngồi 25 cm
-     * là thói quen có hại, không phải "bình thường của em"), BLINK_MS/BFR (chưa có bằng chứng ý
-     * nghĩa hành vi), EAR (đã có đường trộn riêng), và chỉ riêng SEI được đưa vào làm SỐ SO SÁNH
-     * chứ không làm ngưỡng cảnh báo.
+     * Listed here so the HUD, CSV, Firebase record and the metrics table all use one same list.
+     * The five remaining features are excluded for the reasons written in the block above [LO]:
+     * DIST (sitting at 25 cm is a harmful habit, not "this student's normal"), BLINK_MS/BFR (no
+     * evidence of behavioural meaning yet), EAR (already has its own blending path), and only SEI
+     * is included as a COMPARISON NUMBER rather than as an alert threshold.
      */
     val BAND_FEATURES = intArrayOf(BPM, YAW, PITCH, GAZE_H, GAZE_V, MAR, PERCLOS, SEI)
 }
 
-/** Thống kê chạy (Welford): trung bình và độ lệch chuẩn mà không lưu từng mẫu. */
+/** Running statistics (Welford): mean and standard deviation without storing every sample. */
 internal class RunningStat {
     var n = 0
         private set
@@ -142,12 +144,12 @@ internal class RunningStat {
     fun std(): Double = if (n > 1) sqrt(m2 / n) else 0.0
 }
 
-/** Một giá trị nằm ở đâu so với dải quen thuộc của chính học sinh đó. */
+/** Where one value sits relative to that student's own familiar band. */
 internal enum class BandPosition { IN, BELOW, ABOVE, UNKNOWN }
 
 /**
- * Đổi vị trí dải ra mã số của cột CSV: 0 = dưới dải, 1 = trong dải, 2 = trên dải,
- * -1 = không chấm được (chưa học được dải, hoặc giá trị không hữu hạn).
+ * Convert the band position into the CSV column code: 0 = below the band, 1 = inside the band,
+ * 2 = above the band, -1 = cannot be scored (no band learned yet, or the value is not finite).
  */
 internal fun BandPosition.toCsvCode(): Int = when (this) {
     BandPosition.BELOW -> 0
@@ -157,11 +159,12 @@ internal fun BandPosition.toCsvCode(): Int = when (this) {
 }
 
 /**
- * Dải cho phép HAI PHÍA học từ thói quen: [min, max] quanh mức điển hình của riêng em đó.
+ * The TWO-SIDED band learned from habit: [min, max] around that student's own typical level.
  *
- * Đây là MÔ TẢ, không phải ngưỡng cảnh báo. Cảnh báo vẫn do các ngưỡng riêng quyết (nhóm ngưỡng
- * đó kẹp trong khoảng an toàn chung); dải chỉ trả lời câu hỏi "khung hình hôm nay có thuộc thói
- * quen của chính em này không", tức là phần thấp quá / cao quá mà một đường trung bình che mất.
+ * This is a DESCRIPTION, not an alert threshold. Alerts are still decided by their own thresholds
+ * (that threshold group is clamped inside the overall safe range); the band only answers "is
+ * today's frame part of this very student's habit", i.e. the too-low / too-high part that a single
+ * average line would hide.
  */
 internal data class ToleranceBand(val mean: Float, val min: Float, val max: Float) {
     fun position(value: Float): BandPosition = when {
@@ -173,12 +176,12 @@ internal data class ToleranceBand(val mean: Float, val min: Float, val max: Floa
 }
 
 /**
- * Kết quả đối chiếu cả một phiên với dải quen thuộc, bất biến để hiển thị và gửi đi.
- * Giữ SỐ KHUNG chứ không giữ tỷ lệ: muốn tổng hợp cả phiên thì phải cộng các số đếm, còn cộng
- * tỷ lệ đã làm tròn của tám đặc trưng cho ra một con số không đúng với cái nào.
+ * Result of comparing a whole session against the familiar band; immutable for display and sending.
+ * Keeps FRAME COUNTS rather than ratios: aggregating a session must add counters, while adding the
+ * rounded ratios of eight features yields one number that is correct for none of them.
  *
- * Đặc trưng không có khung nào được chấm bị loại hẳn khỏi danh sách thay vì báo "0%": con số 0
- * sẽ bị đọc thành "luôn nằm trong dải", tức là khẳng định ngược với sự thật (chưa đo gì).
+ * A feature with no scored frame at all is dropped from the list instead of reported as "0%": the
+ * number 0 would be read as "always inside the band", i.e. the opposite of the truth (nothing was measured).
  */
 internal data class BandOutcome(
     val feature: Int,
@@ -194,11 +197,11 @@ internal data class BandOutcome(
     val belowPct: Float get() = below * 100f / samples
     val abovePct: Float get() = above * 100f / samples
 
-    /** Phần trăm khung lọt ra NGOÀI dải - con số duy nhất đáng để đánh dấu trên bảng. */
+    /** Percent of frames falling OUTSIDE the band - the only number worth flagging on the table. */
     val outsidePct: Float get() = belowPct + abovePct
 }
 
-/** Tóm tắt một phiên học: trung bình, độ lệch chuẩn và số mẫu của từng đặc trưng. */
+/** Summary of one study session: mean, standard deviation and sample count of each feature. */
 internal class SessionSummary(
     val id: Long,
     val validMs: Long,
@@ -213,8 +216,8 @@ internal class SessionSummary(
 }
 
 /**
- * Bộ tích lũy của phiên đang chạy (chỉ dùng trên cameraExecutor).
- * Mỗi khung hợp lệ gọi observe(); tick() cộng thời gian.
+ * Accumulator for the running session (only used on cameraExecutor).
+ * Every valid frame calls observe(); tick() adds up the time.
  */
 internal class HabitSession(val id: Long) {
     private val stats = Array(HabitFeature.COUNT) { RunningStat() }
@@ -237,15 +240,15 @@ internal class HabitSession(val id: Long) {
         lastTickMs = nowMs
         if (dt <= 0L) return
 
-        // activeMs là đồng hồ của phiên và cũng là mẫu số của faceRatio. Khoảng dừng dài không
-        // được tính là lúc học sinh đang học, nhưng vẫn làm mẫu số lớn lên - đó là lựa chọn có
-        // chủ đích, đã được đóng đinh bằng test stallKeepsFaceRatioHonest: một phiên mà phần lớn
-        // thời gian máy không quay thì không đủ tư cách vào hồ sơ, dù mọi khung còn lại đều thấy mặt.
+        // activeMs is the session's clock and also the denominator of faceRatio. A long stall must not
+        // count as the student studying, yet it still grows the denominator - that is a deliberate
+        // choice, pinned down by the test stallKeepsFaceRatioHonest: a session where the device was not
+        // recording most of the time is not qualified for the profile, even if every frame left shows a face.
         activeMs += dt
         if (dt > HabitConfig.MAX_FRAME_GAP_MS) return
 
-        // Cộng đủ, không kẹp ở 200 ms: khi máy chạy dưới 5 FPS thì mỗi khung cách nhau quá
-        // 200 ms thật, kẹp lại sẽ khiến "phút hợp lệ" không bao giờ chạm MIN_SESSION_MS.
+        // Add the full amount, do not clamp at 200 ms: when the device runs under 5 FPS the frames
+        // really are more than 200 ms apart, and clamping would stop "valid minutes" from ever reaching MIN_SESSION_MS.
         if (faceVisible) faceMs += dt
         if (valid) validMs += dt
     }
@@ -257,23 +260,23 @@ internal class HabitSession(val id: Long) {
     }
 
     /**
-     * Nạp dải cho cả phiên, gọi MỘT LẦN lúc bắt đầu phiên.
+     * Load the bands for the whole session, called ONCE at session start.
      *
-     * Dải tính từ các phiên đã có TRƯỚC phiên này (phiên đang chạy chưa được commit vào hồ sơ).
-     * Nếu nạp lại giữa chừng thì một buổi học khác thường sẽ tự nới dải của chính nó và che đi
-     * cái mà dải ấy đáng ra phải báo.
+     * The bands are computed from the sessions that existed BEFORE this one (the running session has
+     * not been committed into the profile yet). Reloading them mid-session would let one unusual study
+     * session widen its own band and hide exactly what the band was supposed to report.
      */
     fun setBands(base: HabitBaseline, features: IntArray) {
         for (f in features) bands[f] = base.band(f)
     }
 
     /**
-     * Chấm xem một giá trị nằm trong/dưới/trên dải quen thuộc.
+     * Score whether one value is inside / below / above the familiar band.
      *
-     * Đi riêng với [observe] có chủ đích: [observe] kẹp mẫu vào khoảng vật lý trước khi tính
-     * trung bình, còn ở đây giá trị lọt ra ngoài phải giữ nguyên - kẹp thì "thấp hơn thường ngày"
-     * bị kéo về đúng mép dải và không bao giờ thành BELOW. UNKNOWN (chưa có dải, giá trị không
-     * hữu hạn) không được đếm vào đâu cả, kể cả "trong dải".
+     * Deliberately separate from [observe]: [observe] clamps samples into the physical range before
+     * computing the mean, while here an out-of-range value must be kept as-is - clamping would drag
+     * "lower than usual" back onto the band edge so it never becomes BELOW. UNKNOWN (no band yet,
+     * value not finite) is not counted anywhere, not even as "inside the band".
      */
     fun observeBand(feature: Int, value: Float?): BandPosition {
         val band = bands[feature] ?: return BandPosition.UNKNOWN
@@ -286,12 +289,12 @@ internal class HabitSession(val id: Long) {
         }
     }
 
-    /** Bao nhiêu đặc trưng trong [features] đã học được dải. */
+    /** How many features in [features] have a learned band. */
     fun bandCoverage(features: IntArray): Int = features.count { bands[it] != null }
 
     /**
-     * Toàn bộ kết quả đối chiếu của phiên, theo thứ tự [HabitFeature.BAND_FEATURES].
-     * Đặc trưng chưa có dải hoặc chưa có khung nào được chấm thì bị bỏ hẳn.
+     * All band outcomes of the session, in [HabitFeature.BAND_FEATURES] order.
+     * A feature with no band yet, or with no scored frame, is skipped entirely.
      */
     fun bandOutcomes(): List<BandOutcome> {
         val out = ArrayList<BandOutcome>(HabitFeature.BAND_FEATURES.size)
@@ -343,7 +346,7 @@ internal class HabitSession(val id: Long) {
     }
 }
 
-/** Mức cơ sở đã học: giá trị điển hình + độ dao động tự nhiên của từng đặc trưng. */
+/** Learned baseline: typical value + natural spread of each feature. */
 internal class HabitBaseline(
     private val means: FloatArray,
     private val spreads: FloatArray,
@@ -352,19 +355,20 @@ internal class HabitBaseline(
     fun mean(f: Int): Float? = if (ok[f]) means[f] else null
     fun spread(f: Int): Float? = if (ok[f]) spreads[f] else null
 
-    /** |mean| + k * spread, kẹp trong [lo, hi]. Trả về null nếu chưa có dữ liệu. */
+    /** |mean| + k * spread, clamped into [lo, hi]. Returns null when there is no data yet. */
     fun threshold(f: Int, k: Float, lo: Float, hi: Float): Float? {
         if (!ok[f]) return null
         return (abs(means[f]) + k * spreads[f]).coerceIn(lo, hi)
     }
 
     /**
-     * Dải cho phép hai phía của một đặc trưng: mean ± k*spread, kẹp trong khoảng vật lý LO/HI
-     * của chính nó. Trả null khi đặc trưng này chưa học được gì - "chưa biết" phải khác với
-     * "dải rộng bằng 0".
+     * Two-sided allowed band of one feature: mean ± k*spread, clamped into its own physical LO/HI
+     * range. Returns null when nothing was learned for this feature - "not known yet" must differ
+     * from "band of width zero".
      *
-     * Không cần kiểm tra min <= max: [means] là trung bình có trọng số của các giá trị đã bị kẹp
-     * vào [LO, HI] ngay lúc đo, nên mean luôn nằm giữa hai mép và mỗi mép chỉ bị kéo về phía mean.
+     * No min <= max check is needed: [means] is a weighted average of values already clamped into
+     * [LO, HI] at measurement time, so the mean always sits between the two edges and each edge is
+     * only ever pulled toward the mean.
      */
     fun band(f: Int, k: Float = HabitConfig.BAND_K): ToleranceBand? {
         if (!ok[f]) return null

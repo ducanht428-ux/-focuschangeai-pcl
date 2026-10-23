@@ -7,8 +7,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Quản lý danh sách học sinh (SharedPreferences) và lưu hồ sơ từng em ra file JSON
- * trong bộ nhớ riêng của ứng dụng. Không gửi dữ liệu ra ngoài.
+ * Manages the student list (SharedPreferences) and saves each student's profile as
+ * a JSON file inside the app's private storage. No data is sent anywhere outside.
  */
 internal class HabitStore(private val context: Context) {
 
@@ -34,9 +34,9 @@ internal class HabitStore(private val context: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "Danh sách học sinh lỗi, tạo lại", e)
                 out.clear()
-                // Lưu nguyên văn bản hỏng trước khi tạo danh sách mới: persist() bên dưới sẽ đè
-                // lên key này, và nếu không giữ lại thì tên của mọi em từng nhập mất luôn, chỉ
-                // vì một lần SharedPreferences bị đọc sai.
+                // Save the corrupt text verbatim before building a new list: persist() below will
+                // overwrite this key, and if no copy is kept then the name of every student ever
+                // entered is lost, just because SharedPreferences was misread one time.
                 try {
                     prefs.edit().putString(KEY_STUDENTS_CORRUPT, raw).apply()
                 } catch (e2: Exception) {
@@ -90,9 +90,9 @@ internal class HabitStore(private val context: Context) {
         val f = file(id)
         if (!f.exists()) return profile
 
-        // Đọc một lần rồi giữ nguyên văn bản trong bộ nhớ. Lúc cần backup thì ghi lại văn bản đó,
-        // không phụ thuộc renameTo() - rename có thể thất bại (khác thiết bị, file đang bị mở)
-        // và khi đó file gốc vẫn còn nguyên, save() lần sau sẽ đè lên và mất sạch dữ liệu.
+        // Read once and keep the exact text in memory. When a backup is needed, rewrite that text;
+        // do not depend on renameTo() - rename can fail (different device, file currently open),
+        // and then the original file stays intact while the next save() overwrites it and all data is lost.
         val raw = try {
             f.readText()
         } catch (e: Exception) {
@@ -113,9 +113,9 @@ internal class HabitStore(private val context: Context) {
                 }
                 if (s == null) dropped++ else profile.sessions.add(s)
             }
-            // Khối hiệu chuẩn đọc trong try riêng: hồ sơ chưa từng hiệu chuẩn (hoặc file đời cũ
-            // không có mục "cal") chỉ có nghĩa là chưa hiệu chuẩn, không được ăn mất các phiên
-            // đã học. Nếu nó nằm trong try ở ngoài, một giá trị NaN là sessions.clear() chạy theo.
+            // The calibration block is read in its own try: a profile that was never calibrated
+            // (or an old-generation file with no "cal" entry) only means uncalibrated, it must not
+            // eat the sessions already learned. In the outer try, a single NaN runs sessions.clear().
             try {
                 val cal = root.optJSONObject("cal")
                 if (cal != null) {
@@ -133,9 +133,9 @@ internal class HabitStore(private val context: Context) {
 
         val err = parseError
         if (err != null || dropped > 0) {
-            // Một phần hồ sơ không đọc được. Phải nhân bản nguyên văn ra .corrupt TRƯỚC khi
-            // quay lại: hồ sơ một phần vẫn được coi là "đã nạp" và autosave sẽ ghi đè file gốc,
-            // nên nếu không có bản sao thì những phiên bị bỏ qua biến mất vĩnh viễn.
+            // Part of the profile could not be read. The exact text must be cloned to .corrupt
+            // BEFORE returning: a partial profile still counts as "loaded" and autosave would
+            // overwrite the original file, so without a copy the dropped sessions vanish forever.
             val note = if (err != null) "toàn bộ file hỏng" else "$dropped mục trong file hỏng"
             val backedUp = try {
                 File(f.parentFile, f.name + ".corrupt").writeText(raw)
@@ -162,8 +162,8 @@ internal class HabitStore(private val context: Context) {
 
             if (p.hasCalibration()) {
                 val cal = JSONObject()
-                // JSONObject.put(String, Double) ném ngoại lệ với NaN, nên từng giá trị phải
-                // tự kiểm tra thay vì ghi cả ba rồi để try ở ngoài bắt.
+                // JSONObject.put(String, Double) throws an exception on NaN, so every value must
+                // be checked on its own instead of writing all three and letting the outer try catch it.
                 cal.put("distance_scale", p.distanceScale.toDouble())
                 if (p.calRawDistanceCm.isFinite()) {
                     cal.put("raw_distance_cm", p.calRawDistanceCm.toDouble())

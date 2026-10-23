@@ -6,8 +6,8 @@ import java.util.HashMap
 import kotlin.math.roundToInt
 
 /**
- * Những gì một phiên đo để lại trên đám mây. Đây là SỐ TRUNG BÌNH của cả phiên, không phải
- * từng khung hình: một phiên ~2.000 khung chỉ tốn một lần ghi Firestore.
+ * What one measurement session leaves behind in the cloud. These are AVERAGES over the whole
+ * session, not individual frames: a session of ~2,000 frames costs exactly one Firestore write.
  */
 internal class SessionReport(
     val studentId: String,
@@ -22,29 +22,31 @@ internal class SessionReport(
     val endedAtWallMs: Long,
     val ineligibleReason: String?,
     /**
-     * Kết quả đối chiếu phiên này với dải hai phía của chính học sinh đó. Rỗng khi hồ sơ còn
-     * quá ít phiên để dựng dải.
+     * How this session compared with the same student's own two-sided band. Empty when the
+     * profile still has too few sessions to build any band.
      *
-     * Để riêng, không gộp vào các bộ đếm cảnh báo: một phiên có thể không vượt ngưỡng cảnh báo
-     * nào mà vẫn nằm ngoài dải quen thuộc - đúng cái mà con số trung bình của phiên che mất.
+     * Kept separate from the alert counters on purpose: a session can cross no alert threshold at
+     * all and still sit outside its own familiar band - which is exactly what a session average
+     * hides.
      */
     val bandOutcomes: List<BandOutcome>
 )
 
 /**
- * Một nhịp hẹn: "em này đang được đo, tới phút thứ bao nhiêu, số liệu đến lúc này ra sao".
+ * One heartbeat: "this student is being measured right now, the session has run this long, and
+ * here is the data so far".
  *
- * Gửi riêng, gọn hơn nhiều so với bản tổng kết phiên: màn hình giáo viên cần biết AI đang chạy
- * chứ không cần mười hai giá trị trung bình mỗi năm phút. Muốn số đầy đủ thì đọc bản ghi
- * `sessions` được ghi lúc phiên kết thúc.
+ * Sent on its own and far leaner than the session summary: the teacher's screen needs to know a
+ * measurement is alive, not twelve averages every five minutes. Full numbers live in the
+ * `sessions` record written when the session ends.
  *
- * Không có `ineligible_reason` ở đây: phiên đang chạy thì hiển nhiên chưa đủ độ dài, nên mọi
- * nhịp đều sẽ bị đánh dấu "không đủ điều kiện" và giáo viên đọc thành "em này đo hỏng". Phán
- * quyết đủ/không đủ dành cho bản tổng kết cuối phiên.
+ * There is deliberately no `ineligible_reason` here: a running session is by definition not long
+ * enough yet, so every beat would be marked ineligible and the teacher would read it as "this
+ * student's measurement is broken". Eligibility is judged only on the end-of-session summary.
  *
- * [sessionId] và [startedAtWallMs] trùng nhau về cấu tạo (HabitSession lấy giờ wall lúc mở phiên
- * làm id) nhưng ghi thành hai cột để bản ghi tự giải thích được, không bắt người đọc suy ra từ
- * một con số 13 chữ số.
+ * [sessionId] and [startedAtWallMs] are the same value by construction (HabitSession uses the
+ * wall-clock time of session start as its id), but they are written as two columns so the record
+ * explains itself instead of making the reader infer a meaning from a 13-digit number.
  */
 internal class HeartbeatReport(
     val studentId: String,
@@ -53,9 +55,9 @@ internal class HeartbeatReport(
     val startedAtWallMs: Long,
     val beatAtWallMs: Long,
     /**
-     * Thời gian phiên đếm được tới nhịp này, tính bằng cùng đồng hồ với các nhịp trước. Đây là
-     * thứ tăng lên khi camera chạy và đứng yên khi màn hình tắt - cách ngắn nhất để phân biệt
-     * "em này nghỉ giữa giờ" với "máy của em này đang đo".
+     * Session time counted so far, on the same clock as earlier beats. This is the value that
+     * grows while the camera runs and freezes when the screen goes off - the shortest way to tell
+     * "this student is on a break" apart from "this device is not measuring".
      */
     val activeMs: Long,
     val summary: SessionSummary,
@@ -69,33 +71,35 @@ internal class HeartbeatReport(
 )
 
 /**
- * Đồng bộ một bản tổng kết / một phiên lên Cloud Firestore.
+ * Uploads session summaries and heartbeats to Cloud Firestore.
  *
- * Viết tách ra khỏi MainActivity để phần còn lại của app vẫn chạy y nguyên khi không có
- * Firebase: thiếu file cấu hình, mất mạng, bị từ chối quyền - tất cả chỉ làm một dòng chữ
- * trong bảng chuyển sang màu đỏ, không làm hỏng buổi đo đang chạy.
+ * Split out of MainActivity so the rest of the app is unaffected when Firebase is unavailable: a
+ * missing config file, no network, a permission denial - all of them only turn one line in the
+ * panel red, none of them disturb the measurement in progress.
  */
 internal object FirebaseSync {
     private const val COLLECTION = "sessions"
 
     /**
-     * Một tài liệu duy nhất cho mỗi học sinh, được ghi đè bởi nhịp hẹn. Tách khỏi `sessions`
-     * vì màn hình giáo viên cần câu "ai đang được đo ngay bây giờ" mà không phải quét và lọc
-     * cả một bảng lịch sử.
+     * One document per student, overwritten by each heartbeat. Separate from `sessions` because
+     * the teacher's screen needs the question "who is being measured right now" without scanning
+     * and filtering an entire history table.
      */
     private const val PRESENCE_COLLECTION = "presence"
 
     /**
-     * Phiên bản cấu trúc bản ghi. Tăng lên khi đổi tên cột để dữ liệu cũ không bị đọc lệch.
-     * Các cột dải mới chỉ THÊM vào, không đổi tên và không đổi nghĩa cột cũ, nên bản ghi đời
-     * 1 vẫn đọc đúng - vì vậy ở đây vẫn là 1, không phải 2.
+     * Record structure version. Bump it when a column is RENAMED so old data is not read shifted
+     * onto the wrong meaning. The band columns were only ADDED - nothing was renamed and no old
+     * column changed meaning - so a version 1 record still reads correctly, and this stays 1
+     * rather than becoming 2.
      */
     private const val SCHEMA = 1
 
     /**
-     * Khóa của 12 đặc trưng. Lấy từ [HabitFeature.KEYS] chứ không liệt kê lại ở đây: tên khóa
-     * trong Firebase và tên cột dải trong CSV phải là một, nếu tự viết hai bản thì sớm muộn
-     * cũng lệch nhau một chữ và bản ghi trên mây không đọc được nữa.
+     * Keys of the 12 features. Taken from [HabitFeature.KEYS] instead of being listed again here:
+     * the key names in Firebase and the band column names in the CSV must be one list. Write it
+     * twice and the two copies will drift by one character sooner or later, and the cloud record
+     * stops being readable.
      */
     private val FEATURE_KEYS = HabitFeature.KEYS
 
@@ -122,9 +126,10 @@ internal object FirebaseSync {
         private set
 
     /**
-     * Nhịp hẹn đếm riêng, không gộp vào [sentCount]: hai loại bản ghi có nhịp gửi và hậu quả khác
-     * nhau. Một nhịp thất bại chỉ nghĩa là "thầy chưa thấy em này lúc này", còn một phiên thất
-     * bại nghĩa là mất số liệu. Gộp lại thì nhìn vào bảng không phân biệt được chuyện nào.
+     * Heartbeats are counted separately, not merged into [sentCount]: the two record types differ
+     * in cadence and in consequence. A failed beat only means "the teacher could not see this
+     * student at this moment", while a failed session means the data is gone. Merged, the panel
+     * cannot tell the two situations apart.
      */
     @Volatile
     var heartbeatSent = 0L
@@ -139,9 +144,9 @@ internal object FirebaseSync {
         private set
 
     /**
-     * Dấu thời gian wall clock của nhịp gần nhất ĐÃ THỬ gửi (không phải nhịp đã được Firestore
-     * chấp nhận). In ra tuyệt đối thay vì "cách đây n phút": một con số tương đối trên màn hình
-     * chỉ được cập nhật khi có thứ khác vẽ lại, nên nó sẽ nói dối.
+     * Wall-clock timestamp of the most recent beat we TRIED to send, not of a beat Firestore
+     * accepted. Printed as an absolute time rather than "n minutes ago" because a relative number
+     * on screen is only refreshed when something else redraws it - so it would lie.
      */
     @Volatile
     var lastHeartbeatWallMs = 0L
@@ -151,9 +156,9 @@ internal object FirebaseSync {
         get() = db != null
 
     /**
-     * Nối vào FirebaseApp mà ContentProvider của google-services.json đã khởi tạo sẵn.
-     * getInstance() ném IllegalStateException khi không có file cấu hình: phải bắt lại ở đây,
-     * vì đây là ranh giới với thư viện ngoài, không phải lỗi trong code của mình.
+     * Attaches to the FirebaseApp that google-services.json's ContentProvider already started.
+     * getInstance() throws IllegalStateException when there is no config file: that has to be
+     * caught here, because this is the boundary with an external library, not a bug of ours.
      */
     fun start(context: Context) {
         if (db != null) return
@@ -167,7 +172,7 @@ internal object FirebaseSync {
         }
     }
 
-    /** Dựng bản ghi rồi gửi. [onResult] chạy trên luồng chính, đúng lúc cần đổi chữ trên màn hình. */
+    /** Builds the record and sends it. [onResult] runs on the main thread, at the moment the screen text changes. */
     fun upload(r: SessionReport, onResult: (Boolean) -> Unit) {
         val client = db
         if (client == null) {
@@ -175,8 +180,8 @@ internal object FirebaseSync {
             return
         }
         val payload = buildPayload(r)
-        // Tên tài liệu tất định theo học sinh + phiên: gửi lại cùng một phiên (bấm hai lần,
-        // hoặc Firestore gửi lại một lệnh chờ) là ghi đè, không phải tạo bản thứ hai.
+        // Deterministic document name from student + session: sending the same session twice (two
+        // taps, or Firestore replaying a queued write) overwrites, instead of creating a second record.
         val docId = documentId(r.studentId, r.summary.id)
         inFlight++
         client.document("$COLLECTION/$docId").set(payload)
@@ -198,10 +203,10 @@ internal object FirebaseSync {
         sanitize(studentId) + '-' + sessionId
 
     /**
-     * Đổi mọi ký tự không an toàn cho tên tài liệu Firestore thành dấu gạch ngang.
-     * Viết một chỗ vì cả hai bảng đều cần: `sessions/<id>-<phiên>` và `presence/<id>`. Nếu mỗi
-     * bảng tự lọc một kiểu thì tên học sinh có dấu cách sẽ tạo hai tài liệu khác nhau cho cùng
-     * một em, và màn hình giáo viên chỉ thấy một.
+     * Turns every character that is unsafe in a Firestore document name into a dash. Written in
+     * one place because both tables need it: `sessions/<id>-<session>` and `presence/<id>`. If
+     * each table filtered its own way, a student name containing a space would create two
+     * different documents for one student and the teacher's screen would show only one of them.
      */
     private fun sanitize(studentId: String): String {
         val safe = StringBuilder(studentId.length + 8)
@@ -212,10 +217,11 @@ internal object FirebaseSync {
     }
 
     /**
-     * Ghi đè tài liệu `presence/<học sinh>` bằng một nhịp.
+     * Overwrites the `presence/<student>` document with one beat.
      *
-     * Dùng `set` lên tên tài liệu tất định chứ không add(): mỗi em đúng một dòng "đang học",
-     * nhịp sau thay nhịp trước, gửi trùng không tạo bản thừa. [onResult] chạy trên luồng chính.
+     * `set` on a deterministic document name rather than add(): one "currently measuring" row per
+     * student, each beat replacing the previous one, and a duplicate send creating no extra
+     * record. [onResult] runs on the main thread.
      */
     fun uploadHeartbeat(r: HeartbeatReport, onResult: (Boolean) -> Unit) {
         val client = db
@@ -250,18 +256,20 @@ internal object FirebaseSync {
         out["valid_ms"] = s.validMs
         out["face_ratio"] = round4(s.faceRatio)
         out["valid_ratio"] = round4(s.validRatio)
-        // Hai cột này chỉ ghi khi thật sự có mẫu. round2(NaN) trả về 0, mà "SEI = 0" đọc thành
-        // "em này ngủ gục", "chất lượng = 0" đọc thành "máy đo hỏng" - cả hai đều sai: sự thật là
-        // chưa đo được gì. Thiếu cột là tín hiệu đúng, số 0 giả tạo là tín hiệu sai.
-        // mean của một bộ tích lũy rỗng là NaN, nên isFinite chính là "có mẫu hay không".
+        // These two are written only when samples actually exist. round2(NaN) returns 0, and
+        // "SEI = 0" reads as "this student fell asleep" while "quality = 0" reads as "the camera
+        // is broken" - both wrong: nothing was measured yet. A missing column is the honest
+        // signal; a fabricated zero is a false one. The mean of an empty accumulator is NaN, so
+        // isFinite is exactly "were there samples".
         if (s.quality.isFinite()) {
             out["quality_mean"] = round2(s.quality)
         }
         val seiN = s.count[HabitFeature.SEI]
         if (seiN > 0) {
-            // SEI là con số giáo viên nhìn đầu tiên, nên nó có cột riêng thay vì bắt người đọc
-            // tra "mean_sei" như bảng sessions. Đây là trung bình của cả phiên tính tới nhịp này,
-            // không phải của riêng 5 phút vừa rồi - muốn tốc độ ngắn hạn thì phải đọc CSV.
+            // SEI is the first number a teacher looks at, so it gets its own column instead of
+            // making the reader look up "mean_sei" as in the sessions table. This is the average
+            // over the whole session up to this beat, NOT the average of the last five minutes -
+            // short-term speed has to come from the CSV.
             out["sei_mean"] = round2(s.mean[HabitFeature.SEI])
             out["sei_n"] = seiN
         }
@@ -269,8 +277,9 @@ internal object FirebaseSync {
         out["false_alerts"] = r.falseAlerts
         out["device"] = r.device
         out["app_version"] = r.appVersion
-        // Dải chỉ là ba số tổng hợp cho tới khi phiên kết thúc; chi tiết từng chỉ số nằm ở bản
-        // ghi sessions, ghi lại mỗi năm phút là nhân ba lượng dữ liệu mà chẳng thêm thông tin.
+        // The band is only three aggregate numbers until the session ends; per-feature detail
+        // lives in the sessions record, and repeating it every five minutes would triple the data
+        // for no added information.
         if (r.bandFrames > 0) {
             out["band_k"] = HabitConfig.BAND_K.toDouble()
             out["band_frames"] = r.bandFrames
@@ -304,8 +313,8 @@ internal object FirebaseSync {
         }
         for (f in 0 until HabitFeature.COUNT) {
             val key = FEATURE_KEYS[f]
-            // n = 0 nghĩa là đặc trưng đó không có mẫu nào trong phiên. Ghi 0 vào sẽ thành
-            // "đo ra 0", nên chỉ ghi khi thực sự có mẫu.
+            // n = 0 means the feature got no sample at all in this session. Writing 0 would read
+            // as "measured 0", so only features that really have samples are written.
             val n = s.count[f]
             if (n > 0) {
                 out["mean_$key"] = round2(s.mean[f])
@@ -314,13 +323,14 @@ internal object FirebaseSync {
             }
         }
         if (r.bandOutcomes.isNotEmpty()) {
-            // Hệ số nhân của dải đi kèm bản ghi: giáo viên đọc "dải ±2.5 lần dao động" thì mới
-            // hiểu vì sao hai em có cùng trung bình lại có dải rộng khác nhau.
+            // The band's multiplier travels with the record: only by reading "band = typical value
+            // +/- 2.5 times the natural spread" can a teacher see why two students with the same
+            // average can have very different band widths.
             out["band_k"] = HabitConfig.BAND_K.toDouble()
             for (b in r.bandOutcomes) {
                 val key = FEATURE_KEYS[b.feature]
-                // Ghi số khung, không ghi tỷ lệ: muốn tính trung bình cả tuần thì phải cộng các
-                // số đếm, còn trung bình của mấy con số % đã làm tròn thì không có nghĩa gì.
+                // Frame counts are written, not percentages: averaging over a week means adding
+                // counters up, while the mean of several rounded percentages means nothing.
                 out["band_min_$key"] = round2(b.min)
                 out["band_max_$key"] = round2(b.max)
                 out["band_typical_$key"] = round2(b.mean)
@@ -339,7 +349,7 @@ internal object FirebaseSync {
     private fun roundTo(v: Float, scale: Float): Double =
         if (v.isFinite()) (v * scale).roundToInt().toDouble() / scale.toDouble() else 0.0
 
-    /** Một dòng ngắn cho bảng điều khiển: gửi được bao nhiêu phiên, còn gì đang chờ. */
+    /** One short line for the control panel: how many sessions went out, and what is still queued. */
     fun statusText(): String {
         if (db == null) {
             return "Firebase: TẮT ($disabledReason)"
@@ -359,8 +369,8 @@ internal object FirebaseSync {
         }
         if (lastHeartbeatWallMs > 0L) {
             sb.append(", lần thử gần nhất ")
-                // Dựng formatter tại chỗ: SimpleDateFormat không an toàn giữa các luồng, mà dòng
-                // trạng thái này có thể được gọi từ cả luồng camera lẫn luồng chính.
+                // Built per call: SimpleDateFormat is not thread-safe, and this status line can be
+                // asked for from the camera thread as well as from the main thread.
                 .append(
                     java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
                         .format(java.util.Date(lastHeartbeatWallMs))

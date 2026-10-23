@@ -48,10 +48,10 @@ class IndependentFeatureEngine(
     fun evaluate(feature: Feature, value: Double?): FeatureEvaluation {
         val bound = bounds[feature]
         val finite = value?.takeIf { it.isFinite() }
-        // Cổng khoảng vật lý phải áp cả lúc đo, không chỉ lúc học. calibrate() bỏ mẫu ngoài
-        // validMin/validMax ở trên, còn evaluate trước đây chỉ kiểm tra isFinite: một khung
-        // distance rác (3 cm hoặc 250 cm do landmark nhảy) thành BELOW/ABOVE_BOUND chứ không phải
-        // INSUFFICIENT_DATA, tức là sinh cảnh báo giả từ lỗi đo.
+        // The physical-range gate must be applied while measuring too, not only while learning.
+        // calibrate() above drops samples outside validMin/validMax, while evaluate previously
+        // only checked isFinite: a garbage distance frame (3 cm or 250 cm from landmark jumps)
+        // became BELOW/ABOVE_BOUND instead of INSUFFICIENT_DATA, i.e. false alerts from bad measurement.
         val plausible = finite?.takeIf { it >= feature.validMin && it <= feature.validMax }
         if (plausible == null || bound == null) {
             return FeatureEvaluation(feature, finite, bound, FeatureStatus.INSUFFICIENT_DATA)

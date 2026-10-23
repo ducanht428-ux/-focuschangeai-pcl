@@ -208,37 +208,37 @@ class MainActivity : ComponentActivity() {
 
         const val RAD_TO_DEG = 57.29578f
 
-        // Mô hình lỗ kim (Pinhole): D = (W_real * f_px) / W_pixel
-        const val EYE_OUTER_WIDTH_CM = 8.9f        // khóe mắt ngoài - khóe mắt ngoài (không phải IPD 6.3)
-        const val IRIS_DIAMETER_CM = 1.17f         // đường kính mống mắt người, rất ổn định
-        const val FALLBACK_FOCAL_PX_AT_640 = 500f  // chỉ dùng nếu không đọc được Camera2
+        // Pinhole model: D = (W_real * f_px) / W_pixel
+        const val EYE_OUTER_WIDTH_CM = 8.9f        // outer-cornus to outer-cornus (not the 6.3 IPD)
+        const val IRIS_DIAMETER_CM = 1.17f         // human iris diameter, very stable
+        const val FALLBACK_FOCAL_PX_AT_640 = 500f  // only used if Camera2 cannot be read
         const val MIN_SAFE_DISTANCE_CM = 30f
         const val DISTANCE_RECOVER_CM = 32f
         const val REFERENCE_DISTANCE_CM = 50f
         const val DIST_CAL_SAMPLES = 20
 
-        // cửa sổ hiệu chuẩn khoảng cách: 8 giây ngồi yên là đủ 20 khung ở 3 FPS trở lên.
+        // Distance calibration window: 8 seconds sitting still is enough for 20 frames at 3 FPS or more.
         const val DIST_CAL_WINDOW_MS = 8_000L
         const val DIST_MEDIAN_SIZE = 9
 
-        // Thư ký khoảng cách. Khóe mắt (8,9 cm ~ 89 px @50 cm) nhiễu ~1,6%;
-        // mống mắt (1,17 cm ~ 12 px @50 cm) nhiễu ~12% nên chỉ dùng để bắt ngoại lai.
+        // Distance bookkeeper. The eye corners (8.9 cm ~ 89 px @50 cm) are ~1.6% noisy;
+        // the iris (1.17 cm ~ 12 px @50 cm) is ~12% noisy, so it is only used to catch outliers.
         const val DIST_MAX_YAW_DEG = 40f
         const val IRIS_MIN_PIXELS = 6f
         const val IRIS_MAX_DISAGREE = 0.15f
         const val IRIS_AGREE_LO = 0.75f
         const val IRIS_AGREE_HI = 1.35f
 
-        // Hiệu chuẩn EAR thích nghi.
+        // Adaptive EAR calibration.
         const val CALIBRATION_FRAMES = 60
         const val CALIBRATION_MIN_EAR = 0.20f
-        // Mắt nhỏ hoặc đeo kính: nếu sau 6 giây vẫn chưa gom được 10 khung hợp lệ thì hạ ngưỡng.
+        // Small eyes or glasses: if after 6 seconds fewer than 10 valid frames were collected, lower the threshold.
         const val CAL_RELAX_AFTER_MS = 6_000L
         const val CAL_RELAX_MIN_FRAMES = 10
         const val CAL_RELAXED_MIN_EAR = 0.12f
         const val CLOSE_RATIO = 0.68f
 
-        // Chớp mắt / BPM.
+        // Blinking / BPM.
         const val BPM_WINDOW_MS = 60_000L
         const val BPM_MIN_WINDOW_MS = 10_000L
         const val BPM_RELIABLE_AFTER_MS = 15_000L
@@ -246,26 +246,26 @@ class MainActivity : ComponentActivity() {
         const val LOW_BLINK_BPM = 8f
         const val HIGH_BLINK_BPM = 30f
 
-        // PERCLOS và tỉ lệ mất tập trung (60 giây).
+        // PERCLOS and inattention ratio (60 seconds).
         const val RATIO_BUCKETS = 60
         const val RATIO_MIN_SAMPLE_MS = 3_000L
 
-        /** Nhịp khung hình mong đợi của luồng camera (~30 FPS), dùng làm tham chiếu cho WindowRatio. */
+        /** Expected frame cadence of the camera stream (~30 FPS), used as the reference for WindowRatio. */
         const val RATIO_REF_FRAME_MS = 33L
         const val PERCLOS_ALERT = 15f
-        // PERCLOS chuẩn trong tài liệu buồn ngủ là P80: mí che >= 80% đồng tử.
-        // openness = độ mở mắt so với đường cơ sở của chính người này,
-        // nên P80 tương ứng openness <= 0.20 và P70 tương ứng <= 0.30.
+        // The PERCLOS standard in sleepiness literature is P80: lids cover >= 80% of the pupil.
+        // openness = how open the eye is versus this person's own baseline,
+        // so P80 corresponds to openness <= 0.20 and P70 corresponds to <= 0.30.
         const val PERCLOS_P70_OPEN = 0.30f
         const val PERCLOS_P80_OPEN = 0.20f
 
-        // Tư thế đầu 3D.
+        // 3D head pose.
         const val LOOK_AWAY_YAW_DEG = 18f
         const val LOOK_AWAY_PITCH_DEG = 18f
         const val LOOK_AWAY_MS = 2_000L
         const val HEAD_FRONTAL_YAW_DEG = 20f
 
-        // Phát hiện đóng băng / giật bất thường (Anti-Spoofing).
+        // Freeze / abnormal-jerk detection (Anti-Spoofing).
         const val POSE_WINDOW_MS = 10_000L
         const val FREEZE_MIN_SAMPLES = 60
         const val FREEZE_POSE_STD_DEG = 0.15f
@@ -276,19 +276,19 @@ class MainActivity : ComponentActivity() {
         const val JERK_WINDOW_MS = 10_000L
         const val JERK_COUNT_ALERT = 3
 
-        // Hướng nhìn (Gaze) và Visual Drift.
+        // Gaze direction and Visual Drift.
         const val GAZE_H_DRIFT = 0.16f
         const val GAZE_V_DRIFT = 0.22f
         const val VISUAL_DRIFT_MS = 3_000L
 
-        // Vi biểu cảm.
+        // Micro-expressions.
         const val BFR_FURROW_RATIO = 0.88f
         const val BFR_SUSTAIN_MS = 2_000L
         const val MAR_YAWN = 0.55f
         const val YAWN_MIN_MS = 1_200L
         const val YAWN_WINDOW_MS = 5L * 60L * 1000L
 
-        // Chất lượng tín hiệu.
+        // Signal quality.
         const val LUMA_VERY_LOW = 35f
         const val LUMA_LOW = 60f
         const val LUMA_HIGH = 220f
@@ -297,7 +297,7 @@ class MainActivity : ComponentActivity() {
         const val QUALITY_OK = 50
         const val LUMA_SAMPLE_STEP = 8
 
-        // Động cơ mất tập trung tích lũy.
+        // Cumulative inattention engine.
         const val VIOLATION_WINDOW_MS = 5L * 60L * 1000L
         const val V_HEAD_AWAY = 1.0f
         const val V_VISUAL_DRIFT = 1.0f
@@ -310,7 +310,7 @@ class MainActivity : ComponentActivity() {
         const val CHRONIC_OFF = 4f
         const val INATTENTION_RATIO_ALERT = 40f
 
-        // Nghỉ giải lao 20-20-20.
+        // 20-20-20 breaks.
         const val BREAK_REMINDER_MS = 20L * 60L * 1000L
         const val BREAK_REMINDER_SHOW_MS = 30_000L
         const val BREAK_DETECT_MS = 20_000L
@@ -328,24 +328,24 @@ class MainActivity : ComponentActivity() {
         const val W_BPM = 0.10f
         const val W_EXPRESSION = 0.15f
 
-        // Chỉ số mệt mỏi.
+        // Fatigue index.
         const val FATIGUE_SMOOTHING = 0.10f
 
-        // Giao diện.
+        // UI.
         const val HISTORY_SIZE = 120
         const val UI_TEXT_REFRESH_MS = 120L
 
         /**
-         * Thời gian giữ một thông báo ngắn trên dòng trạng thái. Dòng "có mặt / chưa có mặt"
-         * được viết lại mỗi 120 ms, nên nếu nó ghi đè ngay thì bản tóm tắt ghi CSV ("NGỪNG
-         * DÙNG FILE NÀY: ..."), lỗi chia sẻ báo cáo hay nhắc quyền camera biến mất trước khi
-         * người đứng cạnh giám khảo kịp đọc hết.
+         * How long a short message is held on the status line. The periodic "present / not present"
+         * line is rewritten every 120 ms, so if it overwrites immediately then the CSV-write summary
+         * ("STOP USING THIS FILE: ..."), a report-share error, or a camera-permission reminder all
+         * vanish before someone standing next to the judge can finish reading.
          */
         const val STATUS_HOLD_MS = 20_000L
 
-        // ---------------- Bảng "Chuẩn bị trình diễn" ----------------
-        // Trước khi lên sân khấu: bấm một nút, ngồi yên 20 giây, app tự đo xem máy có theo kịp
-        // không và chỉ ra đúng chỗ phải sửa. Không con số nào trong bảng này là suy đoán.
+        // ---------------- Demo-prep panel ----------------
+        // Before going on stage: press one button, sit still for 20 seconds, the app measures whether
+        // the device keeps up and points out exactly what to fix. No number in this panel is a guess.
         const val PREFLIGHT_MS = 20_000L
         const val PREFLIGHT_FPS_FAIL = 12f
         const val PREFLIGHT_FPS_WARN = 20f
@@ -354,7 +354,7 @@ class MainActivity : ComponentActivity() {
         const val PREFLIGHT_FACE_RATIO_MIN = 0.85f
         const val PREFLIGHT_BATTERY_MIN = 25
 
-        // Histogram độ trễ xử lý mỗi khung (vẽ bằng Canvas, không cần thư viện).
+        // Per-frame processing-latency histogram (drawn with Canvas, no library needed).
         const val LATENCY_BINS = 12
         const val LATENCY_BIN_MS = 15f
         const val LATENCY_SAMPLES = 240

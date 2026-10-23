@@ -10,8 +10,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 // =====================================================================
-// CHUYỂN ĐỔI DỮ LIỆU THÀNH VĂN BẢN / JSON — phần này chỉ chạy trên Android
-// (tách ra khỏi HabitModel.kt để mô hình thói quen giữ nguyên là Kotlin thuần)
+// CONVERT DATA TO TEXT / JSON - this part only runs on Android
+// (split out of HabitModel.kt so the habit model stays pure Kotlin)
 // =====================================================================
 
 internal fun FloatArray.toJsonArray(): JSONArray {
@@ -59,7 +59,7 @@ internal fun SessionSummary.Companion.fromJson(o: JSONObject): SessionSummary? {
     }
 }
 
-/** Lịch sử các phiên gần nhất kèm xu hướng SEI (dùng cho màn hình và báo cáo). */
+/** History of the most recent sessions with the SEI trend (used for the screen and reports). */
 internal fun HabitProfile.historyText(maxLines: Int): String {
     if (sessions.isEmpty()) return "Chưa có phiên nào đạt chuẩn."
 
@@ -98,7 +98,7 @@ internal fun HabitProfile.historyText(maxLines: Int): String {
                 )
             )
         } else {
-            // Chưa có bao nhiêu phiên thì chưa được phép nói đến "xu hướng".
+            // While too few sessions exist, no claim about a "trend" is allowed at all.
             sb.append("Chưa đủ số phiên đạt chuẩn để kết luận xu hướng SEI.\n")
         }
     }

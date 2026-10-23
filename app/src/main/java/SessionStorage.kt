@@ -17,8 +17,8 @@ class SessionStorage(context: Context) {
     }
 
     /**
-     * Lưu dữ liệu một phiên theo dõi.
-     * Nếu cùng sessionId thì cập nhật file cũ, không tạo bản trùng.
+     * Save the data of one tracking session.
+     * If the sessionId matches, update the old file instead of creating a duplicate.
      */
     @Synchronized
     fun saveSession(
@@ -49,7 +49,7 @@ class SessionStorage(context: Context) {
     }
 
     /**
-     * Đọc lại toàn bộ các phiên đã lưu.
+     * Read back all the sessions that were saved.
      */
     @Synchronized
     fun getAllSessions(): List<JSONObject> {
@@ -70,7 +70,7 @@ class SessionStorage(context: Context) {
     }
 
     /**
-     * Tổng số phiên đã lưu.
+     * Total number of sessions saved.
      */
     fun getSessionCount(): Int = getAllSessions().size
 }

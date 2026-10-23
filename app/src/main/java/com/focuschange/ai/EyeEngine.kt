@@ -8,10 +8,10 @@ import kotlin.math.min
 
 import kotlin.math.sqrt
 // =====================================================================
-// CÔNG CỤ PHÂN TÍCH MẮT NÂNG CAO (kính, góc chéo, nheo mắt, lệch hai mắt)
+// ADVANCED EYE ANALYSIS TOOLING (glasses, oblique viewing angle, squinting, two-eye asymmetry)
 // =====================================================================
 
-/** Kết quả phân tích mắt của một khung hình (đối tượng tái sử dụng, chỉ đọc trên cameraExecutor). */
+/** Eye analysis result for one frame (reused object, read only on cameraExecutor). */
 internal class EyeFrame {
     var valid = false
     var openness = 1f
@@ -31,19 +31,19 @@ internal class EyeFrame {
 }
 
 /**
- * Độ mở mắt hợp nhất, bền với kính và góc nhìn chéo.
+ * Fused eye openness, robust to glasses and to oblique viewing angles.
  *
- * 1. Hình học: EAR 5 cặp điểm mí (trung bình cắt tỉa, bỏ điểm cao nhất/thấp nhất để loại điểm bị chói kính),
- *    chuẩn hóa theo đường cơ sở từng mắt, bù co ngắn do quay đầu (cos yaw) và mí hạ khi nhìn xuống.
- * 2. Blendshape (nếu có): mô hình học sâu của MediaPipe, ít bị ảnh hưởng bởi kính và góc nghiêng.
- * 3. Hợp nhất có kiểm tra bất đồng, lọc One Euro, ngưỡng đóng/mở tự thích nghi theo mức nhiễu.
- * 4. Máy trạng thái chớp mắt theo thời gian thực (không phụ thuộc FPS), có trễ hai ngưỡng.
- * 5. Chỉ số khó chịu: nheo mắt kéo dài, hai mắt mở không đều, chớp không hoàn toàn.
+ * 1. Geometry: EAR from 5 eyelid point pairs (trimmed mean, dropping the highest/lowest value to reject glare-spiked points),
+ *    normalized by each eye's own baseline, with foreshortening compensation for head rotation (cos yaw) and lid drop when looking down.
+ * 2. Blendshapes (when available): MediaPipe's deep-learned model, far less affected by glasses and head tilt.
+ * 3. Fusion with a disagreement check, One Euro filtering, close/open thresholds that adapt themselves to the noise level.
+ * 4. Real-time blink state machine (independent of FPS), with two-threshold hysteresis.
+ * 5. Discomfort indicators: prolonged squinting, uneven opening between the two eyes, incomplete blinks.
  */
 internal class EyeEngine {
 
-    // internal (không phải private) để bảng ngưỡng trên HUD in đúng hai con số nheo mắt /
-    // lệch hai mắt thay vì chép lại bằng tay và có nguy cơ lệch dần.
+    // internal (not private) so the threshold table on the HUD prints the squint / two-eye
+    // asymmetry values with two decimals instead of copying them by hand and drifting apart.
     internal companion object {
         val R_UP = intArrayOf(161, 160, 159, 158, 157)
         val R_LOW = intArrayOf(163, 144, 145, 153, 154)
@@ -76,7 +76,7 @@ internal class EyeEngine {
 
     val out = EyeFrame()
 
-    /** Độ nhạy: 0 thấp (chỉ nhận chớp sâu), 1 vừa, 2 cao (nhận cả chớp nông). */
+    /** Sensitivity: 0 low (only deep blinks registered), 1 medium, 2 high (also catches shallow blinks). */
     fun setSensitivity(level: Int) {
         closeO = when (level) {
             0 -> 0.54f
@@ -91,7 +91,7 @@ internal class EyeEngine {
     private val squintRatio = WindowRatio(60, 20_000L)
     private val asymRatio = WindowRatio(60, 30_000L)
 
-    // Hiệu chuẩn
+    // Calibration
     private val calE1 = ArrayList<Float>()
     private val calE2 = ArrayList<Float>()
     private val calBs = ArrayList<Float>()
@@ -106,14 +106,14 @@ internal class EyeEngine {
     private var closeO = CLOSE_O
     private var openO = OPEN_O
 
-    // Trạng thái chớp mắt
+    // Blink state
     private var closed = false
     private var candStart = 0L
     private var candMin = 1f
     private var closedStart = 0L
     private var minDuring = 1f
 
-    // Nhiễu và lọc khung lỗi
+    // Noise and rejection of broken frames
     private var sigma = 0.03f
     private var noisyStart = 0L
     private var prevWr = 0f
@@ -122,7 +122,7 @@ internal class EyeEngine {
     private var lastUpdateMs = 0L
     private var dtEma = 33f
 
-    // Chớp không hoàn toàn
+    // Incomplete blinks
     private val ring = BooleanArray(RING)
     private var ringIdx = 0
     private var ringCount = 0
@@ -133,7 +133,7 @@ internal class EyeEngine {
         return sqrt(dx * dx + dy * dy)
     }
 
-    /** EAR 5 cặp điểm, trung bình cắt tỉa. Trả về NaN nếu hình học không hợp lệ. */
+    /** EAR from 5 point pairs, trimmed mean. Returns NaN when the geometry is not valid. */
     private fun ear5(
         lm: Landmarks,
         up: IntArray,
@@ -178,7 +178,7 @@ internal class EyeEngine {
         pause()
     }
 
-    /** Mất khuôn mặt hoặc khởi động lại luồng: xóa trạng thái tức thời, giữ hiệu chuẩn. */
+    /** Face lost or stream restarted: wipes the instant state, keeps the calibration. */
     fun pause() {
         closed = false
         candStart = 0L
@@ -206,8 +206,8 @@ internal class EyeEngine {
     }
 
     /**
-     * Chốt đường cơ sở: lấy phân vị 70 (loại các khung chớp mắt/nheo lọt vào lúc hiệu chuẩn).
-     * scale là hệ số trộn với giá trị đã học trong hồ sơ thói quen.
+     * Locks in the baseline: takes the 70th percentile (dropping the blink/squint frames that slipped into the calibration set).
+     * scale is the mixing factor with the value already learned in the habit profile.
      */
     fun finishCalibration(scale: Float) {
         if (calE1.size < 5) {
@@ -219,7 +219,7 @@ internal class EyeEngine {
         base1 = calBase1
         base2 = calBase2
         bsBase = if (calBs.size >= 5) percentile(calBs, 0.5f).coerceIn(0f, 0.5f) else 0.08f
-        // Mắt hai bên vốn không đối xứng hoàn toàn: chỉ coi là lệch khi vượt mức lệch tự nhiên đã đo lúc hiệu chuẩn.
+        // The two eyes are never perfectly symmetric: only call it asymmetric when it exceeds the natural asymmetry measured during calibration.
         bsAsymBase = if (calAsym.size >= 5) percentile(calAsym, 0.5f).coerceIn(0f, 0.3f) else 0f
         ready = true
         sigma = 0.03f
@@ -245,13 +245,13 @@ internal class EyeEngine {
     }
 
     /**
-     * Khung hình này KHÔNG kết luận được về mắt. Phải xoá các chỉ số suy ra từ khung trước
-     * khỏi bản phát hành: `out` là một đối tượng tái dùng, nên nếu chỉ hạ cờ valid xuống false
-     * thì MainActivity vẫn đọc thấy "nheo 47%" của ba giây trước và trừ điểm SEI, thậm chí bắn
-     * lại cảnh báo nheo mắt, trong khi engine đang nói "tôi không biết".
+     * This frame supports NO conclusion about the eyes. The indicators derived from earlier frames
+     * must be wiped from the release: `out` is a reused object, so just lowering the valid flag to
+     * false would leave MainActivity still reading a squint percentage from three seconds ago and
+     * deducting SEI, even re-firing the squint alert, while the engine is saying "I don't know".
      *
-     * sigma để NaN chứ không để 0: ô trống trong CSV nghĩa là "không đo được", còn 0 nghĩa là
-     * "mắt mở hoàn toàn, không nhiễu" - hai kết luận ngược nhau trên cùng một con số.
+     * sigma is set to NaN instead of 0: an empty CSV cell means "not measurable", while 0 means
+     * "eye fully open, no noise" - two opposite conclusions on the very same number.
      */
     private fun clearConclusions(o: EyeFrame) {
         o.squintPct = 0f
@@ -302,7 +302,7 @@ internal class EyeEngine {
         }
         lastUpdateMs = nowMs
 
-        // 1) Loại khung landmark "nhảy" bất thường (thường do chói kính hoặc mất dấu một khung).
+        // 1) Reject frames where landmarks "jump" abnormally (usually glasses glare or a one-frame tracking loss).
         var glitch = e1.isNaN() || e2.isNaN()
         if (!glitch && prevWr > 0f && prevWl > 0f) {
             val rr = wr / prevWr
@@ -312,7 +312,7 @@ internal class EyeEngine {
         if (glitch) {
             glitchStreak++
             if (glitchStreak > 8) {
-                // Hình học mới ổn định lâu hơn 8 khung: chấp nhận làm mốc mới.
+                // New geometry stable for more than 8 frames: accept it as the new reference point.
                 prevWr = 0f
                 prevWl = 0f
                 glitchStreak = 0
@@ -324,7 +324,7 @@ internal class EyeEngine {
         prevWr = wr
         prevWl = wl
 
-        // 2) Góc quá nghiêng hoặc tín hiệu kém: không kết luận trạng thái mắt.
+        // 2) Angle too oblique or weak signal: no conclusion about the eye state.
         if (!poseOk) {
             closed = false
             candStart = 0L
@@ -333,7 +333,7 @@ internal class EyeEngine {
             return o
         }
 
-        // 3) Độ mở hình học đã bù: co ngắn khi quay đầu và mí hạ khi nhìn xuống.
+        // 3) Compensated geometric openness: foreshortening on head turn and lid drop when looking down.
         val cosY = cos(min(abs(yawDev), 50f) * 0.9f * DEG2RAD)
         val down = max(pitchDev, 0f) * 0.006f + max(gazeVDev, 0f) * 0.5f
         val expected = (1f - down).coerceIn(0.7f, 1f)
@@ -343,7 +343,7 @@ internal class EyeEngine {
         val og2 = (c2 / base2).coerceIn(0f, 1.5f)
         val og = (og1 + og2) / 2f
 
-        // 4) Blendshape (nếu có) và hợp nhất có kiểm tra bất đồng giữa hai nguồn.
+        // 4) Blendshapes (when present) and fusion with a disagreement check between the two sources.
         var fused = og
         var squintBs = 0f
         var asymBs = 0f
@@ -351,7 +351,7 @@ internal class EyeEngine {
             val blink = (bs[0] + bs[1]) / 2f
             val ob = (1f - (blink - bsBase) / (1f - bsBase).coerceAtLeast(0.5f)).coerceIn(0f, 1.3f)
             fused = if (abs(og - ob) > 0.45f) {
-                // Hai nguồn lệch mạnh: hình học thường bị chói kính làm sai, tin blendshape hơn.
+                // The two sources disagree strongly: geometry is usually the one skewed by glasses glare, so trust blendshapes more.
                 0.8f * ob + 0.2f * og
             } else {
                 0.65f * ob + 0.35f * og
@@ -360,7 +360,7 @@ internal class EyeEngine {
             asymBs = abs(bs[0] - bs[1]) - bsAsymBase
         }
 
-        // 5) Lọc thời gian và ước lượng nhiễu khi mắt đang mở ổn định.
+        // 5) Time filtering and noise estimate while the eye is steadily open.
         val f = openFilter.filter(fused, nowMs)
         if (!closed && f > 0.85f) {
             sigma = sigma * 0.98f + abs(fused - f) * 1.25f * 0.02f
@@ -374,11 +374,11 @@ internal class EyeEngine {
         }
         val noisy = noisyStart != 0L && nowMs - noisyStart >= NOISY_HOLD_MS
 
-        // 6) Ngưỡng đóng/mở tự thích nghi: càng nhiễu (kính, chói) càng khắt khe để tránh chớp giả.
+        // 6) Self-adapting close/open thresholds: the noisier (glasses, glare), the stricter, to avoid false blinks.
         val closeThr = (closeO - 1.5f * sigma).coerceIn(0.40f, closeO)
         val openThr = max(closeThr + 0.12f, openO - sigma).coerceAtMost(0.88f)
 
-        // 7) Máy trạng thái chớp mắt theo thời gian thực.
+        // 7) Real-time blink state machine.
         if (!closed) {
             if (f < closeThr) {
                 if (candStart == 0L) {
@@ -387,7 +387,7 @@ internal class EyeEngine {
                 }
                 candMin = min(candMin, f)
                 val dwell = nowMs - candStart
-                // Đóng chắc chắn nếu đủ lâu, hoặc đóng rất sâu (bắt được cú chớp 1 khung khi FPS thấp).
+                // Firmly closed if long enough, or closed very deep (catches a one-frame blink when FPS is low).
                 if (dwell >= MIN_CLOSE_DWELL_MS || f < closeThr - 0.15f) {
                     closed = true
                     closedStart = candStart
@@ -402,7 +402,7 @@ internal class EyeEngine {
                 val dur = nowMs - closedStart
                 if (dur in MIN_BLINK_MS..MAX_BLINK_MS) {
                     o.blinkDurationMs = dur
-                    // FPS thấp (>55 ms/khung) có thể bỏ lỡ đáy của cú chớp: không kết luận "không hoàn toàn".
+                    // Low FPS (>55 ms/frame) can miss the bottom of the blink: do not conclude "incomplete".
                     if (dtEma <= INCOMPLETE_MAX_DT_MS) {
                         o.blinkIncomplete = minDuring > INCOMPLETE_MIN_O
                         recordBlink(o.blinkIncomplete)
@@ -413,7 +413,7 @@ internal class EyeEngine {
             }
         }
 
-        // 8) Chỉ số khó chịu: nheo mắt kéo dài, hai mắt mở không đều.
+        // 8) Discomfort indicators: prolonged squinting, the two eyes opening unevenly.
         var partial = !closed && f >= PARTIAL_LO && f < PARTIAL_HI
         if (!partial && !closed && squintBs > 0.45f && f < 0.9f) partial = true
         squintRatio.record(nowMs, partial)
@@ -426,7 +426,7 @@ internal class EyeEngine {
         val asym = asymRatio.percent(nowMs)
         val inc = incompleteRatio()
 
-        // 9) Đường cơ sở theo dõi chậm: bám theo ánh sáng/kính thay đổi nhưng không "trôi" theo mệt mỏi.
+        // 9) Slowly tracked baseline: follows changing light/glasses but must not "drift" with fatigue.
         if (f > 0.8f && !closed) {
             if (c1 > base1) {
                 if (c1 < base1 * 1.35f) base1 += 0.02f * (c1 - base1)
@@ -460,21 +460,21 @@ internal class EyeEngine {
 
 
 // =====================================================================
-// XỬ LÝ ẢNH MỨC THẤP: CLAHE thích ứng, lọc nhiễu nhẹ, ROI khuôn mặt
+// LOW-LEVEL IMAGE PROCESSING: adaptive CLAHE, light denoising, face ROI
 // =====================================================================
 
 /**
- * Cải thiện ảnh trước khi đưa vào MediaPipe khi ánh sáng kém, chỉ làm việc trên kênh sáng Y
- * (không đụng tới màu), nên rẻ hơn nhiều so với xử lý ảnh RGB.
+ * Improves the image before it is handed to MediaPipe under poor lighting, working only on the Y luma
+ * channel (never touching colour), so it costs far less than processing the RGB image.
  *
- * 1. Đo ánh sáng THẬT trên vùng khuôn mặt (ROI) và trên cả khung: độ sáng, tương phản, tỉ lệ cháy sáng.
- *    Từ đó nhận ra ngược sáng (mặt tối, nền chói) và mặt bị cháy sáng.
- * 2. Bộ điều khiển có "trễ" (hysteresis) và thời gian giữ tối thiểu: không bật/tắt liên tục
- *    làm ảnh nhấp nháy và đường cơ sở hiệu chuẩn bị lệch.
- * 3. CLAHE (cân bằng histogram thích ứng có giới hạn tương phản) trên ROI khuôn mặt, cùng thuật toán
- *    với OpenCV: histogram theo ô, cắt ngưỡng, phân phối lại phần dư, nội suy song tuyến giữa 4 ô.
- * 4. Lọc Gaussian 3x3 tách trục chỉ khi rất thiếu sáng (CLAHE khuếch đại nhiễu).
- * 5. Tự tạm tắt 30 giây nếu chi phí xử lý vượt ngân sách thời gian, để không làm tụt FPS.
+ * 1. Measures the REAL light over the face region (ROI) and over the whole frame: brightness, contrast, blown-highlight ratio.
+ *    From that it detects backlighting (dark face, glaring background) and a blown-out face.
+ * 2. The controller has "lag" (hysteresis) and a minimum hold time: no rapid on/off toggling that would
+ *    make the image flicker and shift the calibration baseline.
+ * 3. CLAHE (contrast-limited adaptive histogram equalization) on the face ROI, the same algorithm
+ *    as OpenCV: per-tile histogram, clipped threshold, redistributed remainder, bilinear interpolation between 4 tiles.
+ * 4. Separable 3x3 Gaussian blur only when badly underexposed (CLAHE amplifies noise).
+ * 5. Pauses itself for 30 seconds when the processing cost exceeds the time budget, so it cannot drag FPS down.
  */
 internal class ImageEnhancer {
 
@@ -524,17 +524,17 @@ internal class ImageEnhancer {
     private var pausedUntilMs = 0L
     private var enhancedFrames = 0
 
-    // Kết quả đo tạm của measure()
+    // Temporary measurements produced by measure()
     private var mMean = 128f
     private var mStd = 50f
     private var mBright = 0f
 
-    // ROI trong hệ tọa độ cảm biến: x0, y0, x1, y1
+    // ROI in sensor coordinate space: x0, y0, x1, y1
     private val roi = IntArray(4)
     private var cornerX = 0f
     private var cornerY = 0f
 
-    // Bộ đệm tái sử dụng (không cấp phát mỗi khung)
+    // Reused buffers (no allocation per frame)
     private var hist = IntArray(0)
     private var lut = IntArray(0)
     private var tmp = IntArray(0)
@@ -547,7 +547,7 @@ internal class ImageEnhancer {
     private var rowW = IntArray(0)
     private var rowT = IntArray(0)
 
-    /** Đo độ sáng, độ lệch chuẩn và tỉ lệ điểm cháy sáng của một vùng bằng lấy mẫu thưa. */
+    /** Measures brightness, standard deviation and blown-pixel ratio of a region by sparse sampling. */
     private fun measure(
         y: ByteArray,
         rowStride: Int,
@@ -591,8 +591,8 @@ internal class ImageEnhancer {
     }
 
     /**
-     * Đổi điểm chuẩn hóa (u, v) của ảnh đã xoay thuận chiều kim đồng hồ `rotation` độ
-     * về tọa độ chuẩn hóa của ảnh cảm biến gốc (đã kiểm chứng cho 0/90/180/270).
+     * Maps a normalized point (u, v) of the image rotated clockwise by `rotation` degrees
+     * back to normalized coordinates of the original sensor image (verified for 0/90/180/270).
      */
     private fun mapCorner(u: Float, v: Float, rotation: Int) {
         when (rotation) {
@@ -615,7 +615,7 @@ internal class ImageEnhancer {
         }
     }
 
-    /** Đổi hộp khuôn mặt sang vùng điểm ảnh của kênh Y, làm tròn theo lưới 8 điểm để ổn định. */
+    /** Converts the face box into a pixel region of the Y plane, rounded onto an 8-pixel grid for stability. */
     private fun mapRoi(box: FloatArray, rotation: Int, w: Int, h: Int): Boolean {
         mapCorner(box[0], box[1], rotation)
         val ax = cornerX
@@ -642,7 +642,7 @@ internal class ImageEnhancer {
         return true
     }
 
-    /** Bật khi thiếu sáng hoặc tương phản thấp, tắt khi đã đủ tốt (ngưỡng bật/tắt khác nhau). */
+    /** Turns on when underexposed or low in contrast, turns off once good enough (separate on/off thresholds). */
     private fun decide(nowMs: Long, mean: Float, std: Float) {
         val need = if (active) {
             !(mean > OFF_MEAN && std > OFF_STD)
@@ -656,8 +656,8 @@ internal class ImageEnhancer {
     }
 
     /**
-     * Xử lý một khung (sửa trực tiếp mảng Y đã sao chép) và trả về độ sáng GỐC của khuôn mặt
-     * (hoặc của cả khung nếu chưa biết vị trí mặt) để đánh giá chất lượng tín hiệu.
+     * Processes one frame (editing the copied Y array in place) and returns the RAW luminance of the face
+     * (or of the whole frame when the face position is not known yet) to rate the signal quality.
      */
     fun process(
         y: ByteArray,
@@ -676,7 +676,7 @@ internal class ImageEnhancer {
         val hasRoi = boxFresh && mapRoi(box, rotation, w, h)
         usingRoi = hasRoi
 
-        // Vùng đọc phải nằm trọn trong bộ đệm của mặt phẳng Y.
+        // The region being read must lie entirely inside the Y plane buffer.
         val lastNeeded = (h - 1) * rowStride + (w - 1) * pixelStride
         if (lastNeeded > yLast || w < MIN_REGION || h < MIN_REGION) {
             active = false
@@ -727,7 +727,7 @@ internal class ImageEnhancer {
         costMs = if (enhancedFrames == 0) ms else costMs * 0.9f + ms * 0.1f
         enhancedFrames++
 
-        // Bảo vệ FPS (bỏ qua giai đoạn khởi động vì mã còn "nguội" nên đo chậm hơn thực tế).
+        // FPS guard (the warmup phase is skipped because the code is still "cold", so it measures slower than reality).
         if (enhancedFrames > BUDGET_WARMUP_FRAMES && costMs > BUDGET_MS) {
             pausedUntilMs = nowMs + PAUSE_MS
             active = false
@@ -738,7 +738,7 @@ internal class ImageEnhancer {
         return result
     }
 
-    /** Dựng bảng nội suy cho một trục: chỉ số hai ô lân cận, trọng số (thang 256) và ô chứa điểm. */
+    /** Builds the lookup for one axis: indices of the two neighbouring tiles, weight (256 scale) and the tile holding the point. */
     private fun buildAxis(
         n: Int,
         tiles: Int,
@@ -768,8 +768,8 @@ internal class ImageEnhancer {
     }
 
     /**
-     * CLAHE trên một vùng chữ nhật của mặt phẳng Y (có xét rowStride và pixelStride).
-     * Cùng thuật toán và số học nguyên đã được đối chiếu với OpenCV (sai khác tối đa 1 mức xám).
+     * CLAHE over a rectangular region of the Y plane (honouring rowStride and pixelStride).
+     * Same algorithm and same integer arithmetic as cross-checked against OpenCV (max difference of 1 gray level).
      */
     private fun clahe(
         y: ByteArray,
