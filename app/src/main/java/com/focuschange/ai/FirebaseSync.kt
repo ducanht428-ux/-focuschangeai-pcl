@@ -71,6 +71,39 @@ internal class HeartbeatReport(
 )
 
 /**
+ * The two-sided range one student is currently scored against - what this student looks like when
+ * they are just being themselves, learned from that student's own past sessions.
+ *
+ * A separate document rather than only a copy inside every session record: the session table answers
+ * "how did this visit go", this one answers "what does the app consider normal for this student right
+ * now". Without it, comparing a week of sessions means opening the last record to find the range the
+ * earlier ones were judged by.
+ *
+ * It is a DESCRIPTION, not a pass mark. Nothing in the app raises an alert because a value left this
+ * range, and no alert is silenced because a value stayed inside it.
+ */
+internal class BandReport(
+    val studentId: String,
+    val studentName: String,
+    /** How many qualifying sessions the range was learned from. */
+    val sessionsUsed: Int,
+    val updatedAtWallMs: Long,
+    /** Only the features that actually have a range. A missing feature is absent, never zero. */
+    val bands: List<FeatureBand>,
+    val device: String,
+    val appVersion: String
+)
+
+/** One feature's range, in that feature's own unit. */
+internal class FeatureBand(
+    val feature: Int,
+    val typical: Float,
+    val min: Float,
+    val max: Float,
+    val spread: Float
+)
+
+/**
  * Uploads session summaries and heartbeats to Cloud Firestore.
  *
  * Split out of MainActivity so the rest of the app is unaffected when Firebase is unavailable: a
@@ -86,6 +119,13 @@ internal object FirebaseSync {
      * and filtering an entire history table.
      */
     private const val PRESENCE_COLLECTION = "presence"
+
+    /**
+     * One document per student holding the two-sided range they are scored against. Separate from
+     * both tables above because it answers a different question: not "what happened in this session"
+     * and not "is a measurement alive now", but "what is normal for this student at the moment".
+     */
+    private const val BAND_COLLECTION = "bands"
 
     /**
      * Record structure version. Bump it when a column is RENAMED so old data is not read shifted
@@ -154,6 +194,22 @@ internal object FirebaseSync {
 
     val enabled: Boolean
         get() = db != null
+
+    /**
+     * Band documents are counted apart from sessions and beats: one send per student per session,
+     * and a failure there changes no measurement, it only leaves the teacher's reference stale.
+     */
+    @Volatile
+    var bandSent = 0L
+        private set
+
+    @Volatile
+    var bandFailed = 0L
+        private set
+
+    @Volatile
+    var lastBandError = ""
+        private set
 
     /**
      * Attaches to the FirebaseApp that google-services.json's ContentProvider already started.
@@ -241,6 +297,55 @@ internal object FirebaseSync {
                 lastHeartbeatError = e.javaClass.simpleName
                 onResult(false)
             }
+    }
+
+    /**
+     * Overwrites `bands/<student>` with the range this student is scored against, sent once per
+     * session at the moment the band is built.
+     *
+     * `set` on a name derived from the student, like [uploadHeartbeat]: a resend replaces its own
+     * document instead of adding a second copy, so the table always holds one current answer per
+     * student rather than an archive nobody queries correctly.
+     */
+    fun uploadBand(r: BandReport, onResult: (Boolean) -> Unit) {
+        val client = db
+        if (client == null) {
+            onResult(false)
+            return
+        }
+        client.document("$BAND_COLLECTION/${sanitize(r.studentId)}").set(buildBandPayload(r))
+            .addOnSuccessListener {
+                bandSent++
+                lastBandError = ""
+                onResult(true)
+            }
+            .addOnFailureListener { e ->
+                bandFailed++
+                lastBandError = e.javaClass.simpleName
+                onResult(false)
+            }
+    }
+
+    private fun buildBandPayload(r: BandReport): HashMap<String, Any> {
+        val out = HashMap<String, Any>(8 + 4 * r.bands.size)
+        out["schema_b"] = SCHEMA
+        out["student_id"] = r.studentId
+        out["student_name"] = r.studentName
+        out["sessions_used"] = r.sessionsUsed
+        out["updated_at_wall_ms"] = r.updatedAtWallMs
+        // The multiplier travels with the range: without "2.5" a reader cannot tell a genuinely
+        // restless student from a well-behaved one whose band is wide for another reason.
+        out["band_k"] = HabitConfig.BAND_K.toDouble()
+        out["device"] = r.device
+        out["app_version"] = r.appVersion
+        for (b in r.bands) {
+            val key = FEATURE_KEYS[b.feature]
+            out["band_typical_$key"] = round2(b.typical)
+            out["band_min_$key"] = round2(b.min)
+            out["band_max_$key"] = round2(b.max)
+            out["band_spread_$key"] = round2(b.spread)
+        }
+        return out
     }
 
     private fun buildHeartbeatPayload(r: HeartbeatReport): HashMap<String, Any> {
@@ -375,6 +480,11 @@ internal object FirebaseSync {
                     java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
                         .format(java.util.Date(lastHeartbeatWallMs))
                 )
+        }
+        sb.append(" - khoảng: ").append(bandSent).append(" đã gửi")
+        if (bandFailed > 0L) {
+            sb.append(", ").append(bandFailed).append(" thất bại")
+            if (lastBandError.isNotEmpty()) sb.append(" (").append(lastBandError).append(')')
         }
         return sb.toString()
     }

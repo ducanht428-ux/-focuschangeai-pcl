@@ -2160,6 +2160,42 @@ class MainActivity : ComponentActivity() {
         // The two-sided band is built ONCE for the whole session, from the sessions that came before it.
         // Rebuilding it midway would let one unusual study session widen its own band.
         session.setBands(base, HabitFeature.BAND_FEATURES)
+        sendBandSnapshot(prof, base)
+    }
+
+    /**
+     * Publishes the range this student is currently scored against, once per session right after
+     * [HabitSession.setBands]. The cloud copy is therefore exactly the range this session is being
+     * judged by, not a wider one built later.
+     *
+     * Purely descriptive, like the on-screen band: it says what this student looks like when they
+     * are being themselves. It does not mark anyone as good or bad, and no alert depends on it.
+     */
+    private fun sendBandSnapshot(prof: HabitProfile, base: HabitBaseline) {
+        if (!FirebaseSync.enabled) return
+        val list = ArrayList<FeatureBand>(HabitFeature.BAND_FEATURES.size)
+        for (f in HabitFeature.BAND_FEATURES) {
+            val b = base.band(f) ?: continue
+            val sp = base.spread(f) ?: continue
+            list.add(FeatureBand(f, b.mean, b.min, b.max, sp))
+        }
+        // Nothing learned yet means nothing to publish. An empty document would read as "this
+        // student has no range", while the truth is "this student has not been measured enough".
+        if (list.isEmpty()) return
+        FirebaseSync.uploadBand(
+            BandReport(
+                studentId = prof.id,
+                studentName = studentName,
+                sessionsUsed = prof.sessionCount(),
+                updatedAtWallMs = System.currentTimeMillis(),
+                bands = list,
+                device = android.os.Build.MODEL,
+                appVersion = appVersionName()
+            )
+        ) {
+            // Firestore reports the result on the main thread, so the panel text can be changed right away.
+            firebaseText = FirebaseSync.statusText()
+        }
     }
 
     /**
