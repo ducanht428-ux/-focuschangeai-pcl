@@ -159,7 +159,7 @@ class PersonalBandTest {
             prof.commit(
                 SessionSummary(
                     id = 1000L + i,
-                    validMs = 160_000L,
+                    validMs = 180_000L,
                     faceRatio = 0.95f,
                     validRatio = 0.95f,
                     quality = 85f,

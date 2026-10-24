@@ -248,8 +248,8 @@ class HabitTimingTest {
 
     /**
      * Five sessions at the per-session floor land on the boundary: 5 x 120 s = exactly MIN_TOTAL_MS,
-     * so the profile is ready with ZERO slack. The booth script does 5 x 2.5 minutes, which needs 10
-     * valid minutes out of 12.5 filmed (~20% headroom) - validMs only counts frames that had a usable
+     * so the profile is ready with ZERO slack. The booth script does 5 x 3 minutes, which needs 10
+     * valid minutes out of 15 filmed (~33% headroom) - validMs only counts frames that had a usable
      * face signal. Recorded so anyone who later lowers MIN_SESSION_MS or raises MIN_TOTAL_MS can see
      * which demo script stops producing a baseline.
      */
@@ -265,7 +265,7 @@ class HabitTimingTest {
     }
 
     /**
-     * The booth run: five sessions of 2.5 minutes = 12.5 valid minutes, over the 10-minute bar. And
+     * The booth run: five sessions of 3 minutes = 15 valid minutes, over the 10-minute bar. And
      * confidence must start at 0.2 on the first qualifying session of a profile that has just
      * become ready - the original design number, not 0.4 shifted by the old "- 2" milestone
      * once MIN_SESSIONS moved from 4 to 5.
@@ -273,10 +273,10 @@ class HabitTimingTest {
     @Test
     fun demoLengthSessionsReachReadinessWithConfidenceAtItsFloor() {
         val p = HabitProfile("hs1", "Học sinh 1")
-        repeat(HabitConfig.MIN_SESSIONS) { p.sessions.add(studySession(150_000L)) }
+        repeat(HabitConfig.MIN_SESSIONS) { p.sessions.add(studySession(180_000L)) }
         assertTrue(p.isReady())
         assertEquals(0.2f, p.confidence(), 0.001f)
-        repeat(4) { p.sessions.add(studySession(150_000L)) }
+        repeat(4) { p.sessions.add(studySession(180_000L)) }
         assertEquals(1f, p.confidence(), 0.001f)
     }
 }

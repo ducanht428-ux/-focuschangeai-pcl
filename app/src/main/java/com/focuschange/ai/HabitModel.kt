@@ -31,10 +31,12 @@ internal object HabitConfig {
 
     /**
      * Minimum number of qualifying sessions and minimum total valid time to count as "profile
-     * established". Sized for the demo booth: one visit is 5 sessions x 2.5 minutes of recording,
-     * which needs 10 valid minutes and has ~20% slack (750 s filmed vs 600 s required) because
-     * validMs only counts frames with a usable face signal. The previous 4 x 2.5 = 600 s case had
-     * exactly zero margin - one glance away from the camera could lose the whole profile.
+     * established". Sized for the demo booth: one visit is 5 sessions x 3 minutes of recording =
+     * 900 s filmed against 600 s required, so 300 s (a third of the filming) may be lost to frames
+     * without a usable face signal before the profile stops forming. validMs counts only those
+     * frames, which is why filmed time and required time are not the same quantity. The earlier
+     * 5 x 2.5 min script left 150 s of slack and a 4 x 2.5 min one had none at all - one long
+     * glance away from the camera could lose the whole profile.
      */
     const val MIN_SESSIONS = 5
     const val MIN_TOTAL_MS = 10L * 60L * 1000L
