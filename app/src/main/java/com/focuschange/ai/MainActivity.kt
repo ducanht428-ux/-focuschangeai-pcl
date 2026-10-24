@@ -5746,7 +5746,7 @@ private val PanelDemoSteps: List<Pair<String, String>> = listOf(
         "SEI hiển thị '--' và ĐỒ THỊ KHÔNG rơi về 0, không có báo đỏ 'mất tập trung kéo dài'.",
     "Bấm 'Cảnh báo sai' ngay sau một cảnh báo" to
         "Bộ đếm tăng, dòng nhãn được ghi vào file false_alerts. Hai file dùng hai mốc giờ khác nhau (dòng ảnh tính từ lúc bật máy, dòng nhãn là giờ đồng hồ), nên đối chiếu theo thứ tự thời gian chứ không so con số timestamp.",
-    "Bấm 'Ghi CSV', theo dõi 2 phút rồi dừng" to
+    "Bấm 'Ghi CSV', theo dõi 3 phút rồi dừng" to
         "HUD báo số dòng đã ghi và số mẫu bị mất; file nằm trong thư mục riêng của app.",
     "Bấm 'Chia sẻ báo cáo'" to
         "Mở bảng chọn chia sẻ với văn bản tóm tắt; không có ảnh, không có dữ liệu người khác."
@@ -5781,7 +5781,7 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
     "Nhịp chớp mắt (BPM)" to
         "Số lần chớp trong cửa sổ 60 giây, chỉ đáng tin sau 15 giây theo dõi liên tục. Chớp quá ít " +
         "(< 8/phút) hoặc quá nhiều (> 30/phút) đều là tín hiệu mệt hoặc căng mắt, nhưng nhịp chớp " +
-        "rất cá nhân nên app so với thói quen của chính học sinh đó khi đã có đủ ba phiên.",
+        "rất cá nhân nên app so với thói quen của chính học sinh đó khi đã có đủ năm phiên.",
     "BFR / MAR" to
         "BFR là tỉ lệ nhíu mày so với đường cơ sở (giữ 2 giây thì tính là cau có). MAR là độ mở miệng " +
         "so với bề rộng môi, vượt 0.55 và giữ 1.2 giây thì tính là một cái ngáp. Cả hai đều là suy đoán " +
