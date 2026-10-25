@@ -32,7 +32,7 @@ internal class DataLogger {
 
     /**
      * 37 measurement columns + 8 two-sided band columns = 45; the order must match the row builder
-     * trong MainActivity.
+     * in MainActivity.
      *
      * This list is public (instead of only the header string) so places that must write an "empty"
      * row can look columns up BY NAME. Counting positions by hand means one column inserted in the
