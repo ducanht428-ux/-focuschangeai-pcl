@@ -640,7 +640,7 @@ internal object FirebaseSync {
         if (resending) {
             // A previous batch is still waiting for the backend (an offline Firestore write stays
             // pending until the connection returns). Say so instead of silently doing nothing: the
-            // panel would otherwise read "Đang gửi lại..." forever with no answer.
+            // the panel would otherwise read "sending again..." forever with no answer.
             onDone?.invoke(0, batch.size)
             return
         }

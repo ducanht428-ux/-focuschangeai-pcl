@@ -2450,10 +2450,10 @@ class MainActivity : ComponentActivity() {
      */
     private fun uploadSessionToCloud(s: SessionSummary, bands: List<BandOutcome>) {
         if (!FirebaseSync.enabled) return
-        // Same reason the heartbeat freezes: while "Học thói quen" is off, tick() and observe() never
-        // run, so this summary is all zeros and the record would say "this student studied 0 minutes
-        // with a 0.00 SEI" - a number that was never measured. A missing row is honest; a zero row is
-        // a false measurement sitting in the table the teacher averages over.
+        // Same reason the heartbeat freezes: while the habit-learning switch is off, tick() and
+        // observe() are skipped, so this summary is all zeros and the record would say "this student
+        // studied 0 minutes with a 0.00 SEI" - a number that was never measured. A missing row is
+        // honest; a zero row is a false measurement sitting in the table the teacher averages over.
         if (!habitLearnEnabled) return
         val prof = habitProfile ?: return
         var alerts = 0
