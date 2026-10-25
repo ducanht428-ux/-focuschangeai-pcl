@@ -18,6 +18,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -95,6 +97,17 @@ class MainActivity : ComponentActivity() {
         const val KEY_SENSITIVITY = "sensitivity_level"
         const val KEY_ENHANCE = "enhance_mode"
         const val KEY_HABIT_LEARN = "habit_learn_enabled"
+
+        /**
+         * Which lens to use: 0 = front, 1 = back, 2 = whichever camera the system offers first.
+         *
+         * Without this the app always grabs the front camera on any phone that has one, which silently
+         * makes an external webcam unusable - it is present, it is listed, and it is never chosen. The
+         * "any" entry is what a USB or network camera ends up behind on Android; the system does not
+         * label it for us, so the only honest way to find it is to bind it and look at the picture.
+         */
+        const val KEY_CAMERA_CHOICE = "camera_choice"
+
         const val HABIT_AUTOSAVE_MS = 30_000L
         const val HABIT_STATUS_REFRESH_MS = 1_000L
 
@@ -294,6 +307,14 @@ class MainActivity : ComponentActivity() {
         const val LUMA_HIGH = 220f
         const val MIN_FACE_PX = 40f
         const val VERY_SMALL_FACE_PX = 25f
+
+        /**
+         * The small-face notice clears only above this inter-ocular width, not the instant it passes
+         * MIN_FACE_PX. That distance jitters a couple of pixels per frame, so triggering and clearing
+         * on the same value would make the line blink during a demo.
+         */
+        const val FACE_HINT_CLEAR_PX = MIN_FACE_PX + 8f
+
         const val QUALITY_OK = 50
         const val LUMA_SAMPLE_STEP = 8
 
@@ -343,6 +364,18 @@ class MainActivity : ComponentActivity() {
          */
         const val STATUS_HOLD_MS = 20_000L
 
+        /**
+         * How long the screen is allowed to keep showing the last numbers it measured. A camera that
+         * was unplugged, a stream that dropped, a driver that hung - all stop delivering frames while
+         * the UI keeps whatever it last received. "82 bpm" frozen on screen reads as "82 bpm right now",
+         * which is a claim about the present that nothing supports any more. Past this gap every number
+         * becomes -- and the reason is printed.
+         *
+         * Three seconds, not one: the analysis uses KEEP_ONLY_LATEST, so a single heavy frame of a few
+         * hundred milliseconds must not make the whole HUD flicker to dashes and back.
+         */
+        const val FRAME_FRESH_MS = 3_000L
+
         // ---------------- Demo-prep panel ----------------
         // Before going on stage: press one button, sit still for 20 seconds, the app measures whether
         // the device keeps up and points out exactly what to fix. No number in this panel is a guess.
@@ -386,6 +419,9 @@ class MainActivity : ComponentActivity() {
     private var cameraStarted = false
     private var lastVideoTimestamp = 0L
 
+    // 0 = front, 1 = back, 2 = any lens. Read by startCamera, changed only through the button.
+    private var cameraChoice = 0
+
     private val prefs by lazy {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
     }
@@ -420,6 +456,7 @@ class MainActivity : ComponentActivity() {
     private var distanceAlert by mutableStateOf(false)
     private var distanceScaleText by mutableStateOf("x1.00")
     private var personHintText by mutableStateOf<String?>(null)
+    private var faceSizeHintText by mutableStateOf<String?>(null)
     private var calibrationText by mutableStateOf("Đang chờ khuôn mặt để hiệu chuẩn...")
     private var bpmText by mutableStateOf("--")
     private var seiValue by mutableIntStateOf(-1)
@@ -456,6 +493,7 @@ class MainActivity : ComponentActivity() {
     private var sensitivityUi by mutableStateOf(1)
     private var enhanceUi by mutableStateOf(0)
     private var cameraMirrored by mutableStateOf(true)
+    private var cameraChoiceUi by mutableStateOf(0)
     private var imageDetailText by mutableStateOf("--")
     private var habitLearnUi by mutableStateOf(true)
     private var showAddStudent by mutableStateOf(false)
@@ -515,6 +553,15 @@ class MainActivity : ComponentActivity() {
     private var pfPerclosReady = false
     private var pfCalibrated = false
     private var preflightWatchdog: Runnable? = null
+
+    /**
+     * Wall clock of the newest frame handed to the analyser. Written by the camera thread, read by
+     * the UI thread; only its age matters, so a plain volatile long is enough.
+     */
+    @Volatile
+    private var lastFrameArrivalMs = 0L
+    private var freshnessTick: Runnable? = null
+    private var sensorLossPrinted = false
     private var csvReading = false
 
     // Latency histogram: plain backing array, only an immutable copy is handed to state.
@@ -601,6 +648,14 @@ class MainActivity : ComponentActivity() {
     /** 0 = no reminder, 1 = rolling test (cleared when clean), 2 = calibration just deviated (kept). */
     @Volatile
     private var personHintKind = 0
+
+    /**
+     * The "your face fills too few pixels" line, written by cameraExecutor and copied by HudSnapshot.
+     * Kept out of the alert chain on purpose (see [HudSnapshot.faceSizeHint]) and held until the face
+     * is clearly bigger again, so a head that wobbles at the threshold cannot flicker the HUD.
+     */
+    @Volatile
+    private var faceSizeHintPlain: String? = null
 
     /**
      * Band position codes of the 12 features for the frame being processed. Only cameraExecutor touches
@@ -883,6 +938,8 @@ class MainActivity : ComponentActivity() {
         sensitivityUi = sensLevel
         enhanceMode = prefs.getInt(KEY_ENHANCE, 0).coerceIn(0, 1)
         enhanceUi = enhanceMode
+        cameraChoice = prefs.getInt(KEY_CAMERA_CHOICE, 0).coerceIn(0, 2)
+        cameraChoiceUi = cameraChoice
 
         habitStore = HabitStore(this)
         habitLearnEnabled = prefs.getBoolean(KEY_HABIT_LEARN, true)
@@ -1234,6 +1291,16 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
+                            // Own line, not a priority alert: the numbers below stay on screen on purpose so
+                            // the person can see how much they are worth and fix the framing.
+                            faceSizeHintText?.let {
+                                Text(
+                                    text = it,
+                                    color = Color(0xFF4FC3F7),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+
                             Text(text = "Tư thế đầu: $headPoseText")
                             Text(text = "Hướng nhìn: $gazeText")
                             Text(text = "Vi biểu cảm: $expressionText")
@@ -1252,7 +1319,9 @@ class MainActivity : ComponentActivity() {
                             Text(text = "Phiên làm việc: $sessionText")
                             Text(text = "Thời gian nhận diện: $processingText ($fpsText FPS)")
                             Text(
-                                text = "Mọi xử lý và lưu trữ đều ở trên máy này. App không tự gửi đi đâu; chỉ khi bạn bấm Chia sẻ báo cáo, phần bạn tự đặt tên mới đi kèm.",
+                                text = "Mọi phép đo chạy trên máy này; app không lưu ảnh, không lưu video. " +
+                                    "Khi bật Firebase, app tự gửi ba bản tổng kết (kèm tên do chính bạn nhập). " +
+                                    "Bấm Chia sẻ báo cáo là cách duy nhất bạn chủ động đẩy thêm gì đi.",
                                 style = MaterialTheme.typography.bodySmall
                             )
 
@@ -1683,6 +1752,19 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        // Which lens the measurement comes from. Without this the app always takes the
+                        // front camera on any phone that has one, so an external camera is listed but
+                        // never reachable.
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = { cycleCameraChoice() }
+                            ) {
+                                Text("Camera: ${cameraChoiceName(cameraChoiceUi)}")
+                            }
+                        }
+
                         Spacer(Modifier.height(8.dp))
 
                         Box(
@@ -1816,17 +1898,25 @@ class MainActivity : ComponentActivity() {
                     analyzeFrame(image)
                 }
 
-                // Prefer the front camera (phone). A device with no front camera (tablet, Chromebook, desktop
-                // emulator, external webcam) falls back to the rear camera or whichever camera is available.
-                val hasFront = hasCameraSafe(provider, CameraSelector.DEFAULT_FRONT_CAMERA)
-                val hasBack = !hasFront && hasCameraSafe(provider, CameraSelector.DEFAULT_BACK_CAMERA)
-                if (!hasFront && !hasBack && provider.availableCameraInfos.isEmpty()) {
-                    throw IllegalStateException("Không tìm thấy camera nào trên thiết bị")
+                // Three lenses to pick from. The front camera is the default because that is what a
+                // phone on a desk points at, but it used to be the only option: on a phone that has a
+                // front camera an external webcam was listed, never chosen, so every test of one looked
+                // like a broken webcam.
+                val desiredLens = when (cameraChoice) {
+                    1 -> CameraCharacteristics.LENS_FACING_BACK
+                    2 -> null
+                    else -> CameraCharacteristics.LENS_FACING_FRONT
                 }
-                val selector = when {
-                    hasFront -> CameraSelector.DEFAULT_FRONT_CAMERA
-                    hasBack -> CameraSelector.DEFAULT_BACK_CAMERA
-                    else -> CameraSelector.Builder().build()
+                val selector = lensSelector(desiredLens)
+                val hasChosen = if (desiredLens == null) {
+                    provider.availableCameraInfos.isNotEmpty()
+                } else {
+                    countLens(provider, desiredLens) > 0
+                }
+                if (!hasChosen) {
+                    throw IllegalStateException(
+                        "Không có camera loại đã chọn. Đang có: ${describeCameras(provider)}"
+                    )
                 }
 
                 provider.unbindAll()
@@ -1840,11 +1930,18 @@ class MainActivity : ComponentActivity() {
                 cameraStarted = true
 
                 runOnUiThread {
-                    cameraMirrored = hasFront
-                    status = if (hasFront) {
-                        "Camera trước đang hoạt động."
-                    } else {
-                        "Camera đang hoạt động (không phải camera trước)."
+                    cameraMirrored = desiredLens == CameraCharacteristics.LENS_FACING_FRONT
+                    // Arming the heartbeat: a bound camera that then goes quiet is the case the HUD
+                    // must catch, so the clock restarts with this camera instead of inheriting the
+                    // arrival time of whichever camera ran before it.
+                    lastFrameArrivalMs = 0L
+                    sensorLossPrinted = false
+                    scheduleFreshnessTick()
+                    status = when (desiredLens) {
+                        CameraCharacteristics.LENS_FACING_FRONT -> "Camera trước đang hoạt động."
+                        CameraCharacteristics.LENS_FACING_BACK -> "Camera sau đang hoạt động."
+                        else -> "Camera ${describeCameras(provider)} đang hoạt động - " +
+                            "kiểm tra khung hình xem có đúng ống kính bạn muốn không."
                     }
                 }
             } catch (e: Exception) {
@@ -1859,12 +1956,72 @@ class MainActivity : ComponentActivity() {
 
     // ======================= REAL CAMERA PARAMETERS =======================
 
-    private fun hasCameraSafe(provider: ProcessCameraProvider, selector: CameraSelector): Boolean {
-        return try {
-            provider.hasCamera(selector)
-        } catch (e: Exception) {
-            false
+    /**
+     * The lens list CameraX gives us only says FRONT / BACK / EXTERNAL, and "EXTERNAL" appears on
+     * some phones and not on others. Asking Camera2 directly for the characteristics is the only way
+     * to tell "there are three lenses" from "there are two and one is the webcam".
+     */
+    private fun lensFacingOf(info: CameraInfo): Int = try {
+        Camera2CameraInfo.from(info).getCameraCharacteristic(
+            CameraCharacteristics.LENS_FACING
+        ) ?: CameraCharacteristics.LENS_FACING_EXTERNAL
+    } catch (e: Exception) {
+        CameraCharacteristics.LENS_FACING_EXTERNAL
+    }
+
+    private fun lensSelector(lens: Int?): CameraSelector =
+        if (lens == null) {
+            CameraSelector.Builder().build()
+        } else {
+            CameraSelector.Builder()
+                .requireLensFacing(lens)
+                .build()
         }
+
+    private fun countLens(provider: ProcessCameraProvider, lens: Int): Int =
+        provider.availableCameraInfos.count { lensFacingOf(it) == lens }
+
+    private fun describeCameras(provider: ProcessCameraProvider): String {
+        val front = countLens(provider, CameraCharacteristics.LENS_FACING_FRONT)
+        val back = countLens(provider, CameraCharacteristics.LENS_FACING_BACK)
+        val other = provider.availableCameraInfos.size - front - back
+        return buildString {
+            append(front).append(" trước, ").append(back).append(" sau")
+            if (other > 0) append(", ").append(other).append(" khác (ngoài hoặc không rõ loại)")
+        }
+    }
+
+    /** Front -> back -> any -> front. "Any" is how a USB or network camera is reached on Android. */
+    private fun cycleCameraChoice() {
+        val next = (cameraChoice + 1) % 3
+        prefs.edit().putInt(KEY_CAMERA_CHOICE, next).apply()
+        cameraChoice = next
+        cameraChoiceUi = next
+        if (!cameraStarted) {
+            status = "Đã chọn ống kính ${cameraChoiceName(next)} - camera sẽ mở cùng khung hình."
+            return
+        }
+        cameraStarted = false
+        cancelFreshnessTick()
+        previewView?.let { startCamera(it) } ?: run {
+            status = "Đổi ống kính cần mở lại camera nhưng không có khung hình để gắn vào."
+        }
+    }
+
+    private fun cameraChoiceName(choice: Int): String = when (choice) {
+        1 -> "sau"
+        2 -> "bất kỳ (camera ngoài)"
+        else -> "trước"
+    }
+
+    /**
+     * The freshness tick re-arms itself, so calling it again while one is already pending would double
+     * the number of ticks every camera switch - two chains becoming four, then eight.
+     */
+    private fun cancelFreshnessTick() {
+        val t = freshnessTick ?: return
+        freshnessTick = null
+        window.decorView.removeCallbacks(t)
     }
 
     private fun loadCameraIntrinsics() {
@@ -3464,6 +3621,9 @@ class MainActivity : ComponentActivity() {
             // The "calibration just deviated by 20%" reminder is an operator matter, so it must still be on the
             // HUD after that student stands up; only the rolling test loses its value when the face is lost.
             personHint = if (personHintKind == 2) personHintPlain else null,
+            // The no-face line already says the face is missing, and any pixel count quoted here
+            // would come from the last frame that still had one.
+            faceSizeHint = null,
             // The band line stays as is when the face is lost: it describes the session, not this frame.
             // Letting it vanish on every turn of the head would only make the HUD flicker.
             bandSummary = bandSummaryPlain
@@ -3688,6 +3848,29 @@ class MainActivity : ComponentActivity() {
             if (calibrated) abs(pitchDeg) else 0f,
             irisAvailable
         )
+        // Small faces are named separately here because a generic "your face is a bit far" wording
+        // does not tell anyone what to DO. Asked on 2026-10-25 whether numbers should be hidden below a size floor, the answer
+        // was no: keep showing them so the person can react - move closer, light the room, fix the
+        // tripod - and the quality line says why the reading wobbles.
+        //
+        // One honest consequence of that choice: below about MIN_FACE_PX the eye ratio is carried by
+        // one or two pixels, so these numbers are only loosely tied to the eyes. The CSV keeps them,
+        // and signal_quality / quality_mean travel with every session summary uploaded to Firebase,
+        // so nobody downstream reads a low-quality session as if it were clean. Rows genuinely without
+        // a face still go out empty, never zero.
+        val smallFace = faceWidthPx < MIN_FACE_PX
+        if (smallFace) {
+            signalNote = "Mặt quá nhỏ trong khung hình: số chỉ mang tính tham khảo"
+            faceSizeHintPlain = String.format(
+                Locale.US,
+                "ℹ Hai mắt chỉ cách nhau %.0f px trong khung hình (nên từ %d px trở lên): " +
+                    "lại gần hơn hoặc phóng to, số sẽ bớt nhiễu.",
+                faceWidthPx,
+                MIN_FACE_PX.toInt()
+            )
+        } else if (faceWidthPx >= FACE_HINT_CLEAR_PX) {
+            faceSizeHintPlain = null
+        }
         val reliable = signalReliable
 
         var blinkDetected = false
@@ -4052,27 +4235,35 @@ class MainActivity : ComponentActivity() {
             // second so it does not allocate a new string every frame.
             if (nowMs - lastBreakdownMs >= BREAKDOWN_REFRESH_MS) {
                 lastBreakdownMs = nowMs
-                val chronicPenalty = when (chronicLevelValue) {
-                    2 -> SEI_CHRONIC_PENALTY
-                    1 -> SEI_WATCH_PENALTY
-                    else -> 0f
+                if (!reliable) {
+                    // The breakdown is the table a judge reads to check where the score came from. When
+                    // the quality line has already said the signal is poor, a page of confident
+                    // sub-scores would advertise the very thing the alert warns about, so it names the
+                    // reason instead.
+                    seiBreakdown = "Tín hiệu kém ($signalNote): thành điểm chưa đáng tin."
+                } else {
+                    val chronicPenalty = when (chronicLevelValue) {
+                        2 -> SEI_CHRONIC_PENALTY
+                        1 -> SEI_WATCH_PENALTY
+                        else -> 0f
+                    }
+                    seiBreakdown = buildSeiBreakdown(
+                        posture = posture,
+                        dist = dist,
+                        gaze = gaze,
+                        eyes = eyes,
+                        blinkRate = blinkRate,
+                        expression = expression,
+                        weights = seiWeights,
+                        closePenalty = if (distanceAlertActive) SEI_TOO_CLOSE_PENALTY else 0f,
+                        chronicPenalty = chronicPenalty,
+                        frozen = frozen,
+                        anomalyCap = SEI_ANOMALY_CAP,
+                        weightedSum = weightedSum,
+                        finalRaw = raw,
+                        sei = seiNow
+                    )
                 }
-                seiBreakdown = buildSeiBreakdown(
-                    posture = posture,
-                    dist = dist,
-                    gaze = gaze,
-                    eyes = eyes,
-                    blinkRate = blinkRate,
-                    expression = expression,
-                    weights = seiWeights,
-                    closePenalty = if (distanceAlertActive) SEI_TOO_CLOSE_PENALTY else 0f,
-                    chronicPenalty = chronicPenalty,
-                    frozen = frozen,
-                    anomalyCap = SEI_ANOMALY_CAP,
-                    weightedSum = weightedSum,
-                    finalRaw = raw,
-                    sei = seiNow
-                )
             }
 
             // ---- Compared with habit: SEI falling below this student's own usual level ----
@@ -4321,12 +4512,21 @@ class MainActivity : ComponentActivity() {
             eyeDetail = eyeDetail,
             imageDetail = imageDetail,
             personHint = personHintPlain,
+            faceSizeHint = faceSizeHintPlain,
             bandSummary = bandSummaryPlain
         )
     }
 
     /** Runs on the UI thread: refreshes the text lines of the parameter panel (already rate limited). */
     private fun applyHudText(s: HudSnapshot) {
+        // No frame for FRAME_FRESH_MS while the camera is bound: every number below is a memory of the
+        // last frame that arrived, not a measurement, so none of them may be shown. The snapshot passed
+        // in is the old one still held by the UI thread - blank the text and return before touching it.
+        if (sensorLost()) {
+            showSensorLoss()
+            return
+        }
+
         ear1Text = s.ear1?.let {
             String.format(Locale.US, "%.3f", it)
         } ?: "--"
@@ -4350,6 +4550,7 @@ class MainActivity : ComponentActivity() {
         distanceAlert = s.tooClose
         distanceScaleText = String.format(Locale.US, "x%.2f", s.distanceScale)
         personHintText = s.personHint
+        faceSizeHintText = s.faceSizeHint
 
         bpmText = s.bpm?.let {
             String.format(Locale.US, "%.1f", it)
@@ -4602,6 +4803,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun analyzeFrame(imageProxy: ImageProxy) {
+        // First thing, before any early return: this is the heartbeat the HUD staleness guard reads.
+        // The frame arrived, whether or not a face is found in it or the model is ready yet.
+        lastFrameArrivalMs = SystemClock.elapsedRealtime()
+
         var bitmap: Bitmap? = null
         var rotatedBitmap: Bitmap? = null
         var mpImage: MPImage? = null
@@ -4836,6 +5041,11 @@ class MainActivity : ComponentActivity() {
             loggingEnabled = false
         }
         cancelPreflightWatchdog()
+        val tick = freshnessTick
+        freshnessTick = null
+        if (tick != null) {
+            window.decorView.removeCallbacks(tick)
+        }
 
         cameraProvider?.unbindAll()
         cameraProvider = null
@@ -5058,6 +5268,95 @@ class MainActivity : ComponentActivity() {
         val w = preflightWatchdog ?: return
         preflightWatchdog = null
         window.decorView.removeCallbacks(w)
+    }
+
+    // ==================== SENSOR FRESHNESS ====================
+
+    /**
+     * True when the camera is bound but has handed over no frame for FRAME_FRESH_MS.
+     *
+     * 0 in [lastFrameArrivalMs] means "this camera has never produced a frame yet", which is the
+     * normal state while the model loads or the preview opens - the cold path already prints its own
+     * reason, so it must not be renamed here as a lost signal.
+     */
+    private fun sensorLost(): Boolean {
+        if (!cameraStarted) {
+            return false
+        }
+        val last = lastFrameArrivalMs
+        return last > 0L && SystemClock.elapsedRealtime() - last > FRAME_FRESH_MS
+    }
+
+    /**
+     * Replaces every measurement line with -- and says why. Runs on the UI thread.
+     *
+     * Deliberately does not clear the alert history, the learned band or the session counters: those
+     * describe what really happened earlier and are still true. Only the live readouts, which the
+     * viewer would otherwise read as "now", are removed.
+     */
+    private fun showSensorLoss() {
+        ear1Text = "--"
+        ear2Text = "--"
+        eyeStatus = "Không xác định"
+        processingText = "-- ms"
+        fpsText = "--"
+        distanceText = "--"
+        distanceScaleText = "--"
+        distanceAlert = false
+        bpmText = "--"
+        perclosText = "--"
+        perclosP70Text = "--"
+        perclosP80Text = "--"
+        headPoseText = "--"
+        gazeText = "Không xác định"
+        expressionText = "Không xác định"
+        expressionMetricsText = "--"
+        inattentionText = "--"
+        fatigueText = "--"
+        signalText = "--"
+        seiBreakdownText = "--"
+        anomalyText = ""
+        chronicLevel = 0
+        chronicText = ""
+        eyeDetailText = "--"
+        imageDetailText = "--"
+        calibrationText = "--"
+        sessionText = "--"
+        seiValue = -1
+        landmarkPoints = EMPTY_LANDMARKS
+        faceCount = 0
+        alertText = ""
+        personHintText = null
+        faceSizeHintText = null
+        bandText = ""
+        if (!sensorLossPrinted) {
+            sensorLossPrinted = true
+            status = "Mất tín hiệu camera: không còn khung hình nào, mọi con số đổi thành --."
+            statusHoldUntilMs = SystemClock.elapsedRealtime() + STATUS_HOLD_MS
+        }
+    }
+
+    /**
+     * Keeps the HUD honest on its own, without a frame to wake it up. Runs on the UI thread and
+     * re-arms itself every UI_TEXT_REFRESH_MS for as long as the activity lives.
+     *
+     * The normal refresh path is frame-driven, so when frames stop the refresh stops with them - the
+     * screen freezes holding exactly the numbers that need erasing. This tick is the only thing that
+     * can still notice.
+     */
+    private fun scheduleFreshnessTick() {
+        if (freshnessTick != null) {
+            return
+        }
+        val tick = Runnable {
+            freshnessTick = null
+            if (sensorLost()) {
+                applyHudText(lastSnapshot ?: return@Runnable)
+            }
+            scheduleFreshnessTick()
+        }
+        freshnessTick = tick
+        window.decorView.postDelayed(tick, UI_TEXT_REFRESH_MS)
     }
 
     private fun clearPreflight() {
@@ -5828,11 +6127,15 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "giả khi học sinh với sách hoặc quay sang bạn - nay đã sửa: mất tín hiệu là thiếu dữ liệu.",
     "Quyền riêng tư và dữ liệu" to
         "Toàn bộ suy luận chạy trên máy; ảnh không được lưu và không rời khỏi điện thoại. Có đúng " +
-        "hai loại dữ liệu được gửi đi, cả hai đều là bản tổng kết chứ không phải khung hình: " +
-        "(1) khi một phiên kết thúc, app ghi MỘT bản tổng kết lên Cloud Firestore - tên học sinh, " +
-        "các giá trị trung bình của phiên, số cảnh báo và số lần bấm 'cảnh báo sai'; (2) giữa " +
-        "chừng phiên, mỗi 5 phút app ghi đè một bản 'presence' nhỏ để giáo viên biết em đang được " +
-        "đo. Ngoài hai loại bản ghi đó, app không tự gửi thêm dữ liệu nào khác. Mất mạng thì lệnh " +
+        "ba loại dữ liệu được gửi đi, cả ba đều là bản tổng kết chứ không phải khung hình, và cả ba " +
+        "đều mang tên do chính em nhập: " +
+        "(1) khi một phiên kết thúc, app ghi MỘT bản tổng kết lên Cloud Firestore - các giá trị trung " +
+        "bình của phiên, số cảnh báo và số lần bấm 'cảnh báo sai'; " +
+        "(2) giữa chừng phiên, mỗi 5 phút app ghi đè một bản 'presence' nhỏ để giáo viên biết em đang " +
+        "được đo; " +
+        "(3) mỗi phiên, khi hồ sơ đã đủ dữ liệu (từ 5 phiên), app ghi đè một bản 'bands' chứa dải quen " +
+        "của chính em - chỉ mô tả, không xếp loại. " +
+        "Ngoài ba loại bản ghi đó, app không tự gửi thêm dữ liệu nào khác. Mất mạng thì lệnh " +
         "ghi nằm trong hàng đợi ngoài luồng của Firestore và tự gửi lại khi có mạng. Sao lưu dự " +
         "phòng của hệ thống đã tắt (allowBackup=false), dữ liệu nằm trong thư mục riêng của app, " +
         "và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm nút tạo ra."

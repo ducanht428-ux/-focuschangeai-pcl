@@ -77,6 +77,12 @@ internal data class HudSnapshot(
      * Not a distraction alert and never audible; null while there is nothing to suspect.
      */
     val personHint: String? = null,
+    /**
+     * Reminder line shown while the face fills too few pixels for the eye ratios to be trustworthy.
+     * Deliberately outside the alert chain: a bad framing is not a sign of distraction, and a warning
+     * with priority would silence the PERCLOS, yawn and pose alerts on exactly those frames.
+     */
+    val faceSizeHint: String? = null,
     val bandSummary: String = ""
 )
 

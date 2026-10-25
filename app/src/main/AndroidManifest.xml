@@ -5,8 +5,9 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- Chỉ để THỬ mở lại màn hình theo dõi khi vừa bật máy; Android 10+ thường chặn cú mở này,
-         xem BootReceiver.kt. App vẫn phải mở bằng icon trên nhiều máy. -->
+    <!-- Only there to TRY to reopen the monitoring screen right after boot; Android 10+ usually
+         blocks that launch, see BootReceiver.kt. On many phones the app still has to be opened
+         from its icon. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <uses-feature
