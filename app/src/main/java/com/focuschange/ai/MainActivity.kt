@@ -586,7 +586,11 @@ class MainActivity : ComponentActivity() {
     private var seiBreakdown = "--"
     private var lastBreakdownMs = 0L
     private var lastThresholdMs = 0L
-    private var activeStudentId = ""
+
+    // Written when a student is chosen on the UI thread, read by the camera thread when a profile
+    // name has to be printed. Volatile so the camera cannot keep seeing the previous child.
+    @Volatile
+    private var activeStudentId: String = ""
 
     // State used on the UI thread only
     private var lastSnapshot: HudSnapshot? = null
@@ -639,7 +643,10 @@ class MainActivity : ComponentActivity() {
         personGuard.reset()
         personHintPlain = null
         personHintKind = 0
-        distanceScaleText = String.format(Locale.US, "x%.2f", distanceScale)
+        // NO Compose state is written here on purpose. This function runs on cameraExecutor after a
+        // student switch, and distanceScaleText is a mutableStateOf: the number reaches the screen
+        // through HudSnapshot.distanceScale and applyHudText on the UI thread, which is also the only
+        // place that can format it the same way as the rest of the HUD.
     }
 
     private val personGuard = PersonGuard()
@@ -752,6 +759,10 @@ class MainActivity : ComponentActivity() {
 
     // ---------------- Per-student habit learning (cameraExecutor only) ----------------
     private lateinit var habitStore: HabitStore
+
+    // Written when cameraExecutor handles a student switch, read by the panel and by the send-again
+    // button on the UI thread. Volatile so the UI cannot count against the previous child profile.
+    @Volatile
     private var habitProfile: HabitProfile? = null
     private var habitSession: HabitSession? = null
     private var lastHabitSaveMs = 0L
@@ -1973,6 +1984,12 @@ class MainActivity : ComponentActivity() {
                 Log.e(TAG, "Lỗi mở camera", e)
 
                 runOnUiThread {
+                    // Blank the readouts now instead of waiting for the freshness watchdog: this path
+                    // leaves cameraStarted false, and sensorLost() reports false while the camera is
+                    // not bound, so the numbers the previous lens put on screen would otherwise stay
+                    // there looking live. A successful startCamera re-arms the tick itself.
+                    sensorLossPrinted = true
+                    showSensorLoss()
                     status = "Lỗi camera: ${e.message}"
                 }
             }
@@ -1986,6 +2003,12 @@ class MainActivity : ComponentActivity() {
      * some phones and not on others. Asking Camera2 directly for the characteristics is the only way
      * to tell "there are three lenses" from "there are two and one is the webcam".
      */
+    // androidx.annotation.OptIn, NOT kotlin.OptIn: ExperimentalCamera2Interop is marked with
+    // androidx.annotation.Experimental, which the Kotlin compiler does not treat as an opt-in
+    // marker (it warns that kotlin.OptIn has no effect) while Android Lint does require one.
+    @androidx.annotation.OptIn(
+        markerClass = [androidx.camera.camera2.interop.ExperimentalCamera2Interop::class]
+    )
     private fun lensFacingOf(info: CameraInfo): Int = try {
         Camera2CameraInfo.from(info).getCameraCharacteristic(
             CameraCharacteristics.LENS_FACING
@@ -2367,7 +2390,7 @@ class MainActivity : ComponentActivity() {
         FirebaseSync.uploadBand(
             BandReport(
                 studentId = prof.id,
-                studentName = studentName,
+                studentName = prof.name,
                 sessionsUsed = prof.sessionCount(),
                 updatedAtWallMs = System.currentTimeMillis(),
                 bands = list,
@@ -2430,9 +2453,13 @@ class MainActivity : ComponentActivity() {
         val prof = habitProfile ?: return
         var alerts = 0
         for (list in alertOccurrences) alerts += list.size
+        // The NAME comes from the profile this session belongs to, never from the on-screen field:
+        // a student switch rewrites studentName on the UI thread a moment before the camera thread
+        // finishes ending the previous session, and the old session would be published under the new
+        // child's name - the one mistake the binding lock exists to prevent.
         val report = SessionReport(
             studentId = prof.id,
-            studentName = studentName,
+            studentName = prof.name,
             summary = s,
             alertsTotal = alerts,
             falseAlerts = falseAlertCount,
@@ -2486,7 +2513,6 @@ class MainActivity : ComponentActivity() {
             FirebaseSync.resendArchive(
                 prof,
                 studentName,
-                android.os.Build.MODEL,
                 appVersionName()
             ) { a, r, skipped -> reportResend(accepted + a, refused + r, skipped) }
         }
@@ -2561,7 +2587,7 @@ class MainActivity : ComponentActivity() {
         FirebaseSync.uploadHeartbeat(
             HeartbeatReport(
                 studentId = prof.id,
-                studentName = studentName,
+                studentName = prof.name,
                 sessionId = session.id,
                 // HabitSession is built with System.currentTimeMillis(), so the id and the start moment are the
                 // same number. Both are passed as separate columns so the record explains itself without guessing.
@@ -5118,13 +5144,9 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         previewView = null
 
-        // The last few dozen rows are still inside the BufferedWriter buffer. If the app is destroyed without
-        // stop(), that part of the session just measured is lost - and it is the most important part,
-        // because it is the final minutes of the session.
-        if (loggingEnabled) {
-            dataLogger.stop()
-            loggingEnabled = false
-        }
+        // The CSV writer is NOT closed here. It is queued as the LAST thing cameraExecutor does, below:
+        // stopping it on the UI thread threw away every row still in the BufferedWriter buffer, which
+        // is the final second of the session - the most interesting part, and the part a judge asks about.
         cancelPreflightWatchdog()
         val tick = freshnessTick
         freshnessTick = null
@@ -5151,6 +5173,9 @@ class MainActivity : ComponentActivity() {
                     }
                     faceLandmarker = null
                 }
+                // Queued after the model close, so every frame that is still in the queue has already
+                // written its rows by the time the file is closed.
+                cameraExecutor.execute { stopHabitLogging() }
             } catch (e: Exception) {
                 Log.w(TAG, "Không xếp được việc đóng phiên/model", e)
             }
@@ -5160,13 +5185,19 @@ class MainActivity : ComponentActivity() {
                     // Frames still running after 1.2 seconds: skip closing the model and let the process free it
                     // rather than close while native is using it - a leaked model only costs RAM, while a
                     // SIGSEGV loses the whole session that is being written to CSV.
-                    cameraExecutor.shutdownNow()
+                    // No shutdownNow(): it cancels the queued tasks, and those tasks are the session end,
+                    // the cloud upload and the CSV flush. Better a thread that outlives the activity than a
+                    // lost measurement.
                     Log.w(TAG, "CameraExecutor chưa xong, để model đóng khi process kết thúc")
                 }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
         }
+
+        // Safety net for the case where the executor was never initialised or the queue was rejected:
+        // the function does nothing if the queued task already closed the file.
+        stopHabitLogging()
 
         try {
             toneGenerator?.release()
@@ -5179,6 +5210,17 @@ class MainActivity : ComponentActivity() {
     }
 
     // ==================== RESEARCH DATA LOGGING ====================
+
+    /**
+     * Closes the CSV writer once, flushing what is still in the buffer. Called from cameraExecutor as
+     * the last queued task, and from the UI thread as the fallback - the flag makes the second call a
+     * no-op, so no row is ever written to a closed writer and none is left unflushed.
+     */
+    private fun stopHabitLogging() {
+        if (!loggingEnabled) return
+        loggingEnabled = false
+        dataLogger.stop()
+    }
 
     /** One numeric column in the CSV. An empty cell means "not measurable", which is not the same as 0. */
     private fun StringBuilder.num(v: Float?) {

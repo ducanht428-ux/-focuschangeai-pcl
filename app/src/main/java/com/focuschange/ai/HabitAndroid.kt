@@ -32,6 +32,7 @@ internal fun SessionSummary.toJson(): JSONObject {
     val n = JSONArray()
     for (c in count) n.put(c)
     o.put("n", n)
+    o.put("qn", qualityCount)
     return o
 }
 
@@ -51,7 +52,11 @@ internal fun SessionSummary.Companion.fromJson(o: JSONObject): SessionSummary? {
             quality = o.getDouble("q").toFloat(),
             mean = FloatArray(c) { m.getDouble(it).toFloat() },
             std = FloatArray(c) { s.getDouble(it).toFloat() },
-            count = IntArray(c) { n.getInt(it) }
+            count = IntArray(c) { n.getInt(it) },
+            // Files written before qn existed have no count stored. A session can only be IN the
+            // profile if it passed the quality bar, so a stored positive mean is proof enough that
+            // samples existed; guessing 0 here would blank the quality column for every old profile.
+            qualityCount = o.optInt("qn", if (o.optDouble("q", 0.0) > 0.0) 1 else 0)
         )
     } catch (e: Exception) {
         Log.w("HabitProfile", "Bỏ qua phiên lỗi định dạng", e)

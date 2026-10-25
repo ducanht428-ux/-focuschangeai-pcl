@@ -213,7 +213,14 @@ internal class SessionSummary(
     val quality: Float,
     val mean: FloatArray,
     val std: FloatArray,
-    val count: IntArray
+    val count: IntArray,
+    /**
+     * How many frames the quality average was computed from. Needed because the mean of an empty
+     * accumulator is 0.0, not NaN: without this counter there is no way to tell "the signal was
+     * genuinely awful" from "nothing was ever measured", and the cloud record would have to write
+     * quality_mean = 0 for every session that never saw a face.
+     */
+    val qualityCount: Int = 0
 ) {
     companion object
 }
@@ -344,7 +351,8 @@ internal class HabitSession(val id: Long) {
             quality = quality.mean.toFloat(),
             mean = mean,
             std = std,
-            count = cnt
+            count = cnt,
+            qualityCount = quality.n
         )
     }
 }

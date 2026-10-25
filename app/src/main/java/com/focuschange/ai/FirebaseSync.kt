@@ -440,12 +440,11 @@ internal object FirebaseSync {
         out["valid_ms"] = s.validMs
         out["face_ratio"] = round4(s.faceRatio)
         out["valid_ratio"] = round4(s.validRatio)
-        // These two are written only when samples actually exist. round2(NaN) returns 0, and
-        // "SEI = 0" reads as "this student fell asleep" while "quality = 0" reads as "the camera
-        // is broken" - both wrong: nothing was measured yet. A missing column is the honest
-        // signal; a fabricated zero is a false one. The mean of an empty accumulator is NaN, so
-        // isFinite is exactly "were there samples".
-        if (s.quality.isFinite()) {
+        // Written only when samples actually exist. The mean of an empty accumulator is 0.0, NOT
+        // NaN, so isFinite proves nothing here: an unguarded write would put "quality = 0" on a
+        // heartbeat that measured nothing, and that reads as "this camera is broken". A missing
+        // column is the honest signal; a fabricated zero is a false one.
+        if (s.qualityCount > 0) {
             out["quality_mean"] = round2(s.quality)
         }
         val seiN = s.count[HabitFeature.SEI]
@@ -484,7 +483,12 @@ internal object FirebaseSync {
         out["valid_ms"] = s.validMs
         out["face_ratio"] = round4(s.faceRatio)
         out["valid_ratio"] = round4(s.validRatio)
-        out["quality_mean"] = round2(s.quality)
+        // Same rule as the heartbeat: a session that never saw a usable face has quality 0.0, and
+        // writing that as a number would tell the teacher the camera was broken rather than that
+        // nothing was measured. So the column is left out.
+        if (s.qualityCount > 0) {
+            out["quality_mean"] = round2(s.quality)
+        }
         out["alerts_total"] = r.alertsTotal
         out["false_alerts"] = r.falseAlerts
         out["csv_rows"] = r.csvRows
@@ -573,28 +577,49 @@ internal object FirebaseSync {
         val ctx = storage ?: return
         val text = synchronized(pendingLock) { PendingUploadStore.encode(pending) }
         try {
-            File(ctx.filesDir, PENDING_FILE).writeText(text)
+            val f = File(ctx.filesDir, PENDING_FILE)
+            // tmp + rename, exactly like HabitStore.save: writeText truncates the existing file
+            // first, so a process killed halfway through would destroy the WHOLE queue instead of
+            // only the last record.
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(text)
+            if (!tmp.renameTo(f)) {
+                f.writeText(text)
+                tmp.delete()
+            }
         } catch (e: Exception) {
             lastPendingError = e.javaClass.simpleName
         }
     }
 
+    /**
+     * Reads the queue file back. Records that cannot be parsed are dropped by [PendingUploadStore.decode],
+     * so the ones that survive are written back out at once: leaving the corrupt text in place would
+     * make every later start re-read and re-lose the same records.
+     */
     private fun loadPending() {
         val ctx = storage ?: return
-        synchronized(pendingLock) {
+        val damaged = synchronized(pendingLock) {
             if (pendingLoaded) return
             pendingLoaded = true
+            var bad = false
             try {
                 val f = File(ctx.filesDir, PENDING_FILE)
                 if (f.exists()) {
-                    val restored = PendingUploadStore.decode(f.readText())
+                    val text = f.readText()
+                    val restored = PendingUploadStore.decode(text)
+                    // Lines present in the file but not in the queue = unparseable records.
+                    val lines = text.count { it == '\n' }
+                    bad = lines > restored.size
                     if (restored.isNotEmpty()) pending = ArrayList(restored)
                 }
             } catch (e: Exception) {
                 lastPendingError = e.javaClass.simpleName
             }
             pendingCount = pending.size
+            bad
         }
+        if (damaged) writeQueue()
     }
 
     /**
@@ -612,7 +637,13 @@ internal object FirebaseSync {
             onDone?.invoke(0, batch.size)
             return
         }
-        if (resending) return
+        if (resending) {
+            // A previous batch is still waiting for the backend (an offline Firestore write stays
+            // pending until the connection returns). Say so instead of silently doing nothing: the
+            // panel would otherwise read "Đang gửi lại..." forever with no answer.
+            onDone?.invoke(0, batch.size)
+            return
+        }
         resending = true
         var answered = 0
         var accepted = 0
@@ -622,6 +653,9 @@ internal object FirebaseSync {
         fun finishBatch() {
             if (answered < batch.size) return
             resending = false
+            // ONE rewrite for the whole batch: removing each record with its own writeQueue() would
+            // rewrite the entire file once per document, on the main thread, for 300 documents.
+            writeQueue()
             onDone?.invoke(accepted, refused)
         }
 
@@ -633,7 +667,10 @@ internal object FirebaseSync {
                     .addOnSuccessListener {
                         accepted++
                         markSentFromPayload(rec)
-                        dropPending(rec.docPath)
+                        // Removed by IDENTITY, not by document path. If a session ended while this
+                        // batch was in the air, the queue holds a NEWER payload for the same path,
+                        // and dropping by path would throw that newer record away.
+                        dropQueuedInstance(rec)
                         answered++
                         finishBatch()
                     }
@@ -648,6 +685,17 @@ internal object FirebaseSync {
                 lastPendingError = e.javaClass.simpleName
                 answered++
                 finishBatch()
+            }
+        }
+    }
+
+    /** Removes one exact queued instance and leaves the file rewrite to the caller. */
+    private fun dropQueuedInstance(rec: PendingUpload) {
+        synchronized(pendingLock) {
+            val at = pending.indexOf(rec)
+            if (at >= 0) {
+                pending.removeAt(at)
+                pendingCount = pending.size
             }
         }
     }
@@ -678,13 +726,15 @@ internal object FirebaseSync {
         confirmedLoaded = true
         try {
             val raw = p.getString(SENT_IDS_KEY, "") ?: ""
-            for (token in raw.split(';')) {
-                val cut = token.indexOf(':')
-                if (cut <= 0) continue
-                val id = token.substring(0, cut)
-                for (value in token.substring(cut + 1).split(',')) {
-                    val sessionId = value.toLongOrNull() ?: continue
-                    getOrCreate(id).add(sessionId)
+            synchronized(confirmedIds) {
+                for (token in raw.split(';')) {
+                    val cut = token.indexOf(':')
+                    if (cut <= 0) continue
+                    val id = token.substring(0, cut)
+                    for (value in token.substring(cut + 1).split(',')) {
+                        val sessionId = value.toLongOrNull() ?: continue
+                        getOrCreate(id).add(sessionId)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -768,12 +818,21 @@ internal object FirebaseSync {
      * this path MERGES instead of overwriting (a rebuild must not erase columns a live send already
      * placed there) and why each rebuilt record says `backfilled = true`.
      *
+     * It deliberately writes NO `device` and no `app_version`. Those two describe the phone that
+     * measured, and the phone doing the resend may be a different one, or the same phone on a newer
+     * build - merging them would rewrite a true value with a plausible lie. What did the rebuild is
+     * recorded separately as `backfilled_by`.
+     *
+     * Also note that "already sent" is remembered in this install only (SharedPreferences): a session
+     * that went up from another phone, or before the app was reinstalled, is rebuilt once more. Since
+     * the rebuild never overwrites the columns the live send wrote, the cost is one extra write, not
+     * damaged data.
+     *
      * [onDone] receives (accepted, refused, skipped) on the main thread.
      */
     fun resendArchive(
         prof: HabitProfile,
         studentName: String,
-        device: String,
         appVersion: String,
         onDone: ((Int, Int, Int) -> Unit)?
     ) {
@@ -795,7 +854,7 @@ internal object FirebaseSync {
 
         for (s in targets) {
             val docPath = "$COLLECTION/" + documentId(prof.id, s.id)
-            val payload = buildArchivePayload(prof, studentName, s, device, appVersion)
+            val payload = buildArchivePayload(prof, studentName, s, appVersion)
             try {
                 client.document(docPath).set(payload, SetOptions.merge())
                     .addOnSuccessListener {
@@ -823,7 +882,6 @@ internal object FirebaseSync {
         prof: HabitProfile,
         studentName: String,
         s: SessionSummary,
-        device: String,
         appVersion: String
     ): HashMap<String, Any> {
         val out = HashMap<String, Any>(32)
@@ -834,16 +892,18 @@ internal object FirebaseSync {
         out["valid_ms"] = s.validMs
         out["face_ratio"] = round4(s.faceRatio)
         out["valid_ratio"] = round4(s.validRatio)
-        if (s.quality.isFinite()) out["quality_mean"] = round2(s.quality)
-        out["device"] = device
-        out["app_version"] = appVersion
+        if (s.qualityCount > 0) out["quality_mean"] = round2(s.quality)
         out["backfilled"] = true
-        // Eligibility can be recomputed honestly: ineligibleReason() looks at the session and at
-        // constants only, never at how many sessions the profile had at the time. Note that the
-        // profile only stores QUALIFYING sessions, so a rejected session cannot be resent at all.
+        out["backfilled_by"] = appVersion
+        // Eligibility CAN be recomputed honestly: ineligibleReason() looks at the session and at the
+        // constants only, never at how many sessions the profile had at the time. The profile only
+        // stores sessions that qualified when they were measured, so reason is normally null here; if
+        // the constants moved since, the rebuilt record says so instead of keeping the old verdict.
+        // The reason column is always written (empty when eligible) so a merge cannot leave a stale
+        // reason sitting next to eligible = true.
         val reason = prof.ineligibleReason(s)
         out["eligible"] = reason == null
-        if (reason != null) out["ineligible_reason"] = reason
+        out["ineligible_reason"] = reason ?: ""
         for (f in 0 until HabitFeature.COUNT) {
             val n = s.count[f]
             if (n > 0) {
