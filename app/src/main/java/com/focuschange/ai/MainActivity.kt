@@ -1518,6 +1518,24 @@ class MainActivity : ComponentActivity() {
                                         }
                                     )
 
+                                    // Two counts, because two different things can be waiting. The queue
+                                    // holds the whole payload of a write the server refused; the profile
+                                    // holds sessions that were never sent at all and can only be rebuilt
+                                    // leaner. One button offers both, so nobody has to know the difference.
+                                    val queuedAgain = FirebaseSync.pendingCount
+                                    val archiveAgain = habitProfile?.let { FirebaseSync.unconfirmedCount(it) }
+                                        ?: 0
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = { resendStoredData() },
+                                            enabled = FirebaseSync.enabled && (queuedAgain + archiveAgain) > 0
+                                        ) {
+                                            Text(
+                                                "Gửi lại ${queuedAgain + archiveAgain} bản ghi đang giữ trong máy"
+                                            )
+                                        }
+                                    }
+
                                     Spacer(Modifier.height(8.dp))
 
                                     Text(
@@ -2433,6 +2451,59 @@ class MainActivity : ComponentActivity() {
                 status = "Không gửi được lên Firebase (${FirebaseSync.lastError}) - " +
                     "số liệu vẫn còn nguyên trong máy."
             }
+        }
+    }
+
+    /**
+     * Offers everything the app still holds to the cloud again: first the queue of writes the server
+     * refused, then the sessions that live only inside this student profile.
+     *
+     * Needed for two reasons. A write the server REFUSES is dropped by the Firestore SDK for good -
+     * its own offline queue only covers a lost connection. And every session recorded so far was
+     * recorded while the database did not exist yet, so without this button the recording week would
+     * have produced nothing but CSV files.
+     */
+    private fun resendStoredData() {
+        if (!FirebaseSync.enabled) {
+            status = "Firebase đang TẮT (${FirebaseSync.disabledReason}): chưa gửi được gì."
+            return
+        }
+        val queued = FirebaseSync.pendingCount
+        val archive = habitProfile?.let { FirebaseSync.unconfirmedCount(it) } ?: 0
+        if (queued + archive == 0) {
+            status = "Không còn gì chờ gửi lại: mọi phiên trong máy đã nằm trên server."
+            return
+        }
+        status = "Đang gửi lại $queued bản ghi bị từ chối và $archive phiên chỉ có trong máy..."
+        FirebaseSync.resendPending { accepted, refused ->
+            val prof = habitProfile
+            if (prof == null) {
+                reportResend(accepted, refused, 0)
+                return@resendPending
+            }
+            // Second step, after the queue: what the queue never saw because the app was not keeping
+            // one yet, or because the write was never attempted.
+            FirebaseSync.resendArchive(
+                prof,
+                studentName,
+                android.os.Build.MODEL,
+                appVersionName()
+            ) { a, r, skipped -> reportResend(accepted + a, refused + r, skipped) }
+        }
+    }
+
+    /**
+     * The honest part of the result. A refused resend is not a failure of the same kind as a lost
+     * one: the payload is still in the phone, so the line says where the data is rather than only
+     * that something went wrong.
+     */
+    private fun reportResend(sent: Int, failed: Int, skipped: Int) {
+        firebaseText = FirebaseSync.statusText()
+        status = if (failed == 0) {
+            "Đã gửi lại $sent bản ghi." + if (skipped > 0) " Bỏ qua $skipped phiên server đã có." else ""
+        } else {
+            "$sent bản ghi vào được, $failed vẫn bị từ chối và còn giữ trong máy " +
+                "(${FirebaseSync.lastPendingError})."
         }
     }
 

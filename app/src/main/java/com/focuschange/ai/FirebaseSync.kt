@@ -1,7 +1,10 @@
 package com.focuschange.ai
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.SetOptions
+import java.io.File
 import java.util.HashMap
 import kotlin.math.roundToInt
 
@@ -136,6 +139,23 @@ internal object FirebaseSync {
     private const val SCHEMA = 1
 
     /**
+     * Name of the send-again queue inside the app private storage. Sessions that the server refused
+     * are written here so the recording week is not thrown away because the database appeared late.
+     */
+    private const val PENDING_FILE = "firebase_pending.txt"
+
+    /**
+     * Cap for that queue. It exists so a write that will ALWAYS be refused (wrong rules, wrong
+     * project) cannot grow the file forever; the oldest records are dropped and counted in
+     * [pendingDropped] rather than the newest ones, because the newest are the ones the teacher
+     * still expects to see.
+     */
+    private const val MAX_PENDING = 300
+
+    /** SharedPreferences key holding the session ids Firestore has already accepted. */
+    private const val SENT_IDS_KEY = "sent_session_ids"
+
+    /**
      * Keys of the 12 features. Taken from [HabitFeature.KEYS] instead of being listed again here:
      * the key names in Firebase and the band column names in the CSV must be one list. Write it
      * twice and the two copies will drift by one character sooner or later, and the cloud record
@@ -212,20 +232,65 @@ internal object FirebaseSync {
         private set
 
     /**
+     * How many documents are waiting in the app for another try. Counted apart from [failedCount]:
+     * a failure that was kept is a different situation from a failure that was lost, and the panel
+     * has to be able to say which one the user is looking at.
+     */
+    @Volatile
+    var pendingCount = 0
+        private set
+
+    /** Records pushed out of the queue by [MAX_PENDING]. Should stay at zero in a normal term. */
+    @Volatile
+    var pendingDropped = 0
+        private set
+
+    @Volatile
+    var lastPendingError = ""
+        private set
+
+    private val pendingLock = Any()
+
+    /** Queued payloads. Every access that can mutate it happens inside [pendingLock]. */
+    private var pending: MutableList<PendingUpload> = ArrayList()
+
+    private var pendingLoaded = false
+
+    /** Session ids accepted by Firestore, keyed by student id. Guards the archive resend. */
+    private val confirmedIds = HashMap<String, MutableSet<Long>>()
+    private var confirmedLoaded = false
+
+    @Volatile
+    private var resending = false
+
+    /** Application context, kept only to reach filesDir and SharedPreferences. */
+    @Volatile
+    private var storage: Context? = null
+
+    /**
      * Attaches to the FirebaseApp that google-services.json's ContentProvider already started.
      * getInstance() throws IllegalStateException when there is no config file: that has to be
      * caught here, because this is the boundary with an external library, not a bug of ours.
      */
     fun start(context: Context) {
-        if (db != null) return
-        try {
-            com.google.firebase.FirebaseApp.initializeApp(context)
-            db = FirebaseFirestore.getInstance()
-            disabledReason = ""
-        } catch (e: Exception) {
-            db = null
-            disabledReason = e.javaClass.simpleName
+        val app = context.applicationContext
+        storage = app
+        loadPending()
+        loadConfirmed()
+        if (db == null) {
+            try {
+                com.google.firebase.FirebaseApp.initializeApp(app)
+                db = FirebaseFirestore.getInstance()
+                disabledReason = ""
+            } catch (e: Exception) {
+                db = null
+                disabledReason = e.javaClass.simpleName
+            }
         }
+        // A queue that survived the app being closed means the database was missing or refusing
+        // writes at the time. Try it again as soon as a client exists, without waiting for a tap:
+        // the booth demo has nobody watching the panel.
+        if (db != null && pendingCount > 0) resendPending(null)
     }
 
     /** Builds the record and sends it. [onResult] runs on the main thread, at the moment the screen text changes. */
@@ -238,19 +303,25 @@ internal object FirebaseSync {
         val payload = buildPayload(r)
         // Deterministic document name from student + session: sending the same session twice (two
         // taps, or Firestore replaying a queued write) overwrites, instead of creating a second record.
-        val docId = documentId(r.studentId, r.summary.id)
+        val docPath = "$COLLECTION/" + documentId(r.studentId, r.summary.id)
         inFlight++
-        client.document("$COLLECTION/$docId").set(payload)
+        client.document(docPath).set(payload)
             .addOnSuccessListener {
                 inFlight--
                 sentCount++
                 lastError = ""
+                markSent(r.studentId, r.summary.id)
+                dropPending(docPath)
                 onResult(true)
             }
             .addOnFailureListener { e ->
                 inFlight--
                 failedCount++
                 lastError = e.javaClass.simpleName
+                // Firestore drops a write the server REFUSED, so the app has to keep its own copy.
+                // This payload is the only place the alert counters, the CSV row count and the band
+                // outcome of this session exist together: none of them is stored in the profile.
+                enqueue(docPath, payload)
                 onResult(false)
             }
     }
@@ -295,6 +366,8 @@ internal object FirebaseSync {
             .addOnFailureListener { e ->
                 heartbeatFailed++
                 lastHeartbeatError = e.javaClass.simpleName
+                // Deliberately NOT queued: a beat means "this student is being measured now".
+                // Resending one an hour later would tell the teacher the opposite of what happened.
                 onResult(false)
             }
     }
@@ -313,15 +386,21 @@ internal object FirebaseSync {
             onResult(false)
             return
         }
-        client.document("$BAND_COLLECTION/${sanitize(r.studentId)}").set(buildBandPayload(r))
+        val docPath = "$BAND_COLLECTION/${sanitize(r.studentId)}"
+        val payload = buildBandPayload(r)
+        client.document(docPath).set(payload)
             .addOnSuccessListener {
                 bandSent++
                 lastBandError = ""
+                dropPending(docPath)
                 onResult(true)
             }
             .addOnFailureListener { e ->
                 bandFailed++
                 lastBandError = e.javaClass.simpleName
+                // Queued like a session record. Re-queueing replaces the older band for the same
+                // student, so the resend always carries the newest range rather than a stale one.
+                enqueue(docPath, payload)
                 onResult(false)
             }
     }
@@ -447,6 +526,336 @@ internal object FirebaseSync {
         return out
     }
 
+    /**
+     * Put one refused payload into the send-again queue. A record already waiting for the SAME
+     * document is replaced, not duplicated: the newest band for a student is the one worth sending,
+     * and two copies of one session would only overwrite each other anyway.
+     */
+    private fun enqueue(docPath: String, payload: HashMap<String, Any>) {
+        val fields = ArrayList<Pair<String, Any>>(payload.size)
+        for (entry in payload.entries) fields.add(entry.key to entry.value)
+        val record = PendingUpload(docPath, fields)
+        synchronized(pendingLock) {
+            val at = indexOfLocked(docPath)
+            if (at >= 0) pending[at] = record else pending.add(record)
+            var dropped = 0
+            while (pending.size > MAX_PENDING) {
+                pending.removeAt(0)
+                dropped++
+            }
+            if (dropped > 0) pendingDropped += dropped
+            pendingCount = pending.size
+        }
+        writeQueue()
+    }
+
+    /** Firestore accepted this document, so it must not be sent a second time. */
+    private fun dropPending(docPath: String) {
+        val removed = synchronized(pendingLock) {
+            val at = indexOfLocked(docPath)
+            if (at < 0) false else {
+                pending.removeAt(at)
+                pendingCount = pending.size
+                true
+            }
+        }
+        if (removed) writeQueue()
+    }
+
+    private fun indexOfLocked(docPath: String): Int {
+        for (i in pending.indices) {
+            if (pending[i].docPath == docPath) return i
+        }
+        return -1
+    }
+
+    private fun writeQueue() {
+        val ctx = storage ?: return
+        val text = synchronized(pendingLock) { PendingUploadStore.encode(pending) }
+        try {
+            File(ctx.filesDir, PENDING_FILE).writeText(text)
+        } catch (e: Exception) {
+            lastPendingError = e.javaClass.simpleName
+        }
+    }
+
+    private fun loadPending() {
+        val ctx = storage ?: return
+        synchronized(pendingLock) {
+            if (pendingLoaded) return
+            pendingLoaded = true
+            try {
+                val f = File(ctx.filesDir, PENDING_FILE)
+                if (f.exists()) {
+                    val restored = PendingUploadStore.decode(f.readText())
+                    if (restored.isNotEmpty()) pending = ArrayList(restored)
+                }
+            } catch (e: Exception) {
+                lastPendingError = e.javaClass.simpleName
+            }
+            pendingCount = pending.size
+        }
+    }
+
+    /**
+     * Send everything the queue holds. [onDone] receives (accepted, refused) once every document of
+     * this batch has answered; it runs on the main thread, like the Firestore callbacks.
+     *
+     * A record leaves the queue only when the server accepts it, so a second refusal keeps the data
+     * for a third try. That is the whole point of the queue: the SDK has already forgotten the write.
+     */
+    fun resendPending(onDone: ((Int, Int) -> Unit)?) {
+        loadPending()
+        val batch = synchronized(pendingLock) { ArrayList(pending) }
+        val client = db
+        if (batch.isEmpty() || client == null) {
+            onDone?.invoke(0, batch.size)
+            return
+        }
+        if (resending) return
+        resending = true
+        var answered = 0
+        var accepted = 0
+        var refused = 0
+
+        // Local because the three counters above belong to this batch only.
+        fun finishBatch() {
+            if (answered < batch.size) return
+            resending = false
+            onDone?.invoke(accepted, refused)
+        }
+
+        for (rec in batch) {
+            val payload = HashMap<String, Any>(rec.fields.size)
+            for ((key, value) in rec.fields) payload[key] = value
+            try {
+                client.document(rec.docPath).set(payload)
+                    .addOnSuccessListener {
+                        accepted++
+                        markSentFromPayload(rec)
+                        dropPending(rec.docPath)
+                        answered++
+                        finishBatch()
+                    }
+                    .addOnFailureListener { e ->
+                        refused++
+                        lastPendingError = e.javaClass.simpleName
+                        answered++
+                        finishBatch()
+                    }
+            } catch (e: Exception) {
+                refused++
+                lastPendingError = e.javaClass.simpleName
+                answered++
+                finishBatch()
+            }
+        }
+    }
+
+    /** Session documents carry their own student and session id, so the queue can confirm itself. */
+    private fun markSentFromPayload(rec: PendingUpload) {
+        if (!rec.docPath.startsWith("$COLLECTION/")) return
+        var studentId: String? = null
+        var sessionId = -1L
+        for ((key, value) in rec.fields) {
+            if (key == "student_id") studentId = value as? String
+            else if (key == "session_id") sessionId = (value as? Number)?.toLong() ?: -1L
+        }
+        if (studentId != null && sessionId >= 0L) markSent(studentId, sessionId)
+    }
+
+    private fun prefs(): SharedPreferences? =
+        storage?.getSharedPreferences("firebase_sync", Context.MODE_PRIVATE)
+
+    /**
+     * Which session ids the cloud already holds. Needed by [resendArchive]: without it, one press of
+     * the button would rewrite every session of every student on the server, and rewriting with a
+     * rebuilt (leaner) payload is exactly how a good record could be damaged.
+     */
+    private fun loadConfirmed() {
+        if (confirmedLoaded) return
+        val p = prefs() ?: return
+        confirmedLoaded = true
+        try {
+            val raw = p.getString(SENT_IDS_KEY, "") ?: ""
+            for (token in raw.split(';')) {
+                val cut = token.indexOf(':')
+                if (cut <= 0) continue
+                val id = token.substring(0, cut)
+                for (value in token.substring(cut + 1).split(',')) {
+                    val sessionId = value.toLongOrNull() ?: continue
+                    getOrCreate(id).add(sessionId)
+                }
+            }
+        } catch (e: Exception) {
+            lastPendingError = e.javaClass.simpleName
+        }
+    }
+
+    private fun getOrCreate(studentId: String): MutableSet<Long> {
+        val existing = confirmedIds[studentId]
+        if (existing != null) return existing
+        val created = HashSet<Long>()
+        confirmedIds[studentId] = created
+        return created
+    }
+
+    private fun markSent(studentId: String, sessionId: Long) {
+        val isNew = synchronized(confirmedIds) { getOrCreate(studentId).add(sessionId) }
+        if (isNew) saveConfirmed()
+    }
+
+    private fun isConfirmed(studentId: String, sessionId: Long): Boolean =
+        synchronized(confirmedIds) { confirmedIds[studentId]?.contains(sessionId) == true }
+
+    private fun saveConfirmed() {
+        val p = prefs() ?: return
+        val sb = StringBuilder()
+        synchronized(confirmedIds) {
+            for ((id, set) in confirmedIds) {
+                if (set.isEmpty()) continue
+                if (sb.isNotEmpty()) sb.append(';')
+                sb.append(id).append(':')
+                var first = true
+                for (value in set) {
+                    if (!first) sb.append(',')
+                    sb.append(value)
+                    first = false
+                }
+            }
+        }
+        try {
+            p.edit().putString(SENT_IDS_KEY, sb.toString()).apply()
+        } catch (e: Exception) {
+            lastPendingError = e.javaClass.simpleName
+        }
+    }
+
+    /** Documents still waiting in the queue, so the archive resend does not race with them. */
+    private fun queuedPaths(): Set<String> = synchronized(pendingLock) {
+        val out = HashSet<String>(pending.size)
+        for (rec in pending) out.add(rec.docPath)
+        out
+    }
+
+    /**
+     * Archived sessions the cloud does not have yet: not confirmed by a past send, and not already
+     * waiting in the queue. Shared by [resendArchive] and [unconfirmedCount] so the number on the
+     * button and the work the button does cannot disagree with each other.
+     */
+    private fun archiveTargets(prof: HabitProfile): List<SessionSummary> {
+        loadConfirmed()
+        loadPending()
+        val queued = queuedPaths()
+        val targets = ArrayList<SessionSummary>()
+        for (s in prof.sessions) {
+            if (isConfirmed(prof.id, s.id)) continue
+            if (queued.contains("$COLLECTION/" + documentId(prof.id, s.id))) continue
+            targets.add(s)
+        }
+        return targets
+    }
+
+    /** Shown on the send-again button: how much the app still holds locally. */
+    fun unconfirmedCount(prof: HabitProfile): Int = archiveTargets(prof).size
+
+    /**
+     * Rebuild and send the sessions this device remembers but the cloud never received.
+     *
+     * The profile file keeps every qualifying session, so the averages can be recovered exactly.
+     * What cannot be recovered: the alert counters, the CSV row count, the frame rate and the
+     * end-of-session band outcome, because those were never written to the file at all. That is why
+     * this path MERGES instead of overwriting (a rebuild must not erase columns a live send already
+     * placed there) and why each rebuilt record says `backfilled = true`.
+     *
+     * [onDone] receives (accepted, refused, skipped) on the main thread.
+     */
+    fun resendArchive(
+        prof: HabitProfile,
+        studentName: String,
+        device: String,
+        appVersion: String,
+        onDone: ((Int, Int, Int) -> Unit)?
+    ) {
+        val client = db
+        val targets = archiveTargets(prof)
+        val skipped = prof.sessions.size - targets.size
+        if (client == null || targets.isEmpty()) {
+            onDone?.invoke(0, 0, skipped)
+            return
+        }
+        var answered = 0
+        var accepted = 0
+        var refused = 0
+
+        fun finishBatch() {
+            if (answered < targets.size) return
+            onDone?.invoke(accepted, refused, skipped)
+        }
+
+        for (s in targets) {
+            val docPath = "$COLLECTION/" + documentId(prof.id, s.id)
+            val payload = buildArchivePayload(prof, studentName, s, device, appVersion)
+            try {
+                client.document(docPath).set(payload, SetOptions.merge())
+                    .addOnSuccessListener {
+                        accepted++
+                        markSent(prof.id, s.id)
+                        answered++
+                        finishBatch()
+                    }
+                    .addOnFailureListener { e ->
+                        refused++
+                        lastPendingError = e.javaClass.simpleName
+                        answered++
+                        finishBatch()
+                    }
+            } catch (e: Exception) {
+                refused++
+                lastPendingError = e.javaClass.simpleName
+                answered++
+                finishBatch()
+            }
+        }
+    }
+
+    private fun buildArchivePayload(
+        prof: HabitProfile,
+        studentName: String,
+        s: SessionSummary,
+        device: String,
+        appVersion: String
+    ): HashMap<String, Any> {
+        val out = HashMap<String, Any>(32)
+        out["schema"] = SCHEMA
+        out["student_id"] = prof.id
+        out["student_name"] = studentName
+        out["session_id"] = s.id
+        out["valid_ms"] = s.validMs
+        out["face_ratio"] = round4(s.faceRatio)
+        out["valid_ratio"] = round4(s.validRatio)
+        if (s.quality.isFinite()) out["quality_mean"] = round2(s.quality)
+        out["device"] = device
+        out["app_version"] = appVersion
+        out["backfilled"] = true
+        // Eligibility can be recomputed honestly: ineligibleReason() looks at the session and at
+        // constants only, never at how many sessions the profile had at the time. Note that the
+        // profile only stores QUALIFYING sessions, so a rejected session cannot be resent at all.
+        val reason = prof.ineligibleReason(s)
+        out["eligible"] = reason == null
+        if (reason != null) out["ineligible_reason"] = reason
+        for (f in 0 until HabitFeature.COUNT) {
+            val n = s.count[f]
+            if (n > 0) {
+                val key = FEATURE_KEYS[f]
+                out["mean_$key"] = round2(s.mean[f])
+                out["std_$key"] = round2(s.std[f])
+                out["n_$key"] = n
+            }
+        }
+        return out
+    }
+
     private fun round2(v: Float): Double = roundTo(v, 100f)
 
     private fun round4(v: Float): Double = roundTo(v, 10000f)
@@ -485,6 +894,14 @@ internal object FirebaseSync {
         if (bandFailed > 0L) {
             sb.append(", ").append(bandFailed).append(" thất bại")
             if (lastBandError.isNotEmpty()) sb.append(" (").append(lastBandError).append(')')
+        }
+        // The queue is printed even when it is the only thing to report: an empty cloud table plus a
+        // queue of forty sessions means the data is safe at home, which is a different message from
+        // "nothing was measured".
+        if (pendingCount > 0 || pendingDropped > 0) {
+            sb.append(" - chờ gửi lại ").append(pendingCount)
+            if (lastPendingError.isNotEmpty()) sb.append(" (").append(lastPendingError).append(')')
+            if (pendingDropped > 0) sb.append(", tràn hàng đợi mất ").append(pendingDropped)
         }
         return sb.toString()
     }
