@@ -298,6 +298,13 @@ class MainActivity : ComponentActivity() {
         const val BFR_FURROW_RATIO = 0.88f
         const val BFR_SUSTAIN_MS = 2_000L
         const val MAR_YAWN = 0.55f
+
+        /**
+         * jawOpen blendshape that also counts as a yawn. Named as a constant because the sensitivity
+         * control now scales it together with MAR; leaving it a bare literal would make the two halves
+         * of the same rule respond to the slider differently.
+         */
+        const val JAW_OPEN_YAWN = 0.55f
         const val YAWN_MIN_MS = 1_200L
         const val YAWN_WINDOW_MS = 5L * 60L * 1000L
 
@@ -4082,8 +4089,13 @@ class MainActivity : ComponentActivity() {
             }
 
             // ---- Micro-expressions: frown (BFR) and yawn (MAR) ----
-            val furrowNow = abs(yawDeg) < HEAD_FRONTAL_YAW_DEG &&
-                    bfr < baselineBfr * BFR_FURROW_RATIO
+            // Both respond to the sensitivity slider, like the timing and head-angle thresholds do.
+            // Before this the slider changed how long a movement had to last but never how small a
+            // mouth opening or brow drop was accepted, which is the half a judge asks about.
+            val furrowTrigger = MuscleSensitivity.furrowRatio(sensLevel, BFR_FURROW_RATIO)
+            val furrowWindow = MuscleSensitivity.furrowYawWindow(sensLevel, HEAD_FRONTAL_YAW_DEG)
+            val furrowNow = abs(yawDeg) < furrowWindow &&
+                    bfr < baselineBfr * furrowTrigger
             if (furrowNow) {
                 if (furrowStartMs == 0L) {
                     furrowStartMs = nowMs
@@ -4096,7 +4108,9 @@ class MainActivity : ComponentActivity() {
 
             // A wide open mouth (blendshape jawOpen) counts as a yawn too: faster and firmer than geometry.
             val jawOpen = if (blend != null && blend.size > 4) blend[4] else 0f
-            val yawnNow = mar > thrMar || jawOpen > 0.55f
+            val marTrigger = MuscleSensitivity.mouthThreshold(sensLevel, thrMar)
+            val jawTrigger = MuscleSensitivity.mouthThreshold(sensLevel, JAW_OPEN_YAWN)
+            val yawnNow = mar > marTrigger || jawOpen > jawTrigger
             if (yawnNow) {
                 if (yawnStartMs == 0L) {
                     yawnStartMs = nowMs
@@ -5655,7 +5669,7 @@ class MainActivity : ComponentActivity() {
         row(
             String.format(
                 Locale.US,
-                "Tăng cường ảnh: %s | Độ nhạy: %s | Âm báo mức %d.",
+                "Tăng cường ảnh: %s | Độ nhạy: %s (thời gian, góc đầu, ngáp, nhíu mày) | Âm báo mức %d.",
                 if (enhanceMode == 0) "tự động" else "tắt",
                 when (sensLevel) { 0 -> "thấp"; 2 -> "cao"; else -> "vừa" },
                 soundMode
@@ -5752,7 +5766,7 @@ class MainActivity : ComponentActivity() {
         line("Lệch nhìn dọc", thrGazeV, GAZE_V_DRIFT, "tỉ lệ trên nửa bề cao mống mắt")
         line("Chớp dưới mức", thrBlinkLow, LOW_BLINK_BPM, "bpm", "/phút")
         line("Chớp trên mức", thrBlinkHigh, HIGH_BLINK_BPM, "bpm", "/phút")
-        line("Ngáp (MAR)", thrMar, MAR_YAWN, "độ mở miệng so với bề rộng")
+        line("Ngáp (MAR)", thrMar, MAR_YAWN, "độ mở miệng so với bề rộng, rồi nhân độ nhạy bên dưới")
         line("Mất tập trung 60 s", INATTENTION_RATIO_ALERT, INATTENTION_RATIO_ALERT, "tỉ lệ thời gian ngoài tầm nhìn", "%")
 
         appendLine()
@@ -5760,6 +5774,21 @@ class MainActivity : ComponentActivity() {
         appendLine(String.format(Locale.US, "  Nhắm mắt liên tục %.2f s thì báo buồn ngủ", DROWSY_CLOSURE_MS / 1000f))
         appendLine(String.format(Locale.US, "  P70/P80: độ mở <= %.2f / %.2f so với đường cơ sở", PERCLOS_P70_OPEN, PERCLOS_P80_OPEN))
         appendLine(String.format(Locale.US, "  Ngưỡng nheo mắt %.0f%%, lệch hai mắt %.0f%%", EyeEngine.SQUINT_ALERT_PCT, EyeEngine.ASYM_ALERT_PCT))
+        // The numbers the muscle features are actually compared against, with the slider already applied.
+        // Printed separately from the table above because that table attributes a changed value to the
+        // personal profile, and a sensitivity multiplier is not the profile's doing.
+        appendLine(
+            String.format(
+                Locale.US,
+                "  Độ nhạy %s đang áp dụng cho cơ mặt: ngáp khi MAR > %.2f hoặc há miệng > %.2f; " +
+                    "nhíu mày khi bề rộng lông mày < %.2f lần đường cơ sở, đầu nghiêng tối đa %.0f độ.",
+                when (sensLevel) { 0 -> "thấp"; 2 -> "cao"; else -> "vừa" },
+                MuscleSensitivity.mouthThreshold(sensLevel, thrMar),
+                MuscleSensitivity.mouthThreshold(sensLevel, JAW_OPEN_YAWN),
+                MuscleSensitivity.furrowRatio(sensLevel, BFR_FURROW_RATIO),
+                MuscleSensitivity.furrowYawWindow(sensLevel, HEAD_FRONTAL_YAW_DEG)
+            )
+        )
         // Converting frame counts into seconds must use the real cadence of the machine. Assuming 30 FPS, a
         // phone running at 18 FPS would print "2 s" while the student actually sat there for 3.3 s.
         val calFps = fpsEma

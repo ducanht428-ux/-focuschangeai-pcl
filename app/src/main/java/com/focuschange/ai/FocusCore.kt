@@ -440,3 +440,36 @@ internal class WindowRatio(
     /** Like [percentOrNull] but treats "not enough samples" as 0% - for scoring, never for display. */
     fun percent(nowMs: Long): Float = percentOrNull(nowMs) ?: 0f
 }
+
+/**
+ * What the sensitivity control does to the mouth and brow comparisons. Level 1 is the documented
+ * default and multiplies by exactly 1; 0 demands a bigger movement, 2 accepts a smaller one.
+ *
+ * Applied where the comparison happens instead of folded into the stored personal threshold, so
+ * moving the slider cannot rewrite what a profile learned, and the threshold table can still show
+ * both the base value and the value in force.
+ */
+internal object MuscleSensitivity {
+
+    fun factor(level: Int): Float = when (level) {
+        0 -> 1.15f
+        2 -> 0.85f
+        else -> 1f
+    }
+
+    /** Mouth-open trigger (MAR, jawOpen): a smaller opening counts at a higher level. */
+    fun mouthThreshold(level: Int, base: Float): Float = base * factor(level)
+
+    /**
+     * Brow trigger, expressed as the fraction of the person's baseline brow width that still counts as
+     * relaxed. A furrow is detected below it, so a higher level has to raise the number: 0.88 becomes
+     * 0.90, meaning a 10% drop already reads as furrowed instead of 12%.
+     */
+    fun furrowRatio(level: Int, base: Float): Float = 1f - (1f - base) * factor(level)
+
+    /**
+     * How far off-frontal the head may be and still have a furrow counted. This one is an acceptance
+     * window, not a trigger, so it takes the inverse: level 2 widens it, level 0 narrows it.
+     */
+    fun furrowYawWindow(level: Int, baseDeg: Float): Float = baseDeg / factor(level)
+}
