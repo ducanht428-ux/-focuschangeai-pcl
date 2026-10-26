@@ -1,6 +1,7 @@
 package com.focuschange.ai
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.Context
 import android.content.pm.PackageManager
@@ -10,6 +11,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -5721,7 +5724,21 @@ class MainActivity : ComponentActivity() {
         status = "Kiểm tra trước trình diễn: ${if (fails > 0) "$fails mục không đạt" else "đạt"}."
     }
 
-    /** Items independent of the frame cadence: permissions, model, free space, battery, alert sounds. */
+    /**
+     * Whether the phone currently holds a network that claims internet capability. ACCESS_NETWORK_STATE
+     * is declared in the manifest, so the suppression only covers the one call Android actually gates.
+     * This says a route exists - it does not say the Firestore backend answers, and that part is left
+     * to the send counters below.
+     */
+    @SuppressLint("MissingPermission")
+    private fun networkHasRoute(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val active = cm.activeNetwork ?: return false
+        return cm.getNetworkCapabilities(active)
+            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    }
+
+    /** Items independent of the frame cadence: permissions, model, free space, network, battery, sounds. */
     private fun preflightStaticChecks(emit: (Int, String) -> Unit) {
         var kind = 0
 
@@ -5773,6 +5790,46 @@ class MainActivity : ComponentActivity() {
                     "Thư mục dữ liệu %s: còn %d MB, ghi được bình thường.",
                     dir.name, freeMb
                 )
+            )
+        }
+
+        // The upload path, checked the way everything else here is checked: by reading what the phone
+        // actually holds rather than asserting the cloud is fine. A session that ends with no network
+        // is not lost - the SDK keeps it - but the person filming needs to know why the panel shows a
+        // send that never completes, and why the app must not be closed before the network returns.
+        val online = networkHasRoute()
+        if (!FirebaseSync.enabled) {
+            kind = 2
+            row(
+                "Firebase đang TẮT (${FirebaseSync.disabledReason}): không có bản ghi nào đi được, " +
+                    "số liệu chỉ nằm trong máy."
+            )
+        } else if (!online) {
+            kind = 2
+            row(
+                "Máy CHƯA có mạng: đo vẫn chạy và CSV vẫn ghi, nhưng phiên kết thúc lúc này nằm lại trong " +
+                    "máy, bảng điều khiển sẽ treo ở 'đang gửi'. Đừng tắt app trước khi có mạng lại."
+            )
+        } else if (FirebaseSync.pendingCount > 0) {
+            kind = 1
+            row(
+                String.format(
+                    Locale.US,
+                    "Có mạng, Firebase bật, nhưng còn %d bản ghi chờ gửi lại%s.",
+                    FirebaseSync.pendingCount,
+                    if (FirebaseSync.lastPendingError.isEmpty()) ""
+                    else " (server từ chối gần nhất: ${FirebaseSync.lastPendingError})"
+                )
+            )
+        } else {
+            kind = 0
+            row("Có mạng, Firebase bật, hàng đợi gửi lại trống.")
+        }
+        if (FirebaseSync.pendingDropped > 0) {
+            kind = 2
+            row(
+                "Hàng đợi từng TRÀN: đã bỏ ${FirebaseSync.pendingDropped} bản ghi cũ nhất. " +
+                    "Số liệu trong habit_*.json vẫn dựng lại và gửi lại được bằng nút Gửi lại."
             )
         }
 
