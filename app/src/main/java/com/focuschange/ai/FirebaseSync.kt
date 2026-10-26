@@ -263,6 +263,9 @@ internal object FirebaseSync {
     @Volatile
     private var resending = false
 
+    /** True while one batch of records is still waiting for the backend. */
+    val sendingNow: Boolean get() = resending
+
     /** Application context, kept only to reach filesDir and SharedPreferences. */
     @Volatile
     private var storage: Context? = null
@@ -843,12 +846,21 @@ internal object FirebaseSync {
             onDone?.invoke(0, 0, skipped)
             return
         }
+        // Same lock as the queue resend. Without it a second tap on the button put a whole second
+        // copy of every session in the air: the deterministic document id means nothing is corrupted,
+        // but the free plan counts each of those writes.
+        if (resending) {
+            onDone?.invoke(0, 0, skipped)
+            return
+        }
+        resending = true
         var answered = 0
         var accepted = 0
         var refused = 0
 
         fun finishBatch() {
             if (answered < targets.size) return
+            resending = false
             onDone?.invoke(accepted, refused, skipped)
         }
 

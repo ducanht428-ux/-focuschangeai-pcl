@@ -489,7 +489,7 @@ class MainActivity : ComponentActivity() {
     private var fatigueText by mutableStateOf("--")
     private var signalText by mutableStateOf("--")
     private var seiHistory by mutableStateOf(emptyList<Int>())
-    private var soundMode by mutableStateOf(2) // 0 off, 1 important alerts only, 2 full
+    private var soundMode by mutableIntStateOf(2) // 0 off, 1 important alerts only, 2 full
 
     private var studentName by mutableStateOf("")
     private var habitText by mutableStateOf("--")
@@ -497,10 +497,10 @@ class MainActivity : ComponentActivity() {
     private var habitHistoryText by mutableStateOf("")
     private var bandText by mutableStateOf("")
     private var eyeDetailText by mutableStateOf("--")
-    private var sensitivityUi by mutableStateOf(1)
-    private var enhanceUi by mutableStateOf(0)
+    private var sensitivityUi by mutableIntStateOf(1)
+    private var enhanceUi by mutableIntStateOf(0)
     private var cameraMirrored by mutableStateOf(true)
-    private var cameraChoiceUi by mutableStateOf(0)
+    private var cameraChoiceUi by mutableIntStateOf(0)
     private var imageDetailText by mutableStateOf("--")
     private var habitLearnUi by mutableStateOf(true)
     private var showAddStudent by mutableStateOf(false)
@@ -2046,7 +2046,19 @@ class MainActivity : ComponentActivity() {
         cameraChoice = next
         cameraChoiceUi = next
         if (!cameraStarted) {
-            status = "Đã chọn ống kính ${cameraChoiceName(next)} - camera sẽ mở cùng khung hình."
+            // Getting here with no camera bound means the previous bind was refused (the lens chosen
+            // then does not exist on this phone) or the model failed to load. Nothing recovers by
+            // itself: with no camera bound there is no next frame, so the old wording here - "the
+            // camera opens with the next frame" - promised something that can never happen. Bind now,
+            // with the lens that was just chosen.
+            val view = previewView
+            if (view == null) {
+                status = "Đã chọn ống kính ${cameraChoiceName(next)} - chưa có khung hình để gắn camera vào."
+            } else if (faceLandmarker == null) {
+                status = "Model chưa nạp được, nên camera không mở. Tắt app rồi mở lại."
+            } else {
+                checkCameraPermission(view)
+            }
             return
         }
         cameraStarted = false
@@ -2504,6 +2516,12 @@ class MainActivity : ComponentActivity() {
         val archive = habitProfile?.let { FirebaseSync.unconfirmedCount(it) } ?: 0
         if (queued + archive == 0) {
             status = "Không còn gì chờ gửi lại: mọi phiên trong máy đã nằm trên server."
+            return
+        }
+        if (FirebaseSync.sendingNow) {
+            // Say it out loud instead of starting a second batch that would only be refused by the
+            // guard in FirebaseSync and come back reading "0 records sent".
+            status = "Một đợt gửi lại đang chờ server trả lời - bấm lại sau khi nó xong."
             return
         }
         status = "Đang gửi lại $queued bản ghi bị từ chối và $archive phiên chỉ có trong máy..."
