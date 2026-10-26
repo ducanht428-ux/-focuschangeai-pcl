@@ -38,7 +38,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.work:work-runtime-ktx:2.10.0")
+    implementation(libs.androidx.work.runtime.ktx)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
@@ -55,13 +55,18 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
-    implementation("com.google.mediapipe:tasks-vision:0.10.26")
+    implementation(libs.mediapipe.tasks.vision)
 
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.firestore)
 
-    implementation("androidx.camera:camera-core:1.4.2")
-    implementation("androidx.camera:camera-camera2:1.4.2")
-    implementation("androidx.camera:camera-lifecycle:1.4.2")
-    implementation("androidx.camera:camera-view:1.4.2")
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+
+    // camera-view only asks for appcompat 1.1.0, and that old appcompat pins fragment 1.1.0.
+    // androidx.activity 1.8 refuses to run result launchers against a fragment that old, so the
+    // version has to be stated here rather than left to the transitive pull.
+    implementation(libs.androidx.fragment)
 }
