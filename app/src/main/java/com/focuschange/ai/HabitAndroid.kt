@@ -33,6 +33,9 @@ internal fun SessionSummary.toJson(): JSONObject {
     for (c in count) n.put(c)
     o.put("n", n)
     o.put("qn", qualityCount)
+    o.put("bi", bandIn)
+    o.put("bb", bandBelow)
+    o.put("ba", bandAbove)
     return o
 }
 
@@ -56,7 +59,12 @@ internal fun SessionSummary.Companion.fromJson(o: JSONObject): SessionSummary? {
             // Files written before qn existed have no count stored. A session can only be IN the
             // profile if it passed the quality bar, so a stored positive mean is proof enough that
             // samples existed; guessing 0 here would blank the quality column for every old profile.
-            qualityCount = o.optInt("qn", if (o.optDouble("q", 0.0) > 0.0) 1 else 0)
+            qualityCount = o.optInt("qn", if (o.optDouble("q", 0.0) > 0.0) 1 else 0),
+            // Old files have no band counts. 0 samples is what actually happened - the session was
+            // never scored against a band - and the day table reads that as "no data", never "0%".
+            bandIn = o.optInt("bi", 0),
+            bandBelow = o.optInt("bb", 0),
+            bandAbove = o.optInt("ba", 0)
         )
     } catch (e: Exception) {
         Log.w("HabitProfile", "Bỏ qua phiên lỗi định dạng", e)

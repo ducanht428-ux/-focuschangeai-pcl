@@ -39,6 +39,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -67,6 +69,7 @@ import java.io.File
 import org.json.JSONObject
 import org.json.JSONArray
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -517,7 +520,7 @@ class MainActivity : ComponentActivity() {
 
     // ---------------- Extended control panel ----------------
     // 0 = monitoring parameters, 1 = demo preparation, 2 = indices and thresholds,
-    // 3 = explanation for the judges, 4 = demo script.
+    // 3 = explanation for the judges, 4 = demo script, 5 = per-day rollup of the habit profile.
     private var panelTab by mutableIntStateOf(0)
 
     private var preflightRunning by mutableStateOf(false)
@@ -537,6 +540,14 @@ class MainActivity : ComponentActivity() {
     private var csvTailLines by mutableStateOf(emptyList<String>())
     private var csvTailNote by mutableStateOf("")
     private var timelineMarks by mutableStateOf(emptyList<Pair<Float, Int>>())
+
+    /**
+     * Per-day rollup shown on the "Diễn biến" tab. Rebuilt by refreshPanelExtras() rather than read
+     * while composing, because habitProfile is a plain var: the list would otherwise be a snapshot of
+     * whenever the last unrelated recomposition happened.
+     */
+    private var rollupDays by mutableIntStateOf(7)
+    private var rollupRows by mutableStateOf(emptyList<HabitProfile.DayRollup>())
 
     // Latest 60-second event line: one strip per type, newest point on the right.
     private class TimedEvent(val second: Long, val band: Int)
@@ -1348,10 +1359,22 @@ class MainActivity : ComponentActivity() {
 
                             Spacer(Modifier.height(10.dp))
 
-                            // ---- Control panel: pick one of the five frames ----
-                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                            // ---- Control panel: pick one of the six frames ----
+                            Row(
+                                Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
                                 PanelTabs.forEachIndexed { index, title ->
-                                    TextButton(onClick = { panelTab = index }) {
+                                    TextButton(
+                                        onClick = {
+                                            panelTab = index
+                                            // The day table would otherwise wait up to a second for the
+                                            // throttled HUD pass, which feels broken on a tap.
+                                            if (index == 5) {
+                                                rollupRows = buildRollupRows()
+                                            }
+                                        }
+                                    ) {
                                         Text(
                                             text = if (panelTab == index) "▸ $title" else title,
                                             color = if (panelTab == index) {
@@ -1698,6 +1721,168 @@ class MainActivity : ComponentActivity() {
                                         ),
                                         style = MaterialTheme.typography.bodySmall
                                     )
+                                }
+
+                                5 -> {
+                                    Text(
+                                        "Diễn biến theo ngày của hồ sơ đang dùng",
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        ROLLUP_RANGES.forEach { d ->
+                                            TextButton(
+                                                onClick = {
+                                                    rollupDays = d
+                                                    rollupRows = buildRollupRows()
+                                                }
+                                            ) {
+                                                Text(
+                                                    text = if (rollupDays == d) "▸ $d ngày" else "$d ngày",
+                                                    color = if (rollupDays == d) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    val rows = rollupRows
+                                    if (rows.isEmpty()) {
+                                        Text(
+                                            "Chưa có phiên nào được lưu trên máy này, hoặc hồ sơ đang " +
+                                                "chọn chưa có phiên nào.",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    } else {
+                                        Text(
+                                            "Mỗi cột là một ngày. SEI trung bình của ngày = trung bình " +
+                                                "điểm SEI của các phiên trong ngày đó; ngày bỏ trống là " +
+                                                "ngày app không đo.",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        Canvas(Modifier.fillMaxWidth().height(56.dp)) {
+                                            val cells = rollupRows
+                                            if (cells.isEmpty()) return@Canvas
+
+                                            val step = size.width / cells.size
+                                            for (i in cells.indices) {
+                                                val x = i * step + step * 0.18f
+                                                val r = cells[i]
+                                                if (r.sessions == 0 || r.seiMean.isNaN()) {
+                                                    // A day with sessions but no SEI sample still gets a
+                                                    // stub: "not measured" must not look like "no data at all".
+                                                    if (r.sessions > 0) {
+                                                        drawLine(
+                                                            color = Color.Gray.copy(alpha = 0.45f),
+                                                            start = Offset(x, size.height),
+                                                            end = Offset(x, size.height * 0.9f),
+                                                            strokeWidth = step * 0.64f
+                                                        )
+                                                    }
+                                                    continue
+                                                }
+                                                val v = r.seiMean.coerceIn(0f, 100f)
+                                                drawLine(
+                                                    color = seiColorOf(v.roundToInt()),
+                                                    start = Offset(x, size.height),
+                                                    end = Offset(x, size.height - size.height * v / 100f),
+                                                    strokeWidth = step * 0.64f
+                                                )
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(4.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            Text(
+                                                "Ngày",
+                                                Modifier.width(48.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Text(
+                                                "Phiên hợp lệ",
+                                                Modifier.weight(1f),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Text(
+                                                "SEI",
+                                                Modifier.width(36.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Text(
+                                                "Ngoài dải",
+                                                Modifier.width(52.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        val dayFmt = java.text.SimpleDateFormat("dd/MM", Locale.US)
+                                        for (i in rows.indices.reversed()) {
+                                            val r = rows[i]
+                                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Text(
+                                                    dayFmt.format(java.util.Date(r.dayStartMs)),
+                                                    Modifier.width(48.dp),
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                                Text(
+                                                    text = if (r.sessions == 0) {
+                                                        "không đo"
+                                                    } else {
+                                                        String.format(
+                                                            Locale.US,
+                                                            "%d phiên - %d phút - %d/%d có SEI",
+                                                            r.sessions,
+                                                            r.validMs / 60000L,
+                                                            r.seiSessions,
+                                                            r.sessions
+                                                        )
+                                                    },
+                                                    Modifier.weight(1f),
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                                Text(
+                                                    text = if (r.seiMean.isNaN()) {
+                                                        "--"
+                                                    } else {
+                                                        "${r.seiMean.roundToInt()}"
+                                                    },
+                                                    Modifier.width(36.dp),
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = if (r.seiMean.isNaN()) {
+                                                        Color.Gray
+                                                    } else {
+                                                        seiColorOf(r.seiMean.coerceIn(0f, 100f).roundToInt())
+                                                    }
+                                                )
+                                                Text(
+                                                    text = if (r.outsidePct.isNaN()) {
+                                                        "--"
+                                                    } else {
+                                                        String.format(Locale.US, "%.0f%%", r.outsidePct)
+                                                    },
+                                                    Modifier.width(52.dp),
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+
+                                        Text(
+                                            "Cột \"Ngoài dải\" là tỉ lệ khung hình rơi ra khỏi khoảng quen " +
+                                                "thuộc của chính em đó, gộp mọi chỉ số có dải. Hồ sơ chỉ giữ " +
+                                                "${HabitConfig.MAX_SESSIONS} phiên gần nhất, nên cửa sổ 30 ngày " +
+                                                "có thể thiếu; các phiên lưu trước bản này chưa có số liệu dải " +
+                                                "nên hiện -- chứ không phải 0%. Một ngày có vài phiên chưa phải " +
+                                                "là xu hướng.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2364,6 +2549,9 @@ class MainActivity : ComponentActivity() {
 
         val session = HabitSession(System.currentTimeMillis())
         habitSession = session
+        // From this frame on the run is worth protecting: the process stays at foreground
+        // importance and the student gets one tap to come back if they leave the screen.
+        MonitorService.start(applicationContext)
 
         // Records the RAW base EAR of this session (before blending) so it cannot amplify itself.
         if (habitLearnEnabled) {
@@ -2454,6 +2642,7 @@ class MainActivity : ComponentActivity() {
         val bands = session?.bandOutcomes() ?: emptyList()
         commitHabitSession()
         habitSession = null
+        MonitorService.stop(applicationContext)
         if (summary != null) uploadSessionToCloud(summary, bands)
     }
 
@@ -5164,6 +5353,9 @@ class MainActivity : ComponentActivity() {
                 Log.w(TAG, "Không lưu được phiên khi dừng", e)
             }
         }
+        // Leaving the screen ended the measurement above, so the session badge must go with it:
+        // an ongoing notification for a run that is already closed would claim we are still measuring.
+        MonitorService.stop(applicationContext)
         super.onStop()
     }
 
@@ -6029,10 +6221,12 @@ class MainActivity : ComponentActivity() {
     /**
      * Refreshes the numbers that only live in the side panel. Called from applyHudText so it is already
      * clamped to about 8 times per second; the threshold table and the histogram are only built while the
-     * index tab is open, so no effort goes to a screen that is currently covered.
+     * index tab is open, and the day table only while the rollup tab is open, so no effort goes to a
+     * screen that is currently covered.
      */
     private fun refreshPanelExtras() {
-        if (panelTab != 2) {
+        val tab = panelTab
+        if (tab != 2 && tab != 5) {
             return
         }
         // applyHudText runs about 8 times per second; the long text table only needs one pass per second.
@@ -6042,11 +6236,26 @@ class MainActivity : ComponentActivity() {
         }
         lastThresholdMs = nowUi
 
+        if (tab == 5) {
+            rollupRows = buildRollupRows()
+            return
+        }
+
         val snapshot = latencySnapshot()
         latencyBars = snapshot.first
         latencySummary = snapshot.second
         timelineMarks = buildTimelineMarks()
         thresholdRows = buildThresholdRows()
+    }
+
+    /**
+     * The last [rollupDays] local calendar days of the bound profile, oldest first.
+     * Empty when no profile is loaded yet - the tab then says so instead of drawing a blank chart.
+     */
+    private fun buildRollupRows(): List<HabitProfile.DayRollup> {
+        val p = habitProfile ?: return emptyList()
+        val now = System.currentTimeMillis()
+        return p.rollupByDays(rollupDays, now, TimeZone.getDefault().getOffset(now))
     }
 
     /**
@@ -6247,8 +6456,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** The five frames of the control panel, in the same order as when (panelTab). */
-private val PanelTabs = listOf("Theo dõi", "Chuẩn bị", "Chỉ số", "Diễn giải", "Kịch bản")
+/** The six frames of the control panel, in the same order as when (panelTab). */
+private val PanelTabs = listOf("Theo dõi", "Chuẩn bị", "Chỉ số", "Diễn giải", "Kịch bản", "Diễn biến")
+
+/** Windows offered on the day-rollup tab; 30 is capped by HabitConfig.ROLLUP_MAX_DAYS. */
+private val ROLLUP_RANGES = intArrayOf(7, 14, 30)
 
 /**
  * Demo script: each row is one action and the exact reaction the HUD must show.

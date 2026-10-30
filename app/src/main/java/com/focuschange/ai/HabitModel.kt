@@ -46,6 +46,12 @@ internal object HabitConfig {
     const val RECENCY_DECAY = 0.9
     const val MAX_WEIGHT_MINUTES = 30.0
 
+    /** Length of one calendar day in the rollup table. */
+    const val DAY_MS = 86_400_000L
+
+    /** Longest window the "per day" table will draw, so a whole-term profile cannot make the UI build thousands of rows. */
+    const val ROLLUP_MAX_DAYS = 31
+
     /** A gap between two frames larger than this: treat as a stall, not counted as study time. */
     const val MAX_FRAME_GAP_MS = 700L
 
@@ -220,8 +226,22 @@ internal class SessionSummary(
      * genuinely awful" from "nothing was ever measured", and the cloud record would have to write
      * quality_mean = 0 for every session that never saw a face.
      */
-    val qualityCount: Int = 0
+    val qualityCount: Int = 0,
+
+    /**
+     * Band scoring pooled over every feature in [HabitFeature.BAND_FEATURES]: frames scored inside,
+     * below and above the student's familiar band. Stored as counts rather than a percentage so two
+     * sessions of very different lengths cannot be averaged as if each percentage carried the same
+     * weight. Sessions saved before this field existed read back as 0 samples, and the day table then
+     * prints "no data" instead of "0% outside the band" - the honest reading of "never scored".
+     */
+    val bandIn: Int = 0,
+    val bandBelow: Int = 0,
+    val bandAbove: Int = 0
 ) {
+    /** Total frames that got a band verdict. Zero means the session carries no band information. */
+    val bandSamples: Int get() = bandIn + bandBelow + bandAbove
+
     companion object
 }
 
@@ -343,6 +363,14 @@ internal class HabitSession(val id: Long) {
         }
         val faceRatio = if (activeMs > 0L) faceMs.toFloat() / activeMs.toFloat() else 0f
         val validRatio = if (faceMs > 0L) validMs.toFloat() / faceMs.toFloat() else 0f
+        var bIn = 0
+        var bBelow = 0
+        var bAbove = 0
+        for (f in HabitFeature.BAND_FEATURES) {
+            bIn += bandIn[f]
+            bBelow += bandBelow[f]
+            bAbove += bandAbove[f]
+        }
         return SessionSummary(
             id = id,
             validMs = validMs,
@@ -352,7 +380,10 @@ internal class HabitSession(val id: Long) {
             mean = mean,
             std = std,
             count = cnt,
-            qualityCount = quality.n
+            qualityCount = quality.n,
+            bandIn = bIn,
+            bandBelow = bBelow,
+            bandAbove = bAbove
         )
     }
 }
@@ -493,6 +524,93 @@ internal class HabitProfile(val id: String, var name: String) {
             }
         }
         return if (n > 0) (sum / n) to n else null
+    }
+
+    /**
+     * One calendar day of the rollup table.
+     *
+     * An entry is produced for EVERY day in the window, including days with no session, because a
+     * silent stretch is itself the thing a teacher should see: a table that only lists days with data
+     * makes "did not open the app for nine days" look identical to "no gap exists".
+     */
+    internal class DayRollup(
+        val dayStartMs: Long,
+        val sessions: Int,
+        val validMs: Long,
+        /** Mean of the per-session SEI means; NaN when no session that day has an SEI sample. */
+        val seiMean: Float,
+        /** Sessions that actually contributed an SEI sample - the denominator behind seiMean. */
+        val seiSessions: Int,
+        val bandSamples: Int,
+        val bandBelow: Int,
+        val bandAbove: Int
+    ) {
+        /** NaN when nothing was ever scored: "no data", not "0% outside the band". */
+        val outsidePct: Float
+            get() = if (bandSamples == 0) Float.NaN else (bandBelow + bandAbove) * 100f / bandSamples
+    }
+
+    /**
+     * Sessions grouped into local calendar days, newest day last, at most [days] entries.
+     *
+     * A session is placed by the moment it STARTED (its id is the wall-clock start time), so a study
+     * session that runs across midnight belongs to the evening it began - the alternative, splitting
+     * its minutes over two days, would credit both days with time that was only measured once.
+     *
+     * [offsetMs] is the caller's timezone offset. The model stays free of any timezone class so the
+     * host test can pin a day boundary to an exact millisecond; pass TimeZone.getDefault() here.
+     */
+    internal fun rollupByDays(days: Int, nowMs: Long, offsetMs: Int): List<DayRollup> {
+        val n = days.coerceIn(1, HabitConfig.ROLLUP_MAX_DAYS)
+        val dayMs = HabitConfig.DAY_MS
+        val today = (nowMs + offsetMs).floorDiv(dayMs)
+        val firstDay = today - n + 1
+
+        val byDay = HashMap<Long, ArrayList<SessionSummary>>()
+        for (s in sessions) {
+            val d = (s.id + offsetMs).floorDiv(dayMs)
+            if (d < firstDay || d > today) continue
+            byDay.getOrPut(d) { ArrayList() }.add(s)
+        }
+
+        val out = ArrayList<DayRollup>(n)
+        for (i in 0 until n) {
+            val d = firstDay + i
+            val list = byDay[d]
+            if (list == null) {
+                out.add(DayRollup(d * dayMs - offsetMs, 0, 0L, Float.NaN, 0, 0, 0, 0))
+                continue
+            }
+            var valid = 0L
+            var seiSum = 0f
+            var seiN = 0
+            var bIn = 0
+            var bBelow = 0
+            var bAbove = 0
+            for (s in list) {
+                valid += s.validMs
+                if (s.count[HabitFeature.SEI] > 0) {
+                    seiSum += s.mean[HabitFeature.SEI]
+                    seiN++
+                }
+                bIn += s.bandIn
+                bBelow += s.bandBelow
+                bAbove += s.bandAbove
+            }
+            out.add(
+                DayRollup(
+                    dayStartMs = d * dayMs - offsetMs,
+                    sessions = list.size,
+                    validMs = valid,
+                    seiMean = if (seiN > 0) seiSum / seiN else Float.NaN,
+                    seiSessions = seiN,
+                    bandSamples = bIn + bBelow + bAbove,
+                    bandBelow = bBelow,
+                    bandAbove = bAbove
+                )
+            )
+        }
+        return out
     }
 
     /**
