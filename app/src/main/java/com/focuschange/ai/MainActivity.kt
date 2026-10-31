@@ -520,7 +520,7 @@ class MainActivity : ComponentActivity() {
 
     // ---------------- Extended control panel ----------------
     // 0 = monitoring parameters, 1 = demo preparation, 2 = indices and thresholds,
-    // 3 = explanation for the judges, 4 = demo script, 5 = per-day rollup of the habit profile.
+    // 3 = explanation for the judges, 4 = per-day rollup of the habit profile.
     private var panelTab by mutableIntStateOf(0)
 
     private var preflightRunning by mutableStateOf(false)
@@ -532,7 +532,6 @@ class MainActivity : ComponentActivity() {
     private var thresholdRows by mutableStateOf("")
     private var latencyBars by mutableStateOf(emptyList<Int>())
     private var latencySummary by mutableStateOf("--")
-    private var demoDone by mutableIntStateOf(0)
     private var glossaryOpen by mutableIntStateOf(-1)
     private var presenterMode by mutableStateOf(false)
     private var showCsvTail by mutableStateOf(false)
@@ -611,7 +610,7 @@ class MainActivity : ComponentActivity() {
     private var lastHistorySecond = 0L
     private var lastUiTextMs = 0L
 
-    // Sensitivity: 0 low, 1 medium, 2 high. Written by the UI thread, read by cameraExecutor.
+    // Sensitivity: 0 low, 1 medium, 2 high, 3 very high. Written by the UI thread, read by cameraExecutor.
     @Volatile
     private var sensLevel = 1
     private var lastChronicLevelUi = 0
@@ -966,7 +965,7 @@ class MainActivity : ComponentActivity() {
             if (prefs.getBoolean(KEY_SOUND, true)) 2 else 0
         )
 
-        sensLevel = prefs.getInt(KEY_SENSITIVITY, 1).coerceIn(0, 2)
+        sensLevel = prefs.getInt(KEY_SENSITIVITY, 1).coerceIn(0, 3)
         sensitivityUi = sensLevel
         enhanceMode = prefs.getInt(KEY_ENHANCE, 0).coerceIn(0, 1)
         enhanceUi = enhanceMode
@@ -1213,6 +1212,7 @@ class MainActivity : ComponentActivity() {
                                         when (sensitivityUi) {
                                             0 -> "Độ nhạy: Thấp"
                                             2 -> "Độ nhạy: Cao"
+                                            3 -> "Độ nhạy: Rất cao"
                                             else -> "Độ nhạy: Vừa"
                                         }
                                     )
@@ -1359,7 +1359,7 @@ class MainActivity : ComponentActivity() {
 
                             Spacer(Modifier.height(10.dp))
 
-                            // ---- Control panel: pick one of the six frames ----
+                            // ---- Control panel: pick one of the five frames ----
                             Row(
                                 Modifier.horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(2.dp)
@@ -1370,7 +1370,7 @@ class MainActivity : ComponentActivity() {
                                             panelTab = index
                                             // The day table would otherwise wait up to a second for the
                                             // throttled HUD pass, which feels broken on a tap.
-                                            if (index == 5) {
+                                            if (index == 4) {
                                                 rollupRows = buildRollupRows()
                                             }
                                         }
@@ -1682,48 +1682,6 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 4 -> {
-                                    Text(
-                                        "Kịch bản tập trước buổi thi",
-                                        style = MaterialTheme.typography.titleSmall
-                                    )
-                                    PanelDemoSteps.forEachIndexed { index, step ->
-                                        val done = (demoDone and (1 shl index)) != 0
-                                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                            TextButton(onClick = { toggleDemoStep(index) }) {
-                                                Text(if (done) "[X]" else "[ ]")
-                                            }
-                                            Column(Modifier.weight(1f)) {
-                                                Text(
-                                                    step.first,
-                                                    style = MaterialTheme.typography.bodyMedium
-                                                )
-                                                Text(
-                                                    "-> ${step.second}",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = if (done) {
-                                                        Color(0xFF43A047)
-                                                    } else {
-                                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                                    }
-                                                )
-                                            }
-                                        }
-                                    }
-                                    val doneCount = PanelDemoSteps.indices.count {
-                                        (demoDone and (1 shl it)) != 0
-                                    }
-                                    Text(
-                                        String.format(
-                                            Locale.US,
-                                            "Đã tập %d/%d bước. Bước 5 (mất khuôn mặt) là bước dễ hỏng nhất trên sân khấu.",
-                                            doneCount,
-                                            PanelDemoSteps.size
-                                        ),
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-
-                                5 -> {
                                     Text(
                                         "Diễn biến theo ngày của hồ sơ đang dùng",
                                         style = MaterialTheme.typography.titleSmall
@@ -2390,7 +2348,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun cycleSensitivity() {
-        sensLevel = (sensLevel + 1) % 3
+        sensLevel = (sensLevel + 1) % 4
         sensitivityUi = sensLevel
         prefs.edit().putInt(KEY_SENSITIVITY, sensLevel).apply()
     }
@@ -2548,6 +2506,9 @@ class MainActivity : ComponentActivity() {
         }
 
         val session = HabitSession(System.currentTimeMillis())
+        // Blink counting runs through the eyelid threshold this level moves, so a session measured
+        // at "rất cao" is not comparable to one measured at "thấp" without saying which it was.
+        session.sensitivityLevel = sensLevel
         habitSession = session
         // From this frame on the run is worth protecting: the process stays at foreground
         // importance and the student gets one tap to come back if they leave the screen.
@@ -3112,6 +3073,7 @@ class MainActivity : ComponentActivity() {
     private fun sensTime(): Float = when (sensLevel) {
         0 -> 1.5f
         2 -> 0.6f
+        3 -> 0.35f
         else -> 1.0f
     }
 
@@ -3119,6 +3081,7 @@ class MainActivity : ComponentActivity() {
     private fun sensThr(): Float = when (sensLevel) {
         0 -> 1.15f
         2 -> 0.85f
+        3 -> 0.72f
         else -> 1.0f
     }
 
@@ -3126,6 +3089,7 @@ class MainActivity : ComponentActivity() {
     private fun sensSmooth(): Float = when (sensLevel) {
         0 -> 0.7f
         2 -> 1.6f
+        3 -> 2.4f
         else -> 1.0f
     }
 
@@ -3693,7 +3657,7 @@ class MainActivity : ComponentActivity() {
         var raw = clamp01((perclosValue - 3f) / 17f) * 35f
 
         if (avgBlink != null) {
-            raw += clamp01((avgBlink - 150f) / 250f) * 20f
+            raw += MuscleSensitivity.blinkLoad(sensLevel, avgBlink) * 20f
         }
 
         raw += min(25f, yawnsRecent * 8f)
@@ -6054,9 +6018,9 @@ class MainActivity : ComponentActivity() {
         row(
             String.format(
                 Locale.US,
-                "Tăng cường ảnh: %s | Độ nhạy: %s (thời gian, góc đầu, ngáp, nhíu mày) | Âm báo mức %d.",
+                "Tăng cường ảnh: %s | Độ nhạy: %s (thời gian, góc đầu, ngáp, nhíu mày, độ dài chớp) | Âm báo mức %d.",
                 if (enhanceMode == 0) "tự động" else "tắt",
-                when (sensLevel) { 0 -> "thấp"; 2 -> "cao"; else -> "vừa" },
+                sensitivityName(sensLevel),
                 soundMode
             )
         )
@@ -6167,11 +6131,24 @@ class MainActivity : ComponentActivity() {
                 Locale.US,
                 "  Độ nhạy %s đang áp dụng cho cơ mặt: ngáp khi MAR > %.2f hoặc há miệng > %.2f; " +
                     "nhíu mày khi bề rộng lông mày < %.2f lần đường cơ sở, đầu nghiêng tối đa %.0f độ.",
-                when (sensLevel) { 0 -> "thấp"; 2 -> "cao"; else -> "vừa" },
+                sensitivityName(sensLevel),
                 MuscleSensitivity.mouthThreshold(sensLevel, thrMar),
                 MuscleSensitivity.mouthThreshold(sensLevel, JAW_OPEN_YAWN),
                 MuscleSensitivity.furrowRatio(sensLevel, BFR_FURROW_RATIO),
                 MuscleSensitivity.furrowYawWindow(sensLevel, HEAD_FRONTAL_YAW_DEG)
+            )
+        )
+        // Blink length feeds the fatigue index, and that comparison also follows the slider - printed
+        // here because blink duration is on the metrics table and a judge will ask what moved it.
+        appendLine(
+            String.format(
+                Locale.US,
+                "  Độ nhạy %s với độ dài một cái chớp: từ %.0f ms trở lên bắt đầu bị tính vào chỉ số " +
+                    "mệt, tới %.0f ms thì tính đủ %.0f điểm (mặc định 150 ms / 250 ms).",
+                sensitivityName(sensLevel),
+                MuscleSensitivity.blinkLoadFloorMs(sensLevel),
+                MuscleSensitivity.blinkLoadFloorMs(sensLevel) + MuscleSensitivity.blinkLoadRampMs(sensLevel),
+                20f
             )
         )
         // Converting frame counts into seconds must use the real cadence of the machine. Assuming 30 FPS, a
@@ -6226,7 +6203,7 @@ class MainActivity : ComponentActivity() {
      */
     private fun refreshPanelExtras() {
         val tab = panelTab
-        if (tab != 2 && tab != 5) {
+        if (tab != 2 && tab != 4) {
             return
         }
         // applyHudText runs about 8 times per second; the long text table only needs one pass per second.
@@ -6236,7 +6213,7 @@ class MainActivity : ComponentActivity() {
         }
         lastThresholdMs = nowUi
 
-        if (tab == 5) {
+        if (tab == 4) {
             rollupRows = buildRollupRows()
             return
         }
@@ -6402,12 +6379,6 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    // ==================== DEMO SCRIPT ====================
-
-    private fun toggleDemoStep(index: Int) {
-        demoDone = demoDone xor (1 shl index)
-    }
-
     // ==================== INDEX EXPLANATION ====================
 
     /** Snapshot of every number currently on screen, for pasting into the written report. */
@@ -6456,34 +6427,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** The six frames of the control panel, in the same order as when (panelTab). */
-private val PanelTabs = listOf("Theo dõi", "Chuẩn bị", "Chỉ số", "Diễn giải", "Kịch bản", "Diễn biến")
+/** The five frames of the control panel, in the same order as when (panelTab). */
+private val PanelTabs = listOf("Theo dõi", "Chuẩn bị", "Chỉ số", "Diễn giải", "Diễn biến")
 
 /** Windows offered on the day-rollup tab; 30 is capped by HabitConfig.ROLLUP_MAX_DAYS. */
 private val ROLLUP_RANGES = intArrayOf(7, 14, 30)
-
-/**
- * Demo script: each row is one action and the exact reaction the HUD must show.
- * Used for rehearsing beforehand and for comparing notes when something on stage differs.
- */
-private val PanelDemoSteps: List<Pair<String, String>> = listOf(
-    "Ngồi thẳng, cách màn hình 40-50 cm, đủ sáng" to
-        "SEI tăng lên vùng 70-90, chất lượng tín hiệu > 70, khoảng cách hiển thị 4x-5x cm.",
-    "Nhìn sang bên 30 độ trong 3 giây" to
-        "Dòng 'Tư thế đầu' đổi góc yaw, sau 2 giây xuất hiện cảnh báo mất tập trung, điểm vi phạm tăng.",
-    "Nhắm nghiền một mắt 2 giây" to
-        "EAR mắt đó tụt, độ mở mắt trung bình giảm, tỉ lệ nhắm mắt tăng; nếu giữ lâu thì HUD chuyển sang 'Đang nhắm' và có cảnh báo buồn ngủ.",
-    "Giả vờ ngáp (há miệng rộng)" to
-        "MAR vượt 0.55, bộ đếm ngáp tăng, chỉ số mệt mỏi nhích lên trong vài giây.",
-    "Nghiêng người ra khỏi tầm camera 5 giây" to
-        "SEI hiển thị '--' và ĐỒ THỊ KHÔNG rơi về 0, không có báo đỏ 'mất tập trung kéo dài'.",
-    "Bấm 'Cảnh báo sai' ngay sau một cảnh báo" to
-        "Bộ đếm tăng, dòng nhãn được ghi vào file false_alerts. Hai file dùng hai mốc giờ khác nhau (dòng ảnh tính từ lúc bật máy, dòng nhãn là giờ đồng hồ), nên đối chiếu theo thứ tự thời gian chứ không so con số timestamp.",
-    "Bấm 'Ghi CSV', theo dõi 3 phút rồi dừng" to
-        "HUD báo số dòng đã ghi và số mẫu bị mất; file nằm trong thư mục riêng của app.",
-    "Bấm 'Chia sẻ báo cáo'" to
-        "Mở bảng chọn chia sẻ với văn bản tóm tắt; không có ảnh, không có dữ liệu người khác."
-)
 
 /**
  * Explains every index for the judges. Each entry states what is actually measured and what is only an

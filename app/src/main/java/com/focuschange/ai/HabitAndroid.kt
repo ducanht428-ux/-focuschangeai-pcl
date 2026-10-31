@@ -36,6 +36,7 @@ internal fun SessionSummary.toJson(): JSONObject {
     o.put("bi", bandIn)
     o.put("bb", bandBelow)
     o.put("ba", bandAbove)
+    o.put("sl", sensitivityLevel)
     return o
 }
 
@@ -64,7 +65,10 @@ internal fun SessionSummary.Companion.fromJson(o: JSONObject): SessionSummary? {
             // never scored against a band - and the day table reads that as "no data", never "0%".
             bandIn = o.optInt("bi", 0),
             bandBelow = o.optInt("bb", 0),
-            bandAbove = o.optInt("ba", 0)
+            bandAbove = o.optInt("ba", 0),
+            // A file with no "sl" was written by a build that did not record the setting. -1 keeps
+            // that as "unknown"; reading it as "medium" would invent a measurement condition.
+            sensitivityLevel = o.optInt("sl", -1)
         )
     } catch (e: Exception) {
         Log.w("HabitProfile", "Bỏ qua phiên lỗi định dạng", e)
@@ -88,6 +92,9 @@ internal fun HabitProfile.historyText(maxLines: Int): String {
         }
         if (s.count[HabitFeature.BPM] > 0) {
             sb.append(", chớp ").append(s.mean[HabitFeature.BPM].roundToInt()).append("/phút")
+        }
+        if (s.sensitivityLevel >= 0) {
+            sb.append(", độ nhạy ").append(sensitivityName(s.sensitivityLevel))
         }
         sb.append('\n')
     }

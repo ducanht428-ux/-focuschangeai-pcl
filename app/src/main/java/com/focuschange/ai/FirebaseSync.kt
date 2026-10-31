@@ -461,6 +461,12 @@ internal object FirebaseSync {
         }
         out["alerts_total"] = r.alertsTotal
         out["false_alerts"] = r.falseAlerts
+        // Written only when the session actually recorded a setting. Blink numbers depend on the
+        // eyelid threshold this level moves, so a record without "sensitivity" is not "medium by
+        // default" - it is "measured by a build that did not say". Absence has to read as absence.
+        if (s.sensitivityLevel >= 0) {
+            out["sensitivity"] = s.sensitivityLevel
+        }
         out["device"] = r.device
         out["app_version"] = r.appVersion
         // The band is only three aggregate numbers until the session ends; per-feature detail
@@ -494,6 +500,9 @@ internal object FirebaseSync {
         }
         out["alerts_total"] = r.alertsTotal
         out["false_alerts"] = r.falseAlerts
+        if (s.sensitivityLevel >= 0) {
+            out["sensitivity"] = s.sensitivityLevel
+        }
         out["csv_rows"] = r.csvRows
         out["avg_fps"] = round2(r.avgFps)
         out["device"] = r.device

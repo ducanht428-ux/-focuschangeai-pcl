@@ -76,14 +76,25 @@ internal class EyeEngine {
 
     val out = EyeFrame()
 
-    /** Sensitivity: 0 low (only deep blinks registered), 1 medium, 2 high (also catches shallow blinks). */
+    /**
+     * Sensitivity: 0 low (only deep blinks registered), 1 medium, 2 high (also catches shallow
+     * blinks), 3 very high. A higher level raises [closeO], so a less-shut eye already counts as
+     * closed - which shortens the time an alert needs to confirm but also admits more noise.
+     *
+     * Only the CLOSE line moves. The reopen line stays capped at [OPEN_O]: if it rose with
+     * [closeO], a more sensitive setting would demand a wider eye opening before a blink is
+     * allowed to finish, so shallow or slowly-reopening blinks would start and never end -
+     * under-counting blinks and inflating [closedDuration] into a false drowsy alert. The
+     * min-gap floor in the state machine still guarantees hysteresis above the higher close line.
+     */
     fun setSensitivity(level: Int) {
         closeO = when (level) {
             0 -> 0.54f
             2 -> 0.66f
+            3 -> 0.70f
             else -> CLOSE_O
         }
-        openO = closeO + 0.18f
+        openO = minOf(OPEN_O, closeO + 0.18f)
     }
 
     private val tmp = FloatArray(5)
@@ -103,8 +114,10 @@ internal class EyeEngine {
     private var base2 = 0.3f
     private var bsBase = 0.08f
     private var bsAsymBase = 0f
-    private var closeO = CLOSE_O
-    private var openO = OPEN_O
+    // internal so a host test can pin the sensitivity trap: the reopen line must not climb with
+    // the close line, or a more sensitive level demands a wider reopening to end a blink.
+    internal var closeO = CLOSE_O
+    internal var openO = OPEN_O
 
     // Blink state
     private var closed = false

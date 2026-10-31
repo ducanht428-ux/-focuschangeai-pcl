@@ -237,7 +237,15 @@ internal class SessionSummary(
      */
     val bandIn: Int = 0,
     val bandBelow: Int = 0,
-    val bandAbove: Int = 0
+    val bandAbove: Int = 0,
+
+    /**
+     * The sensitivity level in force when this session began, 0..3, or -1 for a session stored
+     * before the app recorded it. Not decoration: the eyelid threshold this control moves decides
+     * what counts as a blink at all, so two sessions with identical-looking blink numbers were not
+     * necessarily measured the same way. -1 must stay "unknown", never be guessed as "medium".
+     */
+    val sensitivityLevel: Int = -1
 ) {
     /** Total frames that got a band verdict. Zero means the session carries no band information. */
     val bandSamples: Int get() = bandIn + bandBelow + bandAbove
@@ -264,6 +272,14 @@ internal class HabitSession(val id: Long) {
         private set
     var validMs = 0L
         private set
+
+    /**
+     * Sensitivity level copied into the summary when this session ends. Written at the moment the
+     * session starts and never touched again: a slider moved in the middle of a session is NOT
+     * recorded, so this column tells you how the session began, not every setting it passed
+     * through. Changing the setting between sessions is what the column is there to catch.
+     */
+    var sensitivityLevel: Int = -1
 
     fun tick(nowMs: Long, faceVisible: Boolean, valid: Boolean) {
         val dt = if (lastTickMs == 0L) 0L else nowMs - lastTickMs
@@ -383,7 +399,8 @@ internal class HabitSession(val id: Long) {
             qualityCount = quality.n,
             bandIn = bIn,
             bandBelow = bBelow,
-            bandAbove = bAbove
+            bandAbove = bAbove,
+            sensitivityLevel = sensitivityLevel
         )
     }
 }

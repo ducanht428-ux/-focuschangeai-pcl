@@ -442,8 +442,9 @@ internal class WindowRatio(
 }
 
 /**
- * What the sensitivity control does to the mouth and brow comparisons. Level 1 is the documented
- * default and multiplies by exactly 1; 0 demands a bigger movement, 2 accepts a smaller one.
+ * What the sensitivity control does to the mouth, brow and blink comparisons. Level 1 is the
+ * documented default and multiplies by exactly 1; 0 demands a bigger or longer signal, 2 accepts a
+ * smaller one and 3 accepts a smaller one still.
  *
  * Applied where the comparison happens instead of folded into the stored personal threshold, so
  * moving the slider cannot rewrite what a profile learned, and the threshold table can still show
@@ -454,6 +455,7 @@ internal object MuscleSensitivity {
     fun factor(level: Int): Float = when (level) {
         0 -> 1.15f
         2 -> 0.85f
+        3 -> 0.70f
         else -> 1f
     }
 
@@ -472,4 +474,34 @@ internal object MuscleSensitivity {
      * window, not a trigger, so it takes the inverse: level 2 widens it, level 0 narrows it.
      */
     fun furrowYawWindow(level: Int, baseDeg: Float): Float = baseDeg / factor(level)
+
+    /**
+     * Blink length at which the fatigue index starts charging the student, in ms. A blink longer
+     * than usual is the earliest fatigue signal the index reads, so a more sensitive setting has to
+     * start charging it sooner - level 3 begins at 105 ms instead of 150 ms.
+     */
+    fun blinkLoadFloorMs(level: Int): Float = BLINK_LOAD_FLOOR_MS * factor(level)
+
+    /** Extra blink length, above [blinkLoadFloorMs], needed to reach the full blink charge. */
+    fun blinkLoadRampMs(level: Int): Float = BLINK_LOAD_RAMP_MS * factor(level)
+
+    /** The blink charge at the current level, 0..1: how much of the full penalty this blink earns. */
+    fun blinkLoad(level: Int, avgBlinkMs: Float): Float =
+        ((avgBlinkMs - blinkLoadFloorMs(level)) / blinkLoadRampMs(level)).coerceIn(0f, 1f)
+
+    const val BLINK_LOAD_FLOOR_MS = 150f
+    const val BLINK_LOAD_RAMP_MS = 250f
+}
+
+/**
+ * The word the screen uses for one sensitivity level. Kept in one place because the button, the
+ * threshold table and the stored session record all have to name the same level the same way - and
+ * a level outside 0..3 is shown as "không rõ" rather than silently reading back as "vừa".
+ */
+internal fun sensitivityName(level: Int): String = when (level) {
+    0 -> "thấp"
+    1 -> "vừa"
+    2 -> "cao"
+    3 -> "rất cao"
+    else -> "không rõ"
 }
