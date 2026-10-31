@@ -14,8 +14,11 @@ android {
         applicationId = "com.focuschange.ai"
         minSdk = 24
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.2"
+        // Three different builds all reported versionName "1.2" on 2026-11-01, which left dumpsys
+        // lastUpdateTime as the only way to tell which APK was on the phone. The point version is the
+        // fix: the HUD reads this field live, so a number on screen means a specific APK again.
+        versionCode = 4
+        versionName = "1.2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

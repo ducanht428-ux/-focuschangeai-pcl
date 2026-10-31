@@ -9,7 +9,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Research data logger: one CSV row per frame.
+ * Research data logger: one CSV row per frame, one file per session.
  *
  * Only numbers are written, never images or video, so the file carries no identifying info
  * and stays inside the app private directory (no other app can read it).
@@ -22,25 +22,32 @@ internal class DataLogger {
 
     private companion object {
         const val DIR_NAME = "research"
-        const val FRAMES_NAME = "frames.csv"
-        const val ALERTS_NAME = "false_alerts.csv"
-        const val META_NAME = "meta.txt"
+
+        /** Session files are named frames_<tag>.csv; an empty tag gives the old frames.csv. */
+        const val FRAMES_PREFIX = "frames_"
+        const val ALERTS_PREFIX = "false_alerts_"
+        const val META_PREFIX = "meta_"
+        const val CSV_EXT = ".csv"
+        const val TAG_CHARS = "0123456789-_"
         const val FLUSH_EVERY = 30
         const val MAX_QUEUE = 900
         const val TAG = "DataLogger"
     }
 
     /**
-     * 37 measurement columns + 8 two-sided band columns = 45; the order must match the row builder
-     * in MainActivity.
+     * 37 measurement columns + 8 two-sided band columns + 4 situation columns = 49; the order must
+     * match the row builder in MainActivity.
      *
      * This list is public (instead of only the header string) so places that must write an "empty"
      * row can look columns up BY NAME. Counting positions by hand means one column inserted in the
      * middle shifts every later value, and the audit file becomes wrong without anyone noticing.
      *
-     * The band columns sit at the END of the list and carry codes, not measurements: -2 = "this frame
-     * was not scored", -1 = "no band learned for that feature yet", 0/1/2 = below/in/above. Writing 0
-     * instead of -2 or -1 would turn "not measured" into "inside the band", i.e. the opposite claim.
+     * The band columns carry codes, not measurements: -2 = "this frame was not scored", -1 = "no band
+     * learned for that feature yet", 0/1/2 = below/in/above. Writing 0 instead of -2 or -1 would turn
+     * "not measured" into "inside the band", i.e. the opposite claim.
+     *
+     * Nothing is ever inserted before the band block: new columns are appended AFTER it, so the 45
+     * columns of every file written so far keep their exact position and open with the same script.
      */
     private val measuredColumns: List<String> = listOf(
         "t_ms", "face", "ear1", "ear2", "openness", "sigma", "eye_valid",
@@ -54,7 +61,17 @@ internal class DataLogger {
     )
 
     val columnNames: List<String> =
-        measuredColumns + HabitFeature.BAND_FEATURES.map { "band_" + HabitFeature.KEYS[it] }
+        measuredColumns +
+            HabitFeature.BAND_FEATURES.map { "band_" + HabitFeature.KEYS[it] } +
+            // situation = posture code (0 forward, 1 bent down, 2 tilted, 3 turned aside, 4 nodding,
+            // 5 not classifiable); alert_held = 1 when a threshold fired but the situation layer delayed
+            // it. alert_code keeps the threshold's own answer on those frames, which is what makes the
+            // delay countable instead of invisible.
+            // closed_ms and pose_std_deg are the two inputs the layer needed to decide them. Written
+            // rather than re-derived offline so a recorded session can be replayed to the same answer:
+            // a replay that has to guess the closure timer is a second implementation of it, free to
+            // drift from the real one without anything failing.
+            listOf("situation", "alert_held", "closed_ms", "pose_std_deg")
 
     val header: String = columnNames.joinToString(",")
 
@@ -87,10 +104,27 @@ internal class DataLogger {
     private val queued = AtomicInteger(0)
     private var thread: Thread? = null
 
+    /**
+     * Session suffix used for every file name, or null when no session has run since the app started.
+     *
+     * One file per session instead of one shared frames.csv: the shared file was truncated inside
+     * start(), so a week of collected data only ever kept the LAST session's frame detail. The
+     * change-detection comparison needs frames from many sessions, and the name must tie back to the
+     * cloud record, so the suffix is HabitSession.id - the same number used in sessions/<id>-<session>.
+     *
+     * Nothing here deletes old session files. The phone holds the only copy of this data, so freeing
+     * space stays a decision a person makes after copying the folder to a computer; [dirUsage] only
+     * reports how big it has become.
+     */
+    @Volatile private var sessionSuffix: String? = null
+
     /** Returns the file path when writing worked, null when it did not. */
-    fun start(context: Context, meta: String): String? {
+    fun start(context: Context, meta: String, sessionId: Long): String? {
         if (isActive) return null
         val dir = dirFor(context) ?: return null
+
+        val suffix = sanitizeSessionId(sessionId)
+        sessionSuffix = suffix
 
         // Clean up leftovers from the previous write BEFORE opening a new file.
         // stop() only waits 2 seconds for the old pump; if the queue still holds rows (slow flash, or
@@ -116,17 +150,18 @@ internal class DataLogger {
         queued.set(0)
 
         return try {
-            val file = File(dir, FRAMES_NAME)
+            val file = File(dir, FRAMES_PREFIX + suffix + CSV_EXT)
             val w = BufferedWriter(FileWriter(file, false))
             w.write(header)
             w.newLine()
             w.flush()
-            File(dir, META_NAME).writeText(meta)
+            File(dir, META_PREFIX + suffix + ".txt").writeText(meta)
 
-            // frames.csv is overwritten each time logging starts, so false_alerts.csv must also be rebuilt
-            // from scratch; otherwise the previous session's labels would attach to this session's frames.
+            // Each session gets its own alert-label file, opened empty. Labels from an earlier session
+            // must not land here: they would attach a "this alert was wrong" verdict to frames that
+            // produced that alert nowhere in this file.
             try {
-                BufferedWriter(FileWriter(File(dir, ALERTS_NAME), false)).use {
+                BufferedWriter(FileWriter(File(dir, ALERTS_PREFIX + suffix + CSV_EXT), false)).use {
                     it.write(falseAlertHeader)
                     it.newLine()
                 }
@@ -149,6 +184,14 @@ internal class DataLogger {
             isActive = false
             null
         }
+    }
+
+    private fun sanitizeSessionId(sessionId: Long): String {
+        val raw = sessionId.toString()
+        val clean = raw.filter { TAG_CHARS.contains(it) }
+        // An id that survives to nothing must not silently become "the legacy file": that name is
+        // reused by the reader as "no session has run", so two different sessions could share one file.
+        return clean.ifEmpty { "s$sessionId" }
     }
 
     fun stop() {
@@ -181,7 +224,7 @@ internal class DataLogger {
     fun appendFalseAlert(context: Context, line: String): Boolean {
         val dir = dirFor(context) ?: return false
         return try {
-            val f = File(dir, ALERTS_NAME)
+            val f = File(dir, ALERTS_PREFIX + currentSuffix(dir) + CSV_EXT)
             val first = !f.exists() || f.length() == 0L
             val w = BufferedWriter(FileWriter(f, true))
             if (first) {
@@ -254,10 +297,50 @@ internal class DataLogger {
         return if (dir.isDirectory || dir.mkdirs()) dir else null
     }
 
-    /** Image file currently (or last) written, so the raw-data screen can read it back. */
-    fun framesFile(context: Context): File? = dirFor(context)?.let { File(it, FRAMES_NAME) }
+    /**
+     * Suffix of the session whose files the screen should show.
+     *
+     * After an app restart [sessionSuffix] is empty, so the newest frames_*.csv on disk is picked up
+     * instead. Without that, opening the raw-data screen the next day would report "no file yet" while
+     * yesterday's data is still sitting in the folder, and the reader concludes the recording was lost.
+     * An empty result is the old shared frames.csv name, used only when the folder holds nothing newer.
+     */
+    private fun currentSuffix(dir: File): String {
+        sessionSuffix?.let { return it }
+        val newest = dir.listFiles { f ->
+            f.isFile && f.name.startsWith(FRAMES_PREFIX) && f.name.endsWith(CSV_EXT)
+        }?.maxByOrNull { it.lastModified() } ?: return ""
+        val suffix = newest.name.removePrefix(FRAMES_PREFIX).removeSuffix(CSV_EXT)
+        sessionSuffix = suffix
+        return suffix
+    }
 
-    fun alertsFile(context: Context): File? = dirFor(context)?.let { File(it, ALERTS_NAME) }
+    /** Data file currently (or last) written, so the raw-data screen can read it back. */
+    fun framesFile(context: Context): File? =
+        dirFor(context)?.let { File(it, FRAMES_PREFIX + currentSuffix(it) + CSV_EXT) }
+
+    fun alertsFile(context: Context): File? =
+        dirFor(context)?.let { File(it, ALERTS_PREFIX + currentSuffix(it) + CSV_EXT) }
+
+    /**
+     * Number of per-session frame files kept and their total size in bytes, including the alert-label
+     * and meta files.
+     *
+     * Reported instead of enforced: this folder is the only copy of the week's measurements, so growth
+     * has to be visible on screen rather than fixed by deleting research data in the background.
+     */
+    fun dirUsage(context: Context): Pair<Int, Long> {
+        val dir = dirFor(context) ?: return 0 to 0L
+        val files = dir.listFiles() ?: return 0 to 0L
+        var sessions = 0
+        var bytes = 0L
+        for (f in files) {
+            if (!f.isFile) continue
+            bytes += f.length()
+            if (f.name.startsWith(FRAMES_PREFIX) && f.name.endsWith(CSV_EXT)) sessions++
+        }
+        return sessions to bytes
+    }
 
     /**
      * DATA rows already on disk (header excluded), unlike [rows] which does not count what is

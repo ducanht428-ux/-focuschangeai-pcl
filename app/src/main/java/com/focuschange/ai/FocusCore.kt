@@ -83,7 +83,18 @@ internal data class HudSnapshot(
      * with priority would silence the PERCLOS, yawn and pose alerts on exactly those frames.
      */
     val faceSizeHint: String? = null,
-    val bandSummary: String = ""
+    val bandSummary: String = "",
+    /**
+     * What the student appears to be doing, named from head geometry and micro-motion: sitting up
+     * facing the screen, bent over writing, head tilted, turned aside, or nodding.
+     */
+    val situationStatus: String = "--",
+    /**
+     * True on a frame where an eyelid alert was triggered by the thresholds but the situation layer is
+     * holding it back. The alert is delayed, never dropped: [alertCode] keeps the threshold's own
+     * answer so the two can be counted apart afterwards.
+     */
+    val alertHeld: Boolean = false
 )
 
 /** One head-pose sample in the time sliding window (raw angle, unfiltered). */

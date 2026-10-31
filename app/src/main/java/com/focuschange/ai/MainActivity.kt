@@ -168,7 +168,9 @@ class MainActivity : ComponentActivity() {
         const val KIND_HIGH_BLINK = 14
 
         // Only analyse the eyes when the head angle is small enough (beyond it eye landmarks are unreliable).
-        const val EYE_MAX_YAW_DEG = 45f
+        // 28 degrees, not the 45 the landmark detector can technically track: past this the far eye is
+        // foreshortened enough that no compensation keeps the reading honest, so the HUD shows "--".
+        const val EYE_MAX_YAW_DEG = 28f
         const val EYE_MAX_PITCH_DEG = 35f
 
         // Only sound an alert once it has appeared enough times within the counting window.
@@ -485,6 +487,7 @@ class MainActivity : ComponentActivity() {
 
     private var headPoseText by mutableStateOf("--")
     private var gazeText by mutableStateOf("--")
+    private var situationText by mutableStateOf("--")
     private var expressionText by mutableStateOf("--")
     private var expressionMetricsText by mutableStateOf("--")
     private var inattentionText by mutableStateOf("--")
@@ -856,6 +859,17 @@ class MainActivity : ComponentActivity() {
     private var lastEyeValid = false
 
     private val dataLogger = DataLogger()
+
+    /**
+     * Situation layer: names what the student is doing from head numbers already measured, and may hold
+     * an eyelid alert back when that student's own data says the lids look like this in this posture.
+     * It can make an alert LATE, never silent.
+     *
+     * Touched from cameraExecutor only: the delay timer and the learned buckets are not thread safe, and
+     * every number they need is computed on that thread anyway.
+     */
+    private val situationEngine = SituationEngine()
+    private val sitFrame = SituationFrame()
 
     // The button toggles on the UI thread, the frame loop reads on cameraExecutor. Without @Volatile the
     // machine could run a whole session without seeing the record command: empty CSV, screen says writing.
@@ -1335,6 +1349,7 @@ class MainActivity : ComponentActivity() {
 
                             Text(text = "Tư thế đầu: $headPoseText")
                             Text(text = "Hướng nhìn: $gazeText")
+                            Text(text = "Tình huống: $situationText")
                             Text(text = "Vi biểu cảm: $expressionText")
                             Text(text = "Chỉ số: $expressionMetricsText")
                             Text(text = "Mất tập trung: $inattentionText")
@@ -2785,6 +2800,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * One HUD line for the situation layer, spelled so the reader cannot mistake it for a verdict about
+     * the student: it names the posture the geometry suggests and nothing more.
+     */
+    private fun describeSituation(s: Situation): String = when (s) {
+        Situation.FORWARD -> "Ngồi thẳng, nhìn màn hình"
+        Situation.DOWN -> "Cúi xuống (viết hoặc đọc)"
+        Situation.TILT -> "Nghiêng đầu"
+        Situation.TURNED -> "Quay sang bên"
+        Situation.DOZING -> "Gật đầu, ít cử động"
+        Situation.UNKNOWN -> "--"
+    }
+
     /** Build label, so the cloud table can tell which phone is still running an old build. */
     private fun appVersionName(): String =
         packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
@@ -2960,6 +2988,10 @@ class MainActivity : ComponentActivity() {
             append("Số đợt mất tập trung kéo dài: ${s.chronicEpisodes}\n")
             append("Phân tích mắt: ${s.eyeDetail}\n")
             append("Học sinh: $studentName\n")
+            // The context layer belongs in the printed report too. A judge is handed this text, not the
+            // screen, and a layer that appears nowhere in the deliverable is a claim with no artefact
+            // behind it. The tally rides along because situationStatus already carries it.
+            append("Ngữ cảnh đang đọc: ${s.situationStatus}\n")
             append(s.habitStatus).append("\n")
             if (s.habitDetail.isNotEmpty()) append(s.habitDetail).append("\n")
             if (s.habitHistory.isNotEmpty()) {
@@ -3461,6 +3493,9 @@ class MainActivity : ComponentActivity() {
     private fun resetCalibration() {
         endHabitSession()
         eyeEngine.reset()
+        // A new baseline means the openness readings before it were measured against a different face,
+        // so every situation average learned from them has to go with it.
+        situationEngine.reset()
         lastSeiValue = -1
         lowVsPersonalStartMs = 0L
         calibrated = false
@@ -4171,6 +4206,8 @@ class MainActivity : ComponentActivity() {
         var fatigueOut: Int? = null
         var alertCode = 0
         var eyeDetail = "Đang hiệu chuẩn"
+        var situationStatus = "--"
+        var alertHeld = false
 
         if (!calibrated) {
             // ---- Calibration phase: only valid frames and a signal good enough ----
@@ -4216,6 +4253,7 @@ class MainActivity : ComponentActivity() {
                     calSumGazeV = 0f
                     calSumBfr = 0f
                     eyeEngine.reset()
+                    situationEngine.reset()
                 }
             }
             currentEyeStatus = "Đang hiệu chuẩn"
@@ -4363,6 +4401,21 @@ class MainActivity : ComponentActivity() {
                 driftNow -> "Đang liếc sang $gazeDir"
                 else -> "Nhìn vào màn hình"
             }
+
+            // ---- Situation: what is this student doing right now ----
+            // Fed on every frame that has a face, including the ones where the eyelids are refused: a
+            // turned or pitched head still has a posture, and that posture is the reason the eyelid
+            // number on the next frame can be excused. poseStd stays NaN for the first ~10 seconds of a
+            // session (the window needs 60 samples over 9 seconds), which the engine reads as "not
+            // still" - never as still, so a session that just started cannot be called a doze.
+            sitFrame.yawDeg = yawDeg
+            sitFrame.pitchDeg = pitchDeg
+            sitFrame.rollDeg = rollDeg
+            sitFrame.gazeVDev = offV
+            sitFrame.openness = if (eye.valid) eye.openness else Float.NaN
+            sitFrame.closedMs = closedDuration
+            sitFrame.poseStdDeg = if (stats != null) stats.first else Float.NaN
+            situationEngine.update(sitFrame, nowMs)
 
             // ---- Micro-expressions: frown (BFR) and yawn (MAR) ----
             // Both respond to the sensitivity slider, like the timing and head-angle thresholds do.
@@ -4671,6 +4724,30 @@ class MainActivity : ComponentActivity() {
                 eye.noisy -> 0
                 else -> 0
             }
+
+            // ---- Situation gate ----
+            // Asked once per frame even when nothing is alerting, because answering "no reason to hold"
+            // is what clears the delay timer; skipping the call on quiet frames would leave a stale
+            // start time and let the next alert fire with no delay at all.
+            // Only the two alerts whose evidence is "the eye looks closed in this frame" can be held.
+            // PERCLOS is deliberately not one of them: it is a ratio over a whole minute, so holding it
+            // back frame by frame would bend the ratio itself, not the reading of it.
+            val eyelidEvidence = alertCode == KIND_DROWSY || alertCode == KIND_SQUINT
+            alertHeld = !situationEngine.allow(eyelidEvidence, sitFrame, nowMs)
+            // The layer's own tally rides on the situation line, because "context makes the alerts
+            // better" is a claim the judges can only hear, not see, if the number lives only in a CSV
+            // that has to be pulled and replayed later. Suppressed is shown apart from delayed: an
+            // episode the layer let go of entirely and one that merely arrived 0,7 s late are two
+            // different results, and adding them together would overstate the first.
+            // Formatted only once the layer has actually intervened, so the common case stays one
+            // integer test on a path that runs thirty times a second.
+            val held = situationEngine.intervenedEpisodes
+            situationStatus = if (held == 0) {
+                describeSituation(situationEngine.situation)
+            } else {
+                "${describeSituation(situationEngine.situation)} · đã hoãn $held lần, " +
+                    "bỏ hẳn ${situationEngine.suppressedEpisodes} lần"
+            }
         }
 
         frameCounter++
@@ -4741,10 +4818,29 @@ class MainActivity : ComponentActivity() {
             if (lumaMean.isFinite()) {
                 b.append(String.format(Locale.US, "%.2f", lumaMean))
             }
-            // The eight band columns come AFTER luma, never inserted in the middle, so the 37 measured columns
-            // keep their order and files from earlier sessions still open with the same analysis script.
+            // The eight band columns come AFTER luma, never inserted in the middle, so the 37 measured
+            // columns keep their order and files from earlier sessions still open with the same script.
             for (f in HabitFeature.BAND_FEATURES) {
                 b.append(',').append(bandCodes[f])
+            }
+            // situation, alert_held, closed_ms and pose_std_deg are appended after the band block, which
+            // makes them the newest columns of the file. alert_code keeps the thresholds' own answer even
+            // on a held frame: a row that says "no alert" would make the delay invisible, and the whole
+            // point is to be able to count how many alerts the situation layer held back and for how long.
+            // The last two are the engine's own two remaining inputs, read back from the frame object it
+            // was handed rather than re-derived here: the offline comparison must replay the decision, not
+            // guess it from other columns, and a re-derived closure timer is a second implementation that
+            // can drift from this one without anything failing.
+            b.append(',').append(situationEngine.situation.csvCode)
+            b.append(',').append(if (alertHeld) 1 else 0)
+            b.append(',').append(sitFrame.closedMs)
+            // Written last and with the comma always present, like every other optional column: the pose
+            // window has no reading for the first ~10 seconds of a session, and an empty cell means
+            // "not measured" while 0 would mean "perfectly still" - the opposite claim. Suppressing the
+            // comma instead would drop every one of those rows in the column-count check.
+            b.append(',')
+            if (sitFrame.poseStdDeg.isFinite()) {
+                b.append(String.format(Locale.US, "%.3f", sitFrame.poseStdDeg))
             }
             dataLogger.submit(b.toString())
         }
@@ -4803,7 +4899,9 @@ class MainActivity : ComponentActivity() {
             imageDetail = imageDetail,
             personHint = personHintPlain,
             faceSizeHint = faceSizeHintPlain,
-            bandSummary = bandSummaryPlain
+            bandSummary = bandSummaryPlain,
+            situationStatus = situationStatus,
+            alertHeld = alertHeld
         )
     }
 
@@ -4871,6 +4969,7 @@ class MainActivity : ComponentActivity() {
         }
 
         gazeText = s.gazeStatus
+        situationText = s.situationStatus
         expressionText = s.expressionStatus
 
         expressionMetricsText = if (s.bfr != null && s.mar != null) {
@@ -4929,7 +5028,13 @@ class MainActivity : ComponentActivity() {
 
         calibrationText = calibrationLabelFrom(s)
         seiValue = s.sei ?: -1
-        alertText = s.alertMessage ?: ""
+        // A held alert shows what is holding it instead of showing nothing: an operator who sees a
+        // shut eye and no line at all cannot tell "delayed" from "broken".
+        alertText = if (s.alertHeld) {
+            "${s.situationStatus} - đang hoãn cảnh báo: ${s.alertMessage ?: ""}"
+        } else {
+            s.alertMessage ?: ""
+        }
 
         sessionText = if (s.calibrated) {
             val minutes = s.sessionSeconds / 60L
@@ -4993,7 +5098,10 @@ class MainActivity : ComponentActivity() {
         val chronicRising = s.chronicLevel == 2 && lastChronicLevelUi != 2
         val tooCloseRising = s.tooClose && !lastTooCloseUi
         // Counts occurrences per alert type; only enough occurrences make a sound.
-        val code = s.alertCode
+        // A held alert neither sounds nor counts as an occurrence: the number of alerts on record stays
+        // the number that actually reached the student. The thresholds' own answer is still in the CSV
+        // column alert_code, which is what makes the delay countable afterwards.
+        val code = if (s.alertHeld) 0 else s.alertCode
         if (code > 0) {
             val isNew = nowUi - lastKindActiveMs[code] > ALERT_REARM_MS
             lastKindActiveMs[code] = nowUi
@@ -5455,7 +5563,11 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        val path = dataLogger.start(applicationContext, loggerMeta())
+        // The id doubles as the file name so a CSV on disk can be traced back to the cloud record
+        // sessions/<student>-<session> without opening meta.txt. A manual "Ghi CSV" pressed outside a
+        // measured session has no id yet, so it stamps the wall clock instead.
+        val sessionId = habitSession?.id ?: System.currentTimeMillis()
+        val path = dataLogger.start(applicationContext, loggerMeta(sessionId), sessionId)
         if (path == null) {
             loggingText = "Ghi CSV: không mở được file"
             return
@@ -5466,13 +5578,14 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Environment information of the recording session, written separately into meta.txt because the CSV
-     * must stay clean for a machine. Without these numbers the data cannot be reproduced.
+     * Environment information of the recording session, written next to the CSV because the CSV must stay
+     * clean for a machine. Without these numbers the data cannot be reproduced.
      */
-    private fun loggerMeta(): String = buildString {
+    private fun loggerMeta(sessionId: Long): String = buildString {
         append("device=").append(android.os.Build.MODEL).append('\n')
         append("android=").append(android.os.Build.VERSION.RELEASE).append('\n')
         append("app=FocusChangeAI\n")
+        append("session_id=").append(sessionId).append('\n')
         append("student=").append(csvSafe(studentName)).append('\n')
         append("started=").append(
             java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
@@ -5618,6 +5731,7 @@ class MainActivity : ComponentActivity() {
         perclosP80Text = "--"
         headPoseText = "--"
         gazeText = "Không xác định"
+        situationText = "Không xác định"
         expressionText = "Không xác định"
         expressionMetricsText = "--"
         inattentionText = "--"
@@ -6121,6 +6235,18 @@ class MainActivity : ComponentActivity() {
         appendLine()
         appendLine("Ngưỡng cố định (không đổi theo hồ sơ):")
         appendLine(String.format(Locale.US, "  Nhắm mắt liên tục %.2f s thì báo buồn ngủ", DROWSY_CLOSURE_MS / 1000f))
+        // The situation layer is printed with the two numbers that actually bound it, read from the
+        // engine itself, so this screen can never quote a limit the code does not enforce.
+        appendLine(
+            String.format(
+                Locale.US,
+                "  Tầng tình huống chỉ HOÃN cảnh báo nheo/buồn ngủ, tối đa %.1f s, và mỗi tư huống phải có " +
+                    "đủ 60 khung của riêng em đó mới được xét. Nhắm mắt từ %.1f s trở lên thì mọi tư thế " +
+                    "đều phải báo. PERCLOS, ngáp và chớp mắt: tầng này không đụng tới.",
+                SituationEngine.HOLD_MAX_MS / 1000f,
+                SituationEngine.ALWAYS_ALERT_CLOSED_MS / 1000f
+            )
+        )
         appendLine(String.format(Locale.US, "  P70/P80: độ mở <= %.2f / %.2f so với đường cơ sở", PERCLOS_P70_OPEN, PERCLOS_P80_OPEN))
         appendLine(String.format(Locale.US, "  Ngưỡng nheo mắt %.0f%%, lệch hai mắt %.0f%%", EyeEngine.SQUINT_ALERT_PCT, EyeEngine.ASYM_ALERT_PCT))
         // The numbers the muscle features are actually compared against, with the slider already applied.
@@ -6241,7 +6367,9 @@ class MainActivity : ComponentActivity() {
      */
     private fun recordTimelineEvent(s: HudSnapshot) {
         val sec = SystemClock.elapsedRealtime() / 1000L
-        pushEvent(sec, TL_BAND_ALERT, s.alertCode > 0)
+        // Same rule as the sound and the occurrence counter: the timeline shows alerts that reached the
+        // student, not every frame where a threshold was crossed.
+        pushEvent(sec, TL_BAND_ALERT, s.alertCode > 0 && !s.alertHeld)
         pushEvent(sec, TL_BAND_CHRONIC, s.chronicLevel >= 2)
         pushEvent(sec, TL_BAND_NO_FACE, !s.faceDetected)
         pushEvent(sec, TL_BAND_BLINK, s.blinkDetected)
@@ -6309,18 +6437,38 @@ class MainActivity : ComponentActivity() {
                                 "bị thu hồi giữa chừng. Thử tắt bật lại nút ghi."
                             else -> {
                                 val header = dataLogger.header
-                                val note = String.format(
-                                    Locale.US,
-                                    "%s - %d byte, %d dòng trên đĩa, bộ đếm trong máy %d dòng.",
-                                    f.name, f.length(), dataLogger.linesOnDisk(ctx), dataLogger.rows
-                                ) + if (dataLogger.malformedRows > 0L) {
-                                    String.format(
-                                        Locale.US,
-                                        " %d dòng bị chặn vì lệch số cột.",
-                                        dataLogger.malformedRows
+                                val (sessionFiles, totalBytes) = dataLogger.dirUsage(ctx)
+                                val note = buildString {
+                                    append(
+                                        String.format(
+                                            Locale.US,
+                                            "%s - %d byte, %d dòng trên đĩa, bộ đếm trong máy %d dòng.",
+                                            f.name, f.length(), dataLogger.linesOnDisk(ctx), dataLogger.rows
+                                        )
                                     )
-                                } else {
-                                    ""
+                                    append(
+                                        String.format(
+                                            Locale.US,
+                                            " Thư mục nghiên cứu: %d phiên, %.1f MB.",
+                                            sessionFiles, totalBytes / 1_048_576.0
+                                        )
+                                    )
+                                    // frames.csv is the pre-per-session name: it holds one old session and
+                                    // this build no longer writes into it, so it must not look like the live file.
+                                    if (f.name == "frames.csv") {
+                                        append(
+                                            " Đây là file cũ chỉ chứa một phiên; bản này ghi mỗi phiên một file riêng."
+                                        )
+                                    }
+                                    if (dataLogger.malformedRows > 0L) {
+                                        append(
+                                            String.format(
+                                                Locale.US,
+                                                " %d dòng bị chặn vì lệch số cột.",
+                                                dataLogger.malformedRows
+                                            )
+                                        )
+                                    }
                                 }
                                 val shown = if (lines.isEmpty()) {
                                     listOf(header)
@@ -6363,11 +6511,23 @@ class MainActivity : ComponentActivity() {
         appendLine("  alert_code    loại cảnh báo ở khung đó, 0 = không có")
         appendLine("  proc_ms       thời gian xử lý một khung, dùng để suy nhịp khung hình")
         appendLine("  luma          độ sáng trung bình khung (0-255), dùng để giải thích chất lượng thấp")
-        appendLine("  band_<tên>    8 cột cuối: giá trị khung đó nằm ở đâu SO VỚI DẢI RIÊNG của em này -")
+        appendLine("  band_<tên>    8 cột: giá trị khung đó nằm ở đâu SO VỚI DẢI RIÊNG của em này -")
         appendLine("                  0 = dưới dải, 1 = trong dải, 2 = trên dải,")
         appendLine("                  -1 = chưa học được dải (hồ sơ còn thiếu phiên), -2 = khung này không chấm")
         appendLine("                  Dải = mức điển hình ±2.5 lần dao động của chính em đó. Đây là mô tả,")
         appendLine("                  không phải ngưỡng cắt cảnh báo: cột band_* và cột alert_code độc lập nhau.")
+        appendLine("  4 cột mới nhất viết sau khối band, nên không cột nào ở trên dịch chỗ:")
+        appendLine("  situation     em đang làm gì, đoán từ HÌNH HỌC đầu (không nhận diện vật thể):")
+        appendLine("                  0 ngồi thẳng, 1 cúi xuống (viết/đọc), 2 nghiêng đầu,")
+        appendLine("                  3 quay sang bên, 4 gật đầu ít cử động, 5 không đủ tín hiệu.")
+        appendLine("                  Khung không thấy khuôn mặt để trống, KHÔNG ghi 0.")
+        appendLine("  alert_held    1 = khung đó NGƯỠNG đã bật nhưng tầng tình huống hoãn lại")
+        appendLine("                  tối đa 0,7 giây; alert_code vẫn giữ nguyên câu trả lời của ngưỡng,")
+        appendLine("                  nên số lần hoãn đếm được từ file. Nhắm mắt liên tục từ 2,5 giây thì")
+        appendLine("                  không tình huống nào được phép hoãn.")
+        appendLine("  closed_ms     mắt nhắm liên tục tính đến khung này (ms) - đầu vào của hai cột trên.")
+        appendLine("  pose_std_deg  dao động tư thế đầu trong 10 giây gần nhất (độ). Để trống khi cửa sổ chưa")
+        appendLine("                  đủ mẫu (tức khoảng 10 giây đầu phiên); 0 ở đây nghĩa là đứng yên hẳn, ngược lại.")
         append("\n")
         append(
             String.format(
@@ -6392,6 +6552,7 @@ class MainActivity : ComponentActivity() {
         appendLine("Mất tập trung: $inattentionText")
         appendLine("Chớp: $bpmText bpm, $blinkCount lần | EAR: $ear1Text / $ear2Text")
         appendLine("Tư thế: $headPoseText | Hướng nhìn: $gazeText")
+        appendLine("Tình huống: $situationText")
         appendLine("Khoảng cách: $distanceText | Chất lượng: $signalText")
         appendLine("Máy: $fpsText FPS, $processingText")
         appendLine(

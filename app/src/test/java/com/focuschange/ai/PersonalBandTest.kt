@@ -126,13 +126,19 @@ class PersonalBandTest {
     }
 
     @Test
-    fun bandColumnsAreAppendedAtTheEndAndNamedAfterTheKeys() {
+    fun bandColumnsFollowTheMeasuredBlockAndNewestColumnsGoLast() {
         val cols = DataLogger().columnNames
         val expected = HabitFeature.BAND_FEATURES.map { "band_" + HabitFeature.KEYS[it] }
 
-        // Appended at the end rather than inserted in the middle: the 37 old columns keep their order so that
-        // files from earlier sessions still open with the same analysis script.
-        assertEquals(expected, cols.takeLast(expected.size))
+        // Appended at the end rather than inserted in the middle: the 37 old columns keep their order so
+        // that files from earlier sessions still open with the same analysis script. The situation group
+        // went in AFTER the band block for exactly that reason, which moves the band block away
+        // from the end of the list without moving a single older column - so this test now pins the
+        // group order (measured, then band, then situation) instead of "band is last".
+        val situationCols = listOf("situation", "alert_held", "closed_ms", "pose_std_deg")
+        val tail = cols.takeLast(expected.size + situationCols.size)
+        assertEquals(expected, tail.take(expected.size))
+        assertEquals(situationCols, tail.takeLast(situationCols.size))
         assertEquals(cols.size, cols.toSet().size)
         assertFalse(cols.contains("band_distance_cm"))
         assertFalse(cols.contains("band_ear"))

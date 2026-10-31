@@ -354,7 +354,9 @@ internal class EyeEngine {
         val c2 = e2 * cosY / expected
         val og1 = (c1 / base1).coerceIn(0f, 1.5f)
         val og2 = (c2 / base2).coerceIn(0f, 1.5f)
-        val og = (og1 + og2) / 2f
+        // Both lids of one face fall together, so the wider-open eye is the honest reading. Averaging let
+        // the far eye collapse from yaw foreshortening and drag the whole face under the close line.
+        val og = max(og1, og2)
 
         // 4) Blendshapes (when present) and fusion with a disagreement check between the two sources.
         var fused = og
