@@ -1,0 +1,19 @@
+# FocusChangeAI edge server - multi-person focus monitoring.
+# Python 3.10+ recommended (matches MediaPipe Tasks and Ultralytics support).
+
+# --- Vision: detection + tracking (Layer 1) ---
+ultralytics>=8.2.0          # YOLO11 + built-in ByteTrack/BoT-SORT trackers
+opencv-python>=4.9.0        # frame IO, ROI cropping, drawing
+numpy>=1.26.0
+
+# --- Identity: face recognition + roster matching (Layer 2) ---
+insightface>=0.7.3          # ArcFace embeddings (buffalo_l) + face detection
+onnxruntime-gpu>=1.17.0     # backs insightface; swap to onnxruntime for CPU-only boxes
+
+# --- Detailed face/eye measurement (Layer 4) ---
+# Same face_landmarker.task asset the Android app ships, so blendshapes line up 1:1.
+mediapipe>=0.10.14
+
+# --- Cloud sync (Layer 5) ---
+firebase-admin>=6.4.0
+PyYAML>=6.0

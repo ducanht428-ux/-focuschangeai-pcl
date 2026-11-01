@@ -1,0 +1,78 @@
+# FocusChangeAI edge server configuration.
+# Everything the pipeline needs to run one classroom. Copy to config.local.yaml
+# and edit that so real credentials / camera URLs never land in git.
+
+# Which class this box serves. Every Firestore document is keyed under it.
+class_id: "lop12a"
+
+# --- Input: where frames come from ---
+input:
+  # One of: camera index (0), a video file path, or an RTSP/HTTP stream URL.
+  source: 0
+  # Target processing width; frames are downscaled to this so YOLO/pose stay real-time.
+  process_width: 1280
+  # Cap the analysis frame rate (detection runs at most this many times per second).
+  detect_fps: 12
+
+# --- Layer 1: detection + tracking (YOLO + ByteTrack) ---
+detection:
+  model: "yolo11m.pt"        # person + COCO objects; drop to yolo11n.pt on weak GPUs
+  person_class: 0            # COCO class id for "person"
+  conf: 0.35                 # minimum detection confidence
+  tracker: "bytetrack.yaml"  # built into ultralytics
+  # A track whose last sighting is older than this is dropped (its PersonPipeline parks).
+  track_ttl_ms: 15000
+
+# --- Layer 2: identity (ArcFace + roster) ---
+identity:
+  # ArcFace recognition pack from insightface; buffalo_l is the accurate default.
+  recognition_pack: "buffalo_l"
+  # Cosine similarity gates for binding a track to a roster student.
+  bind_hi: 0.45              # >= this and seat agrees -> confident bind
+  bind_lo: 0.30              # below this -> treat as guest (not in roster)
+  # Re-verification: how often (ms) to re-check the bound face against its template.
+  reverify_ms: 30000
+  # Rolling window of embeddings averaged before a match is trusted.
+  embed_window: 40
+  # Deviation held this long with no match -> unbind the track back to guest.
+  unbind_hold_ms: 10000
+
+# --- Layer 3: scheduler (who gets the expensive FaceMesh budget) ---
+scheduler:
+  # Max faces run through FaceLandmarker+blendshapes per frame.
+  max_active_faces: 10
+  # A face smaller than this (px, eye-corner span) is not measurable at all.
+  min_eye_span_px: 12
+  # Round-robin fairness: a track not measured for this long gets priority next frame.
+  starve_ms: 1500
+  # Suspicious (low SEI / dozing) faces get measured this many times more often.
+  hot_multiplier: 3
+
+# --- Layer 4: per-person measurement ---
+person:
+  # Reference face width used for the distance estimate (cm) - mirrors the Android app.
+  ref_face_width_cm: 6.0
+  # Sensitivity level 0..3 applied to every pipeline (see MuscleSensitivity).
+  sensitivity: 1
+  # Session is committed to the habit profile only when it clears HabitConfig bars.
+  habit_learn: true
+
+# --- Layer 5: cloud sync (Firestore) ---
+sync:
+  # Path to a service-account key. Empty/missing -> server runs local-only (JSONL dump).
+  service_account: ""
+  # class_live is overwritten this often; independent of class size (single writer).
+  class_live_ms: 20000
+  # presence/<student> heartbeat cadence (kept for the old phone clients).
+  heartbeat_ms: 300000
+  # Frame-level CSV rows are buffered and flushed in batches, never per-frame writes.
+  frame_batch_rows: 500
+  # Local queue for refused writes (mirrors PendingUploadStore on the phone).
+  pending_file: "pending_upload.jsonl"
+  pending_max: 300
+
+# --- Output when no Firestore is configured (offline / dry-run) ---
+local_output:
+  dir: "out"
+  frames_csv: true
+  class_live_json: true
