@@ -307,9 +307,10 @@ internal class DataLogger {
      */
     private fun currentSuffix(dir: File): String {
         sessionSuffix?.let { return it }
-        val newest = dir.listFiles { f ->
+        val sessions = dir.listFiles { f ->
             f.isFile && f.name.startsWith(FRAMES_PREFIX) && f.name.endsWith(CSV_EXT)
-        }?.maxByOrNull { it.lastModified() } ?: return ""
+        } ?: return ""
+        val newest = sessions.maxByOrNull { it.lastModified() } ?: return ""
         val suffix = newest.name.removePrefix(FRAMES_PREFIX).removeSuffix(CSV_EXT)
         sessionSuffix = suffix
         return suffix
@@ -341,6 +342,38 @@ internal class DataLogger {
         }
         return sessions to bytes
     }
+
+    /**
+     * Every file kept in the research folder, newest first - or null when the folder exists but
+     * Android refuses to list it.
+     *
+     * [framesFile] only ever points at the latest session, but the week's measurements are spread over
+     * one file per session, so anything that hands the data over has to take the whole list.
+     *
+     * The two empty outcomes are kept apart on purpose: saying "no files" when the folder is really
+     * unreadable would tell the reader the week's measurements are gone.
+     *
+     * The meta_ files travel with the CSVs because each one records the thresholds and the baseline
+     * that session ran on. Rows without that file cannot be replayed: the same angles score different
+     * alerts under different baselines.
+     */
+    fun researchFiles(context: Context): List<File>? {
+        val dir = dirFor(context) ?: return null
+        val files = dir.listFiles() ?: return null
+        return files.filter {
+            it.isFile &&
+                (it.name.endsWith(CSV_EXT) || it.name.startsWith(META_PREFIX))
+        }.sortedByDescending { it.lastModified() }
+    }
+
+    /**
+     * Rows handed to the writer but not yet flushed to flash: still in the queue plus up to
+     * [FLUSH_EVERY] rows sitting in the buffer.
+     *
+     * Only needed so the export can say "the newest 30 rows are not in the file yet" instead of
+     * letting a mid-session ZIP look like a complete record of the session.
+     */
+    fun pendingLines(): Int = queued.get()
 
     /**
      * DATA rows already on disk (header excluded), unlike [rows] which does not count what is

@@ -15,3 +15,18 @@
 local.properties
 desktop/
 hs_err_pid*.log
+__pycache__/
+*.pyc
+
+# edge-server run artifacts. Everything below is produced by a camera session on the operator's
+# machine and must never be committed: roster.json holds ArcFace face templates (biometric data,
+# one row per named student), out/ holds the document dumps, and the two weights files are
+# downloads that belong to the library cache, not to git.
+edge-server/roster.json
+edge-server/out/
+edge-server/pending_upload.jsonl
+edge-server/config.local.yaml
+edge-server/*.pt
+edge-server/*.task
+edge-server/service_account.json
+edge-server/*.key

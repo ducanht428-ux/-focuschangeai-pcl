@@ -14,24 +14,38 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional
 
 from .constants import (
+    BFR_FURROW_RATIO,
+    BFR_SUSTAIN_MS,
+    BROW_INNER_L,
+    BROW_INNER_R,
     BPM_RELIABLE_AFTER_MS,
     DROWSY_CLOSURE_MS,
+    EYE_MAX_PITCH_DEG,
+    EYE_MAX_YAW_DEG,
     GAZE_H_DRIFT,
     GAZE_V_DRIFT,
     HabitFeature,
+    HEAD_FRONTAL_YAW_DEG,
     HIGH_BLINK_BPM,
     LOOK_AWAY_MS,
     LOOK_AWAY_PITCH_DEG,
     LOOK_AWAY_YAW_DEG,
     LOW_BLINK_BPM,
     MAR_YAWN,
+    MOUTH_L,
+    MOUTH_LOW,
+    MOUTH_R,
+    MOUTH_UP,
     PERCLOS_P70_OPEN,
     PERCLOS_P80_OPEN,
     REF_DISTANCE_CM,
     Situation,
     VISUAL_DRIFT_MS,
     JAW_OPEN_YAWN,
+    LM_COUNT,
     MuscleSensitivity,
+    YAWN_MIN_MS,
+    YAWN_WINDOW_MS,
     clamp01,
 )
 from .engines import EyeEngine, PersonGuard, SituationEngine, SituationFrame
@@ -43,13 +57,16 @@ from .landmarks import (
     focal_px,
     gaze_offsets,
     head_pose_deg,
+    point_dist_px,
 )
+from .quality import signal_quality
 from .sei import (
     SeiComponents,
     SeiTracker,
     bpm_score,
     distance_score,
     expression_score,
+    eye_score,
     gaze_score,
     head_score,
 )
@@ -77,6 +94,9 @@ class PersonResult:
     pitch: Optional[float]
     alert: Optional[str]
     features: Dict[int, float] = field(default_factory=dict)
+    # 0-100 signal quality of the frame this result came from, None when the frame carried
+    # no readable light data. Shown so a low number is never mistaken for a measurement.
+    quality: Optional[int] = None
 
 
 class PersonPipeline:
@@ -87,11 +107,16 @@ class PersonPipeline:
     POSE_WINDOW_MS = 10000
 
     def __init__(self, track_id: int, profile: Optional[HabitProfile] = None,
-                 sensitivity: int = 1, ref_face_width_cm: float = REF_DISTANCE_CM) -> None:
+                 sensitivity: int = 1, min_eye_span_px: float = 12.0) -> None:
         self.track_id = track_id
         self.profile = profile
         self.sens_level = sensitivity
-        self.ref_face_width_cm = ref_face_width_cm
+        # The scheduler's own floor, reused as the "this face is too small to trust" line in
+        # the quality score. Deliberately not the phone's face-box pixel floors - see quality.py.
+        self.min_eye_span_px = min_eye_span_px
+        # sensTime() on the phone: the slider stretches alert timers, never the 500 ms evidence
+        # gate and never the SEI eye-score penalty. Computed once because the alert path runs per frame.
+        self.sens_time = MuscleSensitivity.time_factor(sensitivity)
 
         self.eye = EyeEngine()
         self.eye.set_sensitivity(sensitivity)
@@ -123,6 +148,14 @@ class PersonPipeline:
         self._blink_ts: Deque[int] = deque(maxlen=512)
         self._blink_dur: Deque[int] = deque(maxlen=512)
         self._monitoring_start_ms = 0
+
+        # micro-expression timing (furrowStartMs / yawnStartMs / yawnTimestamps in MainActivity.kt).
+        # A frown and a yawn are durations on the phone, not single frames, so the server keeps the
+        # same three clocks; without them one noisy blendshape frame costs 60 SEI points.
+        self._furrow_start_ms = 0
+        self._yawn_start_ms = 0
+        self._yawn_counted = False
+        self._yawn_ts: Deque[int] = deque(maxlen=64)
 
         # pose window (jitter + std)
         self._pose: Deque = deque(maxlen=300)
@@ -160,24 +193,34 @@ class PersonPipeline:
 
     # ------------------------------------------------------------------
     def _bfr(self, lm: Landmarks, w: int, h: int) -> float:
-        """Brow-Furrow Ratio: vertical eyebrow-to-eye distance normalized by eye width."""
-        # 66/107 left brow/lower, 300/336 right brow/lower (face-mesh indices)
+        """Brow-Furrow Ratio: inner-brow corner spacing over the face width (MainActivity.kt:4182).
+
+        The quantity the phone actually learns is the GAP BETWEEN the two inner brow corners divided
+        by faceWidthPx (which is the eye-corner span, MainActivity.kt:4020): frowning pulls those
+        corners together and the ratio drops. This file used to average two brow-to-lower-lid
+        vertical distances instead - a different measurement that happens to move the same way, which
+        made the learned BFR band incomparable with the phone's and made the 0.88 trigger, tuned on
+        the phone's ratio, mean something else here.
+        """
         try:
-            b1 = abs(lm.y(66) - lm.y(107)) * h
-            b2 = abs(lm.y(300) - lm.y(336)) * h
-            ew = max(1.0, eye_corner_span_px(lm, w, h))
-            return ((b1 + b2) / 2.0) / ew
+            brow = point_dist_px(lm, BROW_INNER_R, BROW_INNER_L, w, h)
+            return brow / max(1.0, eye_corner_span_px(lm, w, h))
         except IndexError:
             return self.baseline_bfr
 
-    def _mar(self, bs: Optional[List[float]], lm: Landmarks, w: int, h: int) -> float:
-        if bs is not None:
-            return bs[4]  # jawOpen blendshape
-        # geometric fallback: mouth openness / eye span
+    def _mar(self, lm: Landmarks, w: int, h: int) -> float:
+        """Mouth Aspect Ratio: lip-to-lip over mouth width, with the phone's own guard.
+
+        MainActivity.kt:4186-4190 returns 0 when the mouth is under a pixel wide, so a collapsed
+        mouth box reports a shut mouth rather than a huge one. The jawOpen blendshape is NOT the
+        server's MAR: on the phone it is the SECOND yawn clause (MainActivity.kt:4472) and it stays
+        in _update_micro_expressions, compared against its own threshold.
+        """
         try:
-            mo = abs(lm.y(17) - lm.y(13)) * h
-            ew = max(1.0, eye_corner_span_px(lm, w, h))
-            return mo / ew
+            mouth_w = point_dist_px(lm, MOUTH_R, MOUTH_L, w, h)
+            if mouth_w < 1.0:
+                return 0.0
+            return point_dist_px(lm, MOUTH_UP, MOUTH_LOW, w, h) / mouth_w
         except IndexError:
             return 0.0
 
@@ -250,6 +293,8 @@ class PersonPipeline:
         student_name: str,
         identity_conf: str,
         nearby_objects: Dict[str, float],
+        light: Optional[tuple] = None,
+        focal: Optional[float] = None,
     ) -> PersonResult:
         eye_span = eye_corner_span_px(lm, w, h) if lm and lm.count else 0.0
         measurable = lm is not None and lm.count >= 140 and eye_span >= 8.0
@@ -259,12 +304,25 @@ class PersonPipeline:
             return self._result(student_id, student_name, identity_conf, False,
                                 Situation.UNKNOWN, None, None)
 
-        yaw, pitch, roll = head_pose_deg(lm, w, h)
+        pose = head_pose_deg(lm, w, h)
+        if pose is None:
+            # No usable face plane (see head_pose_deg). This frame has no pose, so it gets no
+            # verdict either: scoring a degenerate landmark set as "frontal" would hand it a full
+            # posture mark and a 28 degree eye gate it never earned.
+            self._on_no_face(now_ms)
+            return self._result(student_id, student_name, identity_conf, False,
+                                Situation.UNKNOWN, None, None)
+        yaw, pitch, roll = pose
         off_h, off_v = gaze_offsets(lm, w, h)
         gaze_v = off_v if off_v is not None else 0.0
         gaze_h = off_h if off_h is not None else 0.0
         bfr = self._bfr(lm, w, h)
-        f_px = focal_px(w)
+        # The crop's pixels ARE the frame's pixels, so the focal length must come from the FRAME
+        # width and the camera's field of view. Deriving it from the crop width - which is what
+        # focal_px(w) did here - compares a 200 px face box against a ruler built for 1280 px and
+        # reports every desk several times closer than it is, with the error wobbling as the YOLO
+        # box around the head changes size. Only the caller knows the frame, so it is passed in.
+        f_px = focal if focal is not None else focal_px(w)
         raw_dist = estimate_distance_cm(lm, w, h, f_px, abs(yaw))
 
         # --- calibration phase (per person, one time) ---
@@ -279,12 +337,31 @@ class PersonPipeline:
             self._monitoring_start_ms = now_ms
 
         # --- pose deviation from this person's neutral ---
-        yaw_dev = abs(yaw) - self.baseline_yaw
+        # SIGNED, exactly like the phone's yawRawDev = poseYawAbs - baselineYawDeg
+        # (MainActivity.kt:4016). The old line here took abs() first and then subtracted the
+        # baseline, which is a different quantity: it never went negative, so it could not tell a
+        # head turned to the left from one turned to the right. Nothing used it; now everything
+        # below uses this one value instead of re-deriving it six ways.
+        yaw_dev = yaw - self.baseline_yaw
         pitch_dev = pitch - self.baseline_pitch
         roll_dev = roll
-        self._update_pose_window(now_ms, yaw - self.baseline_yaw, pitch - self.baseline_pitch, roll, 0.0)
+        self._update_pose_window(now_ms, yaw_dev, pitch_dev, roll, 0.0)
         pose_std = self._pose_std_deg()
         jitter = self._jitter(lm, w, h)
+
+        # Quality of THIS frame as a signal, ported from computeSignalQuality (MainActivity.kt:3309).
+        # The phone names that argument yawAbs but feeds it the FILTERED DEVIATION from the neutral
+        # baseline (MainActivity.kt:4195 passes yawDeg, which is poseYawAbs - baselineYawDeg), so the
+        # deviation is what is compared against 35/30 deg here too - not the raw head angle.
+        # light is None when the caller could not read the image: recording a score built on default
+        # brightness would hand this frame a near-perfect quality it never earned, so the frame is
+        # recorded with no quality sample at all and the session mean stays honest about the gap.
+        quality = None
+        if light is not None:
+            quality = signal_quality(
+                light[0], eye_span < self.min_eye_span_px,
+                abs(yaw_dev), abs(pitch_dev), lm.count >= LM_COUNT,
+                light[1], light[2])
 
         # --- distance (scaled + smoothed) ---
         dist = raw_dist * self.distance_scale if raw_dist is not None else None
@@ -295,8 +372,8 @@ class PersonPipeline:
                            self.profile.cal_raw_distance_cm if self.profile else None)
 
         # --- eye engine ---
-        pose_ok = abs(yaw - self.baseline_yaw) <= 35.0 and abs(pitch_dev) <= 35.0
-        eye = self.eye.update(lm, w, h, now_ms, yaw - self.baseline_yaw, pitch_dev,
+        pose_ok = abs(yaw_dev) <= EYE_MAX_YAW_DEG and abs(pitch_dev) <= EYE_MAX_PITCH_DEG
+        eye = self.eye.update(lm, w, h, now_ms, yaw_dev, pitch_dev,
                               gaze_v - self.baseline_gaze_v, bs, pose_ok)
 
         if eye.closed:
@@ -331,13 +408,13 @@ class PersonPipeline:
         bpm_reliable = elapsed >= BPM_RELIABLE_AFTER_MS
 
         # --- gaze / look-away / drift state ---
-        head_away = abs(yaw - self.baseline_yaw) > LOOK_AWAY_YAW_DEG or pitch_dev > LOOK_AWAY_PITCH_DEG
+        head_away = abs(yaw_dev) > LOOK_AWAY_YAW_DEG or pitch_dev > LOOK_AWAY_PITCH_DEG
         if head_away:
             if self.look_away_start_ms == 0:
                 self.look_away_start_ms = now_ms
         else:
             self.look_away_start_ms = 0
-        look_away_long = self.look_away_start_ms != 0 and now_ms - self.look_away_start_ms >= LOOK_AWAY_MS
+        look_away_long = self.look_away_start_ms != 0 and now_ms - self.look_away_start_ms >= LOOK_AWAY_MS * self.sens_time
 
         gaze_h_dev = gaze_h - self.baseline_gaze_h
         gaze_v_dev = gaze_v - self.baseline_gaze_v
@@ -347,17 +424,16 @@ class PersonPipeline:
                 self.drift_start_ms = now_ms
         else:
             self.drift_start_ms = 0
-        drift_long = self.drift_start_ms != 0 and now_ms - self.drift_start_ms >= VISUAL_DRIFT_MS
+        drift_long = self.drift_start_ms != 0 and now_ms - self.drift_start_ms >= VISUAL_DRIFT_MS * self.sens_time
 
         # --- micro-expressions ---
-        mar = self._mar(bs, lm, w, h)
-        mar_thr = MuscleSensitivity.mouth_threshold(self.sens_level, MAR_YAWN)
-        jaw_thr = MuscleSensitivity.mouth_threshold(self.sens_level, JAW_OPEN_YAWN)
-        yawn_now = mar > mar_thr or (bs is not None and bs[4] > jaw_thr)
+        mar = self._mar(lm, w, h)
+        yawn_confirmed, confused, yawns_recent = self._update_micro_expressions(
+            mar, bs, bfr, yaw_dev, now_ms)
 
         # --- situation layer ---
         sf = SituationFrame()
-        sf.yaw_deg = yaw - self.baseline_yaw
+        sf.yaw_deg = yaw_dev
         sf.pitch_deg = pitch_dev
         sf.roll_deg = roll_dev
         sf.gaze_v_dev = gaze_v_dev
@@ -368,17 +444,17 @@ class PersonPipeline:
         self._last_sit_frame = sf
 
         # --- SEI components ---
-        posture = head_score(yaw - self.baseline_yaw, pitch_dev, roll_dev, jitter)
+        posture = head_score(yaw_dev, pitch_dev, roll_dev, jitter)
         dist_sc = distance_score(dist)
         gaze_sc = gaze_score(off_h is not None, not eye.closed, gaze_h_dev, gaze_v_dev,
                               drift_long, GAZE_H_DRIFT, GAZE_V_DRIFT)
         eyes_sc = max(0.0, (
-            _eye_score(closed_dur, eye.closed)
+            eye_score(closed_dur, eye.closed)
             - clamp01((perclos_for_score - 5.0) / 25.0) * 50.0
             - clamp01(eye.squint_pct / 60.0) * 15.0
         ))
         bpm_sc = bpm_score(bpm, bpm_reliable, LOW_BLINK_BPM, HIGH_BLINK_BPM)
-        expr_sc = expression_score(yawn_now, 0, bfr, self.baseline_bfr, False)
+        expr_sc = expression_score(yawn_confirmed, yawns_recent, bfr, self.baseline_bfr, confused)
 
         # context penalty: a phone in hand while head pitched down reads as inattention
         context_penalty = 0.0
@@ -398,11 +474,11 @@ class PersonPipeline:
 
         # --- habit accumulation ---
         feat_map = self._observe_session(
-            now_ms, eye, bpm, bpm_reliable, dist, yaw - self.baseline_yaw, pitch_dev,
-            gaze_h_dev, gaze_v_dev, mar, bfr, perclos_for_score, sei_val)
+            now_ms, eye, bpm, bpm_reliable, dist, yaw_dev, pitch_dev,
+            gaze_h_dev, gaze_v_dev, mar, bfr, perclos_for_score, sei_val, quality)
 
         alert = self._pick_alert(eye, closed_dur, perclos_for_score, look_away_long,
-                                 drift_long, yawn_now, too_close, sei_val, self._baseline,
+                                 drift_long, yawn_confirmed, too_close, sei_val, self._baseline,
                                  sf, now_ms)
 
         result = self._result(student_id, student_name, identity_conf, True,
@@ -411,17 +487,19 @@ class PersonPipeline:
         result.openness = eye.openness
         result.bpm = bpm if bpm_reliable else None
         result.distance_cm = dist
-        result.yaw = yaw - self.baseline_yaw
+        result.yaw = yaw_dev
         result.pitch = pitch_dev
         result.alert = alert
         result.features = feat_map
+        result.quality = quality
         self.last_result = result
         self.last_measured_ms = now_ms
         return result
 
     # ------------------------------------------------------------------
     def _observe_session(self, now_ms, eye, bpm, bpm_reliable, dist, yaw, pitch,
-                         gaze_h, gaze_v, mar, bfr, perclos, sei_val) -> Dict[int, float]:
+                         gaze_h, gaze_v, mar, bfr, perclos, sei_val,
+                         quality: Optional[int] = None) -> Dict[int, float]:
         hs = self.session
         feats: Dict[int, float] = {}
         if hs is None:
@@ -430,6 +508,11 @@ class PersonPipeline:
         hs.tick(now_ms, True, habit_valid)
         if not habit_valid:
             return feats
+        # Sampled under exactly the same guard as every feature above, which is where
+        # MainActivity.kt:4683 calls hs.addQuality(). A frame nobody trusted with a BPM
+        # sample must not be allowed to raise the session's mean quality either.
+        if quality is not None:
+            hs.add_quality(float(quality))
         if bpm_reliable:
             hs.observe(HabitFeature.BPM, bpm)
             feats[HabitFeature.BPM] = bpm
@@ -455,11 +538,58 @@ class PersonPipeline:
                 hs.observe_band(f, v)
         return feats
 
+    def _update_micro_expressions(self, mar: float, bs: Optional[List[float]], bfr: float,
+                                  yaw_dev: float, now_ms: int):
+        """Frown and yawn as durations - MainActivity.kt:4454-4489, same clocks.
+
+        Returns (yawn_confirmed, furrow_confused, yawns_recent). Both were single frames here while
+        they are state machines on the phone: one noisy blendshape reading cost the full 60-point
+        mouth penalty and fired a YAWN alert, while a real two-second yawn counted exactly the same
+        as that frame. The sustained frown was not represented at all, so the "confused" input to
+        expression_score was a hard-coded False.
+        """
+        furrow_trigger = MuscleSensitivity.furrow_ratio(self.sens_level, BFR_FURROW_RATIO)
+        furrow_window = MuscleSensitivity.furrow_yaw_window(self.sens_level, HEAD_FRONTAL_YAW_DEG)
+        # The window is a frontal-face gate: brow geometry reads as lowered when the head is tipped,
+        # so a furrow is only counted while the face still points at the camera.
+        furrow_now = abs(yaw_dev) < furrow_window and bfr < self.baseline_bfr * furrow_trigger
+        if furrow_now:
+            if self._furrow_start_ms == 0:
+                self._furrow_start_ms = now_ms
+        else:
+            self._furrow_start_ms = 0
+        confused = (self._furrow_start_ms != 0 and
+                    now_ms - self._furrow_start_ms >= BFR_SUSTAIN_MS * self.sens_time)
+
+        mar_thr = MuscleSensitivity.mouth_threshold(self.sens_level, MAR_YAWN)
+        jaw_thr = MuscleSensitivity.mouth_threshold(self.sens_level, JAW_OPEN_YAWN)
+        # MainActivity.kt:4469-4472: jawOpen is read only when the blendshape list actually reaches
+        # index 4, and it is the second yawn clause, not a replacement for MAR.
+        jaw_open = bs[4] if (bs is not None and len(bs) > 4) else 0.0
+        yawn_now = mar > mar_thr or jaw_open > jaw_thr
+        if yawn_now:
+            if self._yawn_start_ms == 0:
+                self._yawn_start_ms = now_ms
+                self._yawn_counted = False
+        else:
+            self._yawn_start_ms = 0
+            self._yawn_counted = False
+        yawn_confirmed = (yawn_now and
+                          now_ms - self._yawn_start_ms >= YAWN_MIN_MS * self.sens_time)
+        # Counted once per burst, not once per frame, so a long yawn is one event in the
+        # five-minute recency window instead of thirty.
+        if yawn_confirmed and not self._yawn_counted:
+            self._yawn_counted = True
+            self._yawn_ts.append(now_ms)
+        while self._yawn_ts and now_ms - self._yawn_ts[0] > YAWN_WINDOW_MS:
+            self._yawn_ts.popleft()
+        return yawn_confirmed, confused, len(self._yawn_ts)
+
     def _pick_alert(self, eye, closed_dur, perclos, look_away, drift, yawn, too_close,
                     sei_val, baseline, sf, now_ms) -> Optional[str]:
         eyelid_evidence = eye.closed and closed_dur >= 500
         allowed = self.situation.allow(eyelid_evidence, sf, now_ms) if eyelid_evidence else True
-        if eye.closed and closed_dur >= DROWSY_CLOSURE_MS and allowed:
+        if eye.closed and closed_dur >= DROWSY_CLOSURE_MS * self.sens_time and allowed:
             return "DROWSY"
         if perclos is not None and perclos >= 30.0:
             return "PERCLOS_HIGH"
@@ -492,6 +622,10 @@ class PersonPipeline:
         self.closed_start_ms = 0
         self.look_away_start_ms = 0
         self.drift_start_ms = 0
+        # A face that leaves the frame and comes back is not the second half of one yawn.
+        self._furrow_start_ms = 0
+        self._yawn_start_ms = 0
+        self._yawn_counted = False
 
     def _result(self, student_id, student_name, identity_conf, measurable, situation,
                 sei_val, perclos_val, calibrated=True) -> PersonResult:
@@ -507,13 +641,3 @@ class PersonPipeline:
         cutoff = now_ms - self.BPM_WINDOW_MS
         while self._blink_ts and self._blink_ts[0] < cutoff:
             self._blink_ts.popleft()
-
-
-def _eye_score(closed_duration_ms: int, closed_now: bool) -> float:
-    if closed_now and closed_duration_ms >= DROWSY_CLOSURE_MS:
-        return 0.0
-    if closed_now and closed_duration_ms >= 500:
-        return 40.0
-    if closed_now:
-        return 90.0
-    return 100.0

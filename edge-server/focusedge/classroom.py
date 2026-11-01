@@ -18,7 +18,9 @@ from typing import Deque, Dict, List, Optional
 
 from .constants import HabitFeature, Situation
 from .habit import HabitProfile
+from .landmarks import focal_px
 from .person_pipeline import PersonPipeline, PersonResult
+from .quality import face_light, to_gray
 
 
 def _now_ms() -> int:
@@ -44,11 +46,20 @@ class TrackRuntime:
     eye_span_px: float = 0.0               # 0 -> bootstrap candidate until first measured
     last_result: Optional[PersonResult] = None
     nearby: Dict[str, float] = field(default_factory=dict)
+    # Counted here instead of read back out of the alert log: that log is a 200-item ring,
+    # so a busy classroom would quietly lose the earliest alerts of a session and the number
+    # written to Firestore would be short without anything on screen saying so.
+    alert_count: int = 0
+    measured_frames: int = 0
 
 
 class ClassroomPipeline:
     # head region of the person box fed to FaceLandmarker (faces live near the top)
     FACE_TOP_FRACTION = 0.55
+    # Fraction of that region allowed to fall outside the frame before the face is skipped.
+    # Tuned for a tripod camera at the front of a room, where a body touching the edge means the
+    # head is cut too; a phone held by the student is always framed whole, so it has no equivalent.
+    CLIP_MAX_FRACTION = 0.25
 
     def __init__(self, cfg: dict, detector, embedder, roster, analyzer, scheduler,
                  writer, profiles: Optional[Dict[str, HabitProfile]] = None) -> None:
@@ -70,7 +81,6 @@ class ClassroomPipeline:
         self.class_id = cfg.get("class_id", "class")
         self._track_ttl_ms = int(det.get("track_ttl_ms", 15000))
         self._sensitivity = int(person.get("sensitivity", 1))
-        self._ref_face_cm = float(person.get("ref_face_width_cm", 50.0))
         self._habit_learn = bool(person.get("habit_learn", True))
         self._min_span = float(sched.get("min_eye_span_px", 12))
         self._reverify_ms = int(ident.get("reverify_ms", 30000))
@@ -123,11 +133,18 @@ class ClassroomPipeline:
         embedder = None
         try:
             embedder = FaceEmbedder(pack=ident_cfg.get("recognition_pack", "buffalo_l"))
-        except Exception:
-            embedder = None
+        except Exception as e:  # boundary with an external SDK
+            # Printed rather than swallowed: with no embedder every track stays a guest, which
+            # means a run that looks fine on screen writes no sessions document at all. The
+            # reason has to appear on the same screen the operator is watching.
+            print("identity off (%s: %s) - every track stays a guest" % (type(e).__name__, e))
 
         roster_path = cfg.get("roster", "roster.json")
         roster = Roster.load(roster_path) if isinstance(roster_path, str) else roster_path
+        if embedder is not None and not roster.entries():
+            # The other half of the same silence: insightface loaded, but there is nobody to
+            # match against. Enroll with tools/enroll_roster.py before expecting student rows.
+            print("roster %r has no enrolled students - nobody can be bound" % (roster_path,))
 
         analyzer = FaceAnalyzer(
             model_asset_path=cfg.get("face_landmarker_task", "face_landmarker.task"),
@@ -201,7 +218,8 @@ class ClassroomPipeline:
                 rt = TrackRuntime(
                     track_id=p.track_id,
                     identity=self.new_identity_state(),
-                    pipeline=PersonPipeline(p.track_id, None, self._sensitivity, self._ref_face_cm),
+                    pipeline=PersonPipeline(p.track_id, None, self._sensitivity,
+                                            self._min_span),
                     last_seen_ms=now_ms,
                     # bootstrap so a brand-new face is selected once to get a span
                     eye_span_px=self._min_span,
@@ -228,11 +246,20 @@ class ClassroomPipeline:
         # -- schedule + measure the chosen faces --------------------------
         chosen = self._scheduler.select(candidates, now_ms)
         by_track = {rt.track_id: rt for rt in self._tracks.values()}
+        gray = None  # converted at most once per frame, and only if a face actually got measured
+        # One focal length for the whole frame: face crops are pixel windows of this same image, so
+        # they share its scale. Nominal 60 deg horizontal field of view, like the phone.
+        frame_focal = focal_px(w)
         for cand in chosen:
             rt = by_track.get(cand.track_id)
             if rt is None:
                 continue
             crop = self._crop(frame_bgr, cand.face_bbox)
+            light = None
+            if crop is not None:
+                if gray is None:
+                    gray = to_gray(frame_bgr)
+                light = face_light(gray, cand.face_bbox, w, h)
             rgb = crop[:, :, ::-1] if crop is not None else None
             lm, bs = (None, None)
             if rgb is not None:
@@ -244,9 +271,10 @@ class ClassroomPipeline:
             res = rt.pipeline.process(
                 lm, bs, self._box_size(cand.face_bbox)[0], self._box_size(cand.face_bbox)[1],
                 now_ms, self._frame_dt_ms, rt.student_id, rt.student_name,
-                rt.identity_conf, rt.nearby,
+                rt.identity_conf, rt.nearby, light=light, focal=frame_focal,
             )
             rt.last_measured_ms = now_ms
+            rt.measured_frames += 1
             rt.last_result = res
             results.append(res)
             if res.alert:
@@ -306,6 +334,7 @@ class ClassroomPipeline:
         return False
 
     def _register_alert(self, rt: TrackRuntime, code: str, wall_ms: int) -> None:
+        rt.alert_count += 1
         self._alerts.append({
             "student_id": rt.student_id or ("guest-%d" % rt.track_id),
             "student_name": rt.student_name,
@@ -323,13 +352,20 @@ class ClassroomPipeline:
         summary = s.to_summary()
         profile = rt.pipeline.profile or self._profile_for(rt.student_id)
         profile.commit(summary)
-        alerts_total = sum(1 for a in self._alerts if a["student_id"] == rt.student_id)
+        # Measured frames divided by the session's own active time: the previous number was the
+        # gap of whichever frame happened to come last, so one stutter at the end of a 40 minute
+        # session reported the whole session as running at 3 fps.
+        avg_fps = 1000.0 * rt.measured_frames / float(max(1, s.active_ms))
         self._writer.write_session(
             student_id=rt.student_id, student_name=rt.student_name, s=summary,
             band_outcomes=s.band_outcomes(), ended_at_wall_ms=wall_ms, device=str(self._device),
             ineligible_reason=profile.ineligible_reason(summary),
-            alerts_total=alerts_total, false_alerts=0, csv_rows=summary.count[HabitFeature.SEI],
-            avg_fps=1000.0 / max(1.0, self._frame_dt_ms),
+            alerts_total=rt.alert_count,
+            # None, not 0: nobody on the camera side can mark an alert as wrong, and writing a
+            # zero would put "no false alerts happened" on a session where that was never checked.
+            false_alerts=None,
+            csv_rows=summary.count[HabitFeature.SEI],
+            avg_fps=avg_fps,
         )
         if self._habit_learn:
             self._writer.write_band(rt.student_id, rt.student_name, profile, wall_ms, str(self._device))
@@ -355,6 +391,8 @@ class ClassroomPipeline:
                     entry["distance_cm"] = round(r.distance_cm, 1)
                 if r.alert:
                     entry["alert"] = r.alert
+                if r.quality is not None:
+                    entry["quality"] = r.quality
             students[key] = entry
         self._writer.write_class_live(self.class_id, students, list(self._alerts), wall_ms)
 
@@ -398,6 +436,14 @@ class ClassroomPipeline:
         fx1 = min(w, int(cx + size / 2))
         fy1 = min(h, int(cy + size / 2))
         if fx1 - fx0 < 8 or fy1 - fy0 < 8:
+            return None
+        # How much of the wanted square the frame edge ate. A student half out of frame still
+        # produces a box that looks normal here, and both the eye ratio and the distance come out
+        # of that box's width - so a clipped face is reported as a closer face with sharper eyes
+        # than were ever captured. Refusing the box is the honest answer: the next frame where
+        # this person is fully in view is measured normally.
+        kept = float(min(fx1 - fx0, fy1 - fy0))
+        if size > 0.0 and kept < size * (1.0 - self.CLIP_MAX_FRACTION):
             return None
         return (fx0, fy0, fx1, fy1)
 

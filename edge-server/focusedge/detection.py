@@ -46,6 +46,38 @@ class PersonTrack:
         return self.bbox[3] - self.bbox[1]
 
 
+def assign_objects(persons: List["PersonTrack"], objects: List[tuple]) -> List[tuple]:
+    """Record each context object on the person who actually owns it.
+
+    An object belongs to the tightest person box that contains its centre. The first version took
+    the FIRST person in YOLO's output order and stopped looking: two desks pressed together means
+    one phone whose centre sits inside both boxes, and the student who was listed second never got
+    the context while the one listed first took a penalty - and a phone-in-hand alert - for an
+    object in somebody else's space. Choosing the smallest containing box is the same tie-break an
+    annotator would use: whoever the object occupies most of, owns it.
+
+    Returns the objects no person box contains, for scene-level rules.
+    """
+    unassigned = []
+    for name, box, cf in objects:
+        cx = (box[0] + box[2]) / 2.0
+        cy = (box[1] + box[3]) / 2.0
+        owner = None
+        owner_area = 0.0
+        for p in persons:
+            if p.bbox[0] <= cx <= p.bbox[2] and p.bbox[1] <= cy <= p.bbox[3]:
+                area = p.width * p.height
+                if owner is None or area < owner_area:
+                    owner = p
+                    owner_area = area
+        if owner is not None:
+            if cf > owner.nearby_objects.get(name, 0.0):
+                owner.nearby_objects[name] = cf
+        else:
+            unassigned.append((name, box, cf))
+    return unassigned
+
+
 class Detector:
     """Wraps an Ultralytics YOLO model in tracking mode.
 
@@ -102,18 +134,5 @@ class Detector:
                 raw_objects.append((CONTEXT_CLASSES[c], tuple(box), float(cf)))
 
         # Assign each object to the person whose box contains its center.
-        unassigned = []
-        for name, box, cf in raw_objects:
-            cx = (box[0] + box[2]) / 2.0
-            cy = (box[1] + box[3]) / 2.0
-            owner = None
-            for p in raw_persons:
-                if p.bbox[0] <= cx <= p.bbox[2] and p.bbox[1] <= cy <= p.bbox[3]:
-                    owner = p
-                    break
-            if owner is not None:
-                if cf > owner.nearby_objects.get(name, 0.0):
-                    owner.nearby_objects[name] = cf
-            else:
-                unassigned.append((name, box, cf))
+        unassigned = assign_objects(raw_persons, raw_objects)
         return raw_persons, unassigned

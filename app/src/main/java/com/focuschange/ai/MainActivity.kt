@@ -60,12 +60,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.focuschange.ai.ui.theme.FocusChangeAITheme
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import java.nio.ByteBuffer
 import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import org.json.JSONObject
 import org.json.JSONArray
 import java.util.Locale
@@ -421,6 +425,12 @@ class MainActivity : ComponentActivity() {
         const val TL_MAX_EVENTS = 400
         const val CSV_TAIL_LINES = 10
 
+        /** Cache subfolder holding zip exports. Must match the <cache-path> in res/xml/file_paths.xml. */
+        const val RESEARCH_EXPORT_DIR = "export"
+
+        /** Cached zips older than this are dropped before a new one is packed. */
+        const val RESEARCH_EXPORT_STALE_MS = 3_600_000L
+
         const val LOG_EVERY_N_FRAMES = 30
     }
 
@@ -541,6 +551,8 @@ class MainActivity : ComponentActivity() {
     private var firebaseText by mutableStateOf("Firebase: chưa bật")
     private var csvTailLines by mutableStateOf(emptyList<String>())
     private var csvTailNote by mutableStateOf("")
+    private var csvExportNote by mutableStateOf("")
+    private var csvExporting by mutableStateOf(false)
     private var timelineMarks by mutableStateOf(emptyList<Pair<Float, Int>>())
 
     /**
@@ -1641,6 +1653,24 @@ class MainActivity : ComponentActivity() {
                                         TextButton(onClick = { readCsvTail() }) {
                                             Text("Đọc lại")
                                         }
+                                    }
+
+                                    // On its own row: the two labels above already fill the screen width,
+                                    // and a cut-off button reads like a broken one.
+                                    TextButton(onClick = { exportResearchZip() }) {
+                                        Text(
+                                            if (csvExporting) {
+                                                "Đang đóng gói..."
+                                            } else {
+                                                "Gửi toàn bộ file CSV (ZIP)"
+                                            }
+                                        )
+                                    }
+                                    if (csvExportNote.isNotEmpty()) {
+                                        Text(
+                                            csvExportNote,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
                                     }
 
                                     if (showCsvTail) {
@@ -6496,6 +6526,136 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    /**
+     * Packs every research file into one zip and opens the system share sheet.
+     *
+     * Without this the week's measurements can only leave the phone over a cable: the folder sits in
+     * app-private storage, so no file manager on the phone can see it, and the replay experiment needs
+     * the CSVs on a computer. One archive instead of one send per file because a single attachment
+     * survives email and cloud upload while thirty separate CSVs do not.
+     *
+     * Packing reads every file from flash, so it runs off the UI thread exactly like [readCsvTail].
+     */
+    private fun exportResearchZip() {
+        if (csvExporting) {
+            return
+        }
+        csvExporting = true
+        csvExportNote = "Đang đóng gói dữ liệu nghiên cứu..."
+        val ctx = applicationContext
+        Thread {
+            val outcome: Pair<Intent?, String> = try {
+                buildResearchZipIntent(ctx)
+            } catch (e: Exception) {
+                Log.w(TAG, "Đóng gói dữ liệu nghiên cứu thất bại", e)
+                null to "Không đóng gói được: ${e.message}"
+            }
+            runOnUiThread {
+                csvExporting = false
+                csvExportNote = outcome.second
+                val share = outcome.first
+                if (share != null) {
+                    try {
+                        startActivity(Intent.createChooser(share, "Gửi dữ liệu nghiên cứu"))
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Không mở được hộp thoại chia sẻ dữ liệu nghiên cứu", e)
+                        csvExportNote = "Đã đóng gói nhưng không mở được hộp thoại chia sẻ."
+                    }
+                }
+            }
+        }.start()
+    }
+
+    /** Returns the send intent plus the line to show, or null for the intent and the reason why. */
+    private fun buildResearchZipIntent(ctx: Context): Pair<Intent?, String> {
+        // The writer batches rows and only flushes every 30, so packing immediately after a tap would
+        // silently leave the last seconds of a running session out of the archive. Two seconds off the
+        // UI thread lets the pump catch up; anything still pending afterwards is named in the note.
+        val unwritten = drainWriteQueue()
+        val files = dataLogger.researchFiles(ctx)
+            ?: return null to "Không liệt kê được thư mục nghiên cứu. Chưa chắc là mất dữ liệu - thử bấm lại."
+        if (files.isEmpty()) {
+            return null to "Chưa có file nào trong thư mục nghiên cứu. Bật ghi CSV, chạy một phiên rồi bấm lại."
+        }
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(java.util.Date())
+        val outDir = File(ctx.cacheDir, RESEARCH_EXPORT_DIR)
+        if (!outDir.isDirectory && !outDir.mkdirs()) {
+            return null to "Không tạo được thư mục tạm trong bộ nhớ đệm của app."
+        }
+        // A week of taps would otherwise leave a week of duplicate copies of one student's numbers in
+        // the cache. Only stale ones go: a share sheet still open has to be able to finish reading.
+        val cutoff = System.currentTimeMillis() - RESEARCH_EXPORT_STALE_MS
+        outDir.listFiles()?.forEach { old ->
+            if (old.lastModified() < cutoff) {
+                old.delete()
+            }
+        }
+        val zipFile = File(outDir, "focuschangeai-research-$stamp.zip")
+        val buffer = ByteArray(32 * 1024)
+        var packed = 0
+        FileOutputStream(zipFile).buffered().use { sink ->
+            ZipOutputStream(sink).use { zip ->
+                for (f in files) {
+                    try {
+                        zip.putNextEntry(ZipEntry(f.name))
+                        f.inputStream().use { source ->
+                            var read = source.read(buffer)
+                            while (read > 0) {
+                                zip.write(buffer, 0, read)
+                                read = source.read(buffer)
+                            }
+                        }
+                        zip.closeEntry()
+                        packed++
+                    } catch (e: Exception) {
+                        // One unreadable file must not cost the whole archive: the rest of the week is
+                        // still analysable, and the count below says a file was skipped.
+                        Log.w(TAG, "Bỏ qua ${f.name} khi đóng gói", e)
+                        runCatching { zip.closeEntry() }
+                    }
+                }
+            }
+        }
+        if (packed == 0) {
+            zipFile.delete()
+            return null to "Không đọc được file nào để đóng gói."
+        }
+        val uri = FileProvider.getUriForFile(ctx, "$packageName.fileprovider", zipFile)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/zip"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val skipped = files.size - packed
+        val note = String.format(
+            Locale.US,
+            "Đã gói %d file (%.1f MB) vào %s.",
+            packed, zipFile.length() / 1_048_576.0, zipFile.name
+        ) + (if (skipped > 0) " Bỏ qua $skipped file không đọc được." else "") +
+            (if (unwritten > 0) {
+                " Còn $unwritten dòng chưa ghi ra file - chạy lại nút này sau khi phiên đo kết thúc."
+            } else {
+                ""
+            })
+        return intent to note
+    }
+
+    /**
+     * Give the CSV writer up to two seconds to empty its queue, then report what it still holds.
+     *
+     * Rows are only on flash after the pump's periodic flush. Waiting is what makes "gửi toàn bộ file"
+     * true for a session that just stopped; the leftover count is reported rather than hidden because a
+     * silently shorter archive is exactly the kind of thing that ruins a week of measurements.
+     */
+    private fun drainWriteQueue(): Int {
+        var attempts = 0
+        while (dataLogger.pendingLines() > 0 && attempts < 8) {
+            Thread.sleep(250L)
+            attempts++
+        }
+        return dataLogger.pendingLines()
+    }
+
     /** Explanation for every column, written so nobody has to guess when opening the file on a computer. */
     private fun csvColumnLegend(): String = buildString {
         appendLine("Đơn vị và ý nghĩa của các cột hay bị đọc sai:")
@@ -6681,7 +6841,9 @@ private val PanelGlossary: List<Pair<String, String>> = listOf(
         "Ngoài ba loại bản ghi đó, app không tự gửi thêm dữ liệu nào khác. Mất mạng thì lệnh " +
         "ghi nằm trong hàng đợi ngoài luồng của Firestore và tự gửi lại khi có mạng. Sao lưu dự " +
         "phòng của hệ thống đã tắt (allowBackup=false), dữ liệu nằm trong thư mục riêng của app, " +
-        "và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm nút tạo ra."
+        "và văn bản chia sẻ chỉ gồm những dòng bạn tự bấm nút tạo ra. Nút 'Gửi toàn bộ file CSV (ZIP)' " +
+        "cũng nằm trong luật đó: nó chỉ gói những con số đã ghi sẵn trong thư mục nghiên cứu rồi đưa " +
+        "cho bạn tự chọn nơi gửi, và ảnh vẫn không rời khỏi điện thoại."
 )
 
 /** Colour bands for the event rows, in the same order as the TL_BAND_* constants above. */

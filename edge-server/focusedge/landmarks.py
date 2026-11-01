@@ -7,7 +7,7 @@ unchanged. The geometry helpers reproduce the app's head-pose / gaze / distance 
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 from .constants import (
     CHIN,
@@ -16,10 +16,11 @@ from .constants import (
     EYE_OUTER_WIDTH_CM,
     EYE_R_IN,
     EYE_R_OUT,
+    FACE_LEFT_SIDE,
+    FACE_RIGHT_SIDE,
     FOREHEAD,
     L_IRIS,
     LM_COUNT,
-    NOSE_TIP,
     R_IRIS,
     REF_DISTANCE_CM,
 )
@@ -53,15 +54,16 @@ class Landmarks:
 EMPTY_LANDMARKS = Landmarks([], 0)
 
 
-def _px_dist(lm: Landmarks, a: int, b: int, w: int, h: int) -> float:
+def point_dist_px(lm: Landmarks, a: int, b: int, w: int, h: int) -> float:
+    """Pixel distance between two landmarks - the app's pixelDistance()."""
     dx = (lm.x(a) - lm.x(b)) * w
     dy = (lm.y(a) - lm.y(b)) * h
     return math.sqrt(dx * dx + dy * dy)
 
 
 def eye_corner_span_px(lm: Landmarks, w: int, h: int) -> float:
-    """Distance between the two outer eye corners - the app's face-width proxy."""
-    return _px_dist(lm, EYE_R_OUT, EYE_L_OUT, w, h)
+    """Distance between the two outer eye corners - the app's face-width proxy (faceWidthPx)."""
+    return point_dist_px(lm, EYE_R_OUT, EYE_L_OUT, w, h)
 
 
 def estimate_distance_cm(lm: Landmarks, w: int, h: int, focal_px: float, yaw_abs_deg: float) -> Optional[float]:
@@ -74,31 +76,53 @@ def estimate_distance_cm(lm: Landmarks, w: int, h: int, focal_px: float, yaw_abs
     return EYE_OUTER_WIDTH_CM * focal_px / (corner_px / cos_y)
 
 
-def head_pose_deg(lm: Landmarks, w: int, h: int) -> "tuple[float, float, float]":
-    """yaw / pitch / roll in degrees from face-mesh geometry.
+def head_pose_deg(lm: Landmarks, w: int, h: int) -> Optional[Tuple[float, float, float]]:
+    """yaw / pitch / roll in degrees: a port of computeHeadPose() (MainActivity.kt:3273).
 
-    A lightweight, dependency-free stand-in for the app's solvePnP: it uses the same
-    landmark triplets (forehead / nose tip / chin, eye corners) so the *deviation from
-    the calibrated neutral pose* behaves the same way the SituationEngine expects.
-    Roll from the eye-corner line; yaw from horizontal nose offset across the eye line;
-    pitch from the nose-tip position between forehead and chin.
+    Same three vectors as the phone. The horizontal one joins the two sides of the face plane
+    (454 - 234), the vertical one joins forehead to chin (10 - 152), both taken in pixels and
+    including MediaPipe's z, and their cross product is the direction the face is pointing.
+    Yaw and pitch are read off that normal, roll off the cheek line. Convention as in the app:
+    yaw positive = turned toward the subject's left, pitch positive = bending down.
+
+    Replaces a two-dimensional guess (nose offset across the eye line, multiplied by 2.2 to look
+    like degrees). It agreed with the phone in sign but not in scale, which meant the thresholds
+    in constants.py - the 28 degree eye gate, the 18 degree look-away gate, the furrow window -
+    were each enforced against a different ruler on the two devices, so a head turn could alert
+    on one and pass on the other.
+
+    Returns None when the plane degenerates. That is an unmeasurable frame, not a frontal head:
+    the phone keeps its previous angles in that case, but a classroom camera must not carry an
+    old pose into a new frame, because the next alert would be judged by geometry nobody saw.
     """
-    rx, ry = lm.x(EYE_R_OUT) * w, lm.y(EYE_R_OUT) * h
-    lx, ly = lm.x(EYE_L_OUT) * w, lm.y(EYE_L_OUT) * h
-    roll = math.degrees(math.atan2(ly - ry, lx - rx))
+    if lm.count <= FACE_LEFT_SIDE:
+        return None
+    wf = float(w)
+    hf = float(h)
 
-    nose_x = lm.x(NOSE_TIP) * w
-    mid_eye_x = (rx + lx) / 2.0
-    eye_span = max(1.0, math.hypot(lx - rx, ly - ry))
-    yaw = math.degrees(math.atan2(nose_x - mid_eye_x, eye_span)) * 2.2
+    rx = (lm.x(FACE_LEFT_SIDE) - lm.x(FACE_RIGHT_SIDE)) * wf
+    ry = (lm.y(FACE_LEFT_SIDE) - lm.y(FACE_RIGHT_SIDE)) * hf
+    rz = (lm.z(FACE_LEFT_SIDE) - lm.z(FACE_RIGHT_SIDE)) * wf
 
-    nose_y = lm.y(NOSE_TIP) * h
-    fore_y = lm.y(FOREHEAD) * h
-    chin_y = lm.y(CHIN) * h
-    face_h = max(1.0, chin_y - fore_y)
-    # ratio of the nose along the forehead->chin line; 0.5 is neutral
-    ratio = (nose_y - fore_y) / face_h
-    pitch = (ratio - 0.5) * 90.0
+    ux = (lm.x(FOREHEAD) - lm.x(CHIN)) * wf
+    uy = (lm.y(FOREHEAD) - lm.y(CHIN)) * hf
+    uz = (lm.z(FOREHEAD) - lm.z(CHIN)) * wf
+
+    nx = ry * uz - rz * uy
+    ny = rz * ux - rx * uz
+    nz = rx * uy - ry * ux
+
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-6:
+        return None
+
+    fx = nx / length
+    fy = ny / length
+    fz = nz / length
+
+    yaw = math.degrees(math.atan2(fx, -fz))
+    pitch = math.degrees(math.atan2(fy, math.sqrt(fx * fx + fz * fz)))
+    roll = math.degrees(math.atan2(ry, max(abs(rx), 0.0001)))
     return yaw, pitch, roll
 
 

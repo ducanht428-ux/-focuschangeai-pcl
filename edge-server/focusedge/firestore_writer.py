@@ -1,16 +1,20 @@
 """Layer 5 - cloud sync, keyed by studentId.
 
-Mirrors FirebaseSync.kt exactly where it matters:
-  * deterministic document ids  sessions/<sanitize(studentId)>-<sessionId>
-  * "not measured" is a MISSING column, never a fabricated 0
-  * refused writes go to an on-disk queue and are resent (never silently dropped)
+Mirrors FirebaseSync.kt where it matters - the field names, the "not measured is a
+missing column, never a 0" rule, the on-disk retry queue - but it must NOT mirror the
+document keys. The phone writes sessions/<sanitize(id)>-<n>, presence/<id> and
+bands/<id> for the same child, and set() replaces a whole document, so a camera run
+would silently erase the week of phone data the habit profile is built from, and the
+teacher's screen would alternate between two instruments with nothing to say which one
+produced the number on screen.
 
-Adds the multi-person records the phone never had:
-  * class_live/<classId>  - one document per class, overwritten on a timer, so a
-    teacher's screen reads ONE doc instead of N heartbeats (write cost is flat in
-    class size).
-If no service-account is configured the writer dumps the same payloads to local JSON
-so the pipeline is runnable and inspectable offline.
+One profile per student, one row per instrument. Everything the camera writes stays in
+the SAME collection, so a profile is still read by studentId, but under a key carrying
+"-cam-":
+  * sessions/<id>-cam-<n>   never collides with the phone's <id>-<n>
+  * bands/<id>-cam          sits beside the phone's band for the same child
+  * presence/<id>           merged, every camera field prefixed cam_, so a beat from the
+                            camera cannot blank the phone's beat
 """
 from __future__ import annotations
 
@@ -30,8 +34,19 @@ def sanitize(student_id: str) -> str:
     return "".join(out)
 
 
+# Tagged into the document name rather than the payload because two instruments measuring
+# the same child are two rows of evidence, not one row that last writer wins. "cam" cannot
+# collide with a session index: the phone's key is <id>-<digits>, this is <id>-cam-<digits>.
+SOURCE_TAG = "cam"
+
+
 def document_id(student_id: str, session_id: int) -> str:
-    return sanitize(student_id) + "-" + str(session_id)
+    return sanitize(student_id) + "-" + SOURCE_TAG + "-" + str(session_id)
+
+
+def student_doc_key(student_id: str) -> str:
+    """Document name for the one-row-per-student tables, camera-namespaced."""
+    return sanitize(student_id) + "-" + SOURCE_TAG
 
 
 COLLECTION = "sessions"
@@ -79,7 +94,8 @@ class FirestoreWriter:
     def write_session(self, student_id: str, student_name: str, s: SessionSummary,
                       band_outcomes, ended_at_wall_ms: int, device: str,
                       ineligible_reason: Optional[str], alerts_total: int,
-                      false_alerts: int, csv_rows: int, avg_fps: float) -> None:
+                      csv_rows: int, avg_fps: float,
+                      false_alerts: Optional[int] = None) -> None:
         payload = self.build_session_payload(
             student_id, student_name, s, band_outcomes, ended_at_wall_ms, device,
             ineligible_reason, alerts_total, false_alerts, csv_rows, avg_fps)
@@ -98,7 +114,6 @@ class FirestoreWriter:
             "face_ratio": _round4(s.face_ratio),
             "valid_ratio": _round4(s.valid_ratio),
             "alerts_total": alerts_total,
-            "false_alerts": false_alerts,
             "csv_rows": csv_rows,
             "avg_fps": _round2(avg_fps),
             "device": device,
@@ -106,6 +121,10 @@ class FirestoreWriter:
             "source": "edge-camera",
             "eligible": ineligible_reason is None,
         }
+        # Only when someone actually counted them. A camera run has no way to mark an alert wrong,
+        # and writing 0 there reads exactly like "checked, none were wrong".
+        if false_alerts is not None:
+            out["false_alerts"] = false_alerts
         if s.quality_count > 0:
             out["quality_mean"] = _round2(s.quality)
         if ineligible_reason is not None:
@@ -157,26 +176,30 @@ class FirestoreWriter:
             out[f"band_typical_{key}"] = _round2(b.mean)
             out[f"band_min_{key}"] = _round2(b.min)
             out[f"band_max_{key}"] = _round2(b.max)
-        self._set(f"{BAND_COLLECTION}/{sanitize(student_id)}", out, kind="band")
+        self._set(f"{BAND_COLLECTION}/{student_doc_key(student_id)}", out, kind="band")
 
     def write_presence(self, student_id: str, student_name: str, session_id: int,
                        started_at_wall_ms: int, beat_at_wall_ms: int, active_ms: int,
                        sei_mean: Optional[float], state: str) -> None:
+        # Every value carries the cam_ prefix and the write is a merge, because presence/<id> is
+        # one live row per child that the phone also beats into. A plain set() here would blank the
+        # phone's state and its session number the moment the camera pinged, and the teacher's
+        # screen would show "learning" for a child whose phone says otherwise.
         out: Dict = {
             "schema_h": SCHEMA,
             "student_id": student_id,
             "student_name": student_name,
-            "session_id": session_id,
-            "started_at_wall_ms": started_at_wall_ms,
-            "beat_at_wall_ms": beat_at_wall_ms,
-            "active_ms": active_ms,
-            "state": state,
+            "cam_session_id": session_id,
+            "cam_started_at_wall_ms": started_at_wall_ms,
+            "cam_beat_at_wall_ms": beat_at_wall_ms,
+            "cam_active_ms": active_ms,
+            "cam_state": state,
             "source": "edge-camera",
         }
         if sei_mean is not None:
-            out["sei_mean"] = _round2(sei_mean)
+            out["cam_sei_mean"] = _round2(sei_mean)
         self._set(f"{PRESENCE_COLLECTION}/{sanitize(student_id)}", out, kind="presence",
-                  queue_on_fail=False)
+                  queue_on_fail=False, merge=True)
 
     def write_class_live(self, class_id: str, students: Dict[str, Dict],
                          alerts: List[Dict], updated_at_wall_ms: int) -> None:
@@ -191,22 +214,23 @@ class FirestoreWriter:
                   queue_on_fail=False)
 
     # ------------------------------------------------------------------
-    def _set(self, doc_path: str, payload: Dict, kind: str, queue_on_fail: bool = True) -> None:
+    def _set(self, doc_path: str, payload: Dict, kind: str, queue_on_fail: bool = True,
+             merge: bool = False) -> None:
         with self._lock:
             if self._db is None:
                 self._dump_local(doc_path, payload)
                 return
         try:
-            self._db.document(doc_path).set(payload)
+            self._db.document(doc_path).set(payload, merge=merge)
             self.sent += 1
-        except Exception as e:
+        except Exception as e:  # boundary with an external SDK
             self.failed += 1
             self.last_error = type(e).__name__
             if queue_on_fail:
-                self._enqueue(doc_path, payload)
+                self._enqueue(doc_path, payload, merge)
 
-    def _enqueue(self, doc_path: str, payload: Dict) -> None:
-        rec = {"doc": doc_path, "payload": payload}
+    def _enqueue(self, doc_path: str, payload: Dict, merge: bool = False) -> None:
+        rec = {"doc": doc_path, "payload": payload, "merge": merge}
         with self._lock:
             # replace an older queued payload for the SAME document
             self._pending = [p for p in self._pending if p["doc"] != doc_path]
@@ -244,7 +268,7 @@ class FirestoreWriter:
             batch = list(self._pending)
         for rec in batch:
             try:
-                self._db.document(rec["doc"]).set(rec["payload"])
+                self._db.document(rec["doc"]).set(rec["payload"], merge=rec.get("merge", False))
                 accepted += 1
                 with self._lock:
                     self._pending = [p for p in self._pending if p is not rec]
