@@ -4872,6 +4872,17 @@ class MainActivity : ComponentActivity() {
             if (sitFrame.poseStdDeg.isFinite()) {
                 b.append(String.format(Locale.US, "%.3f", sitFrame.poseStdDeg))
             }
+            // The four cheek / mouth-corner channels are written last, in the same leading-comma style,
+            // so the file keeps one shape per column count and a reader of an older file still finds
+            // every column where it expects. Empty cell = blendshapes off for that frame, never a 0
+            // that would read as "this side of the face was perfectly still".
+            for (idx in 5..8) {
+                b.append(',')
+                val channel = blendChannel(blend, idx)
+                if (channel.isFinite()) {
+                    b.append(String.format(Locale.US, "%.3f", channel))
+                }
+            }
             dataLogger.submit(b.toString())
         }
 
@@ -5197,9 +5208,13 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Takes 5 blendshape coefficients: [left blink, right blink, left squint, right squint, jaw open].
+     * Takes 9 blendshape coefficients: [left blink, right blink, left squint, right squint, jaw open,
+     * left cheek, right cheek, left mouth corner, right mouth corner].
      * Returns null when FaceLandmarker has not been given setOutputFaceBlendshapes(true) - then the eye
      * analysis falls back to the geometry-only mode by itself.
+     *
+     * The last four cost nothing to obtain: FaceLandmarker already computes the whole 52-channel list in
+     * the same pass, and this function only reads four more names out of it.
      */
     private fun extractBlend(
         result: com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
@@ -5214,6 +5229,10 @@ class MainActivity : ComponentActivity() {
             var squintL = 0f
             var squintR = 0f
             var jawOpen = 0f
+            var cheekL = 0f
+            var cheekR = 0f
+            var smileL = 0f
+            var smileR = 0f
             for (c in list) {
                 when (c.categoryName()) {
                     "eyeBlinkLeft" -> blinkL = c.score()
@@ -5221,14 +5240,28 @@ class MainActivity : ComponentActivity() {
                     "eyeSquintLeft" -> squintL = c.score()
                     "eyeSquintRight" -> squintR = c.score()
                     "jawOpen" -> jawOpen = c.score()
+                    "cheekSquintLeft" -> cheekL = c.score()
+                    "cheekSquintRight" -> cheekR = c.score()
+                    "mouthSmileLeft" -> smileL = c.score()
+                    "mouthSmileRight" -> smileR = c.score()
                 }
             }
             if (blinkL < 0f || blinkR < 0f) null
-            else floatArrayOf(blinkL, blinkR, squintL, squintR, jawOpen)
+            else floatArrayOf(blinkL, blinkR, squintL, squintR, jawOpen, cheekL, cheekR, smileL, smileR)
         } catch (e: Exception) {
             null
         }
     }
+
+    /**
+     * One blendshape channel as a CSV value.
+     *
+     * NaN rather than 0f when blendshapes are off: 0 means "this side is completely still", which is the
+     * opposite claim of "the app did not look at this channel", and the empty cell is what the column
+     * count check and every reader downstream rely on.
+     */
+    private fun blendChannel(blend: FloatArray?, index: Int): Float =
+        if (blend != null && blend.size > index) blend[index] else Float.NaN
 
     private fun analyzeFrame(imageProxy: ImageProxy) {
         // First thing, before any early return: this is the heartbeat the HUD staleness guard reads.
@@ -6676,7 +6709,7 @@ class MainActivity : ComponentActivity() {
         appendLine("                  -1 = chưa học được dải (hồ sơ còn thiếu phiên), -2 = khung này không chấm")
         appendLine("                  Dải = mức điển hình ±2.5 lần dao động của chính em đó. Đây là mô tả,")
         appendLine("                  không phải ngưỡng cắt cảnh báo: cột band_* và cột alert_code độc lập nhau.")
-        appendLine("  4 cột mới nhất viết sau khối band, nên không cột nào ở trên dịch chỗ:")
+        appendLine("  8 cột mới nhất viết sau khối band, nên không cột nào ở trên dịch chỗ:")
         appendLine("  situation     em đang làm gì, đoán từ HÌNH HỌC đầu (không nhận diện vật thể):")
         appendLine("                  0 ngồi thẳng, 1 cúi xuống (viết/đọc), 2 nghiêng đầu,")
         appendLine("                  3 quay sang bên, 4 gật đầu ít cử động, 5 không đủ tín hiệu.")
@@ -6688,6 +6721,15 @@ class MainActivity : ComponentActivity() {
         appendLine("  closed_ms     mắt nhắm liên tục tính đến khung này (ms) - đầu vào của hai cột trên.")
         appendLine("  pose_std_deg  dao động tư thế đầu trong 10 giây gần nhất (độ). Để trống khi cửa sổ chưa")
         appendLine("                  đủ mẫu (tức khoảng 10 giây đầu phiên); 0 ở đây nghĩa là đứng yên hẳn, ngược lại.")
+        appendLine("  cheek_squint_l/r  má bên trái/phải bị kéo lên (0-1). mouth_smile_l/r  khóe miệng bên")
+        appendLine("                  trái/phải bị kéo ra (0-1). Bốn cột này là hệ số do mô hình khuôn mặt")
+        appendLine("                  trả ra sẵn, app chỉ đọc thêm - không tốn khung hình nào cả.")
+        appendLine("                  Chúng có mặt để một câu hỏi kiểu 'mặt giật khoảng 1-2 giây' trả lời được")
+        appendLine("                  bằng số: giật một bên thì một cột nhô lên còn cột bên kia nằm yên, còn")
+        appendLine("                  nói chuyện, nuốt hay cười thì kéo cả hai bên cùng lúc.")
+        appendLine("                  App KHÔNG cảnh báo và KHÔNG kết luận gì về bốn cột này: chưa có dữ liệu")
+        appendLine("                  nhãn thì mọi ngưỡng đặt lên chúng chỉ là đoán, và 'giật mặt' là một")
+        appendLine("                  tuyên bố y tế mà file này không đỡ nổi. Để trống = tắt blendshape.")
         append("\n")
         append(
             String.format(

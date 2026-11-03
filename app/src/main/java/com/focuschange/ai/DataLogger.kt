@@ -35,8 +35,8 @@ internal class DataLogger {
     }
 
     /**
-     * 37 measurement columns + 8 two-sided band columns + 4 situation columns = 49; the order must
-     * match the row builder in MainActivity.
+     * 37 measurement columns + 8 two-sided band columns + 4 situation columns + 4 cheek/mouth
+     * blendshape columns = 53; the order must match the row builder in MainActivity.
      *
      * This list is public (instead of only the header string) so places that must write an "empty"
      * row can look columns up BY NAME. Counting positions by hand means one column inserted in the
@@ -71,7 +71,17 @@ internal class DataLogger {
             // rather than re-derived offline so a recorded session can be replayed to the same answer:
             // a replay that has to guess the closure timer is a second implementation of it, free to
             // drift from the real one without anything failing.
-            listOf("situation", "alert_held", "closed_ms", "pose_std_deg")
+            // The four cheek/mouth channels are appended after everything else, so a file from before
+            // them still opens with the same script. They exist because "the face twitched for a second
+            // on one side" is a question the eye and mouth-ratio columns cannot answer at all: a twitch
+            // of one cheek moves that side's cheek/mouth-corner coefficient while the other side stays
+            // flat, and that left/right difference is the only thing in the file that separates it from
+            // talking, swallowing or a smile, which pull both sides. They are recorded, never alerted
+            // on: no labelled data exists, so a threshold on them would be a guess dressed as a finding.
+            listOf(
+                "situation", "alert_held", "closed_ms", "pose_std_deg",
+                "cheek_squint_l", "cheek_squint_r", "mouth_smile_l", "mouth_smile_r"
+            )
 
     val header: String = columnNames.joinToString(",")
 

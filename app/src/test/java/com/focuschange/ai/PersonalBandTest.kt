@@ -136,9 +136,15 @@ class PersonalBandTest {
         // from the end of the list without moving a single older column - so this test now pins the
         // group order (measured, then band, then situation) instead of "band is last".
         val situationCols = listOf("situation", "alert_held", "closed_ms", "pose_std_deg")
-        val tail = cols.takeLast(expected.size + situationCols.size)
+        // The cheek / mouth-corner block went in after the situation group, so those four are the only
+        // names whose position is allowed to move. Pinned because a value written into the wrong slot
+        // leaves no trace on screen: the file opens, every number looks plausible, and the average of
+        // each shifted column is quietly wrong.
+        val blendCols = listOf("cheek_squint_l", "cheek_squint_r", "mouth_smile_l", "mouth_smile_r")
+        val tail = cols.takeLast(expected.size + situationCols.size + blendCols.size)
         assertEquals(expected, tail.take(expected.size))
-        assertEquals(situationCols, tail.takeLast(situationCols.size))
+        assertEquals(situationCols, tail.subList(expected.size, expected.size + situationCols.size))
+        assertEquals(blendCols, tail.takeLast(blendCols.size))
         assertEquals(cols.size, cols.toSet().size)
         assertFalse(cols.contains("band_distance_cm"))
         assertFalse(cols.contains("band_ear"))
