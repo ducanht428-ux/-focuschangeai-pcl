@@ -35,7 +35,9 @@ echo.
 
 rem One import line catches every missing dependency at once, before the window opens.
 rem Without this the program can start, show a black window, and die on the first frame.
-"%PY%" -c "import cv2, numpy, mediapipe, ultralytics, yaml, PIL" 2>nul
+rem 1>nul keeps Python's "Traceback" noise off the screen - the message below replaces it, and
+rem 2>nul is not enough because some installers report the missing module on the normal output.
+"%PY%" -c "import cv2, numpy, mediapipe, ultralytics, yaml, PIL" 1>nul 2>nul
 if not errorlevel 1 goto run
 
 echo The camera program needs libraries that are not installed for this Python yet.
