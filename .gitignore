@@ -30,3 +30,7 @@ edge-server/*.pt
 edge-server/*.task
 edge-server/service_account.json
 edge-server/*.key
+# Any weight file, wherever it lands. ultralytics writes the model into the CURRENT folder, so running
+# main.py from the repo root used to drop a second 5.4 MB yolo11n.pt there and leave it in git status
+# as an untracked binary someone might add. No .pt is tracked in this repo, so this costs nothing.
+*.pt

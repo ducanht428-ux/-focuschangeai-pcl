@@ -11,6 +11,7 @@ and the heavy objects are only built when ``ClassroomPipeline`` is constructed.
 """
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,6 +22,26 @@ from .habit import HabitProfile
 from .landmarks import focal_px
 from .person_pipeline import PersonPipeline, PersonResult
 from .quality import face_light, to_gray
+
+# edge-server/, whichever folder the process was started from.
+_PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def resolve_asset(value: str, root: Optional[str] = None) -> str:
+    """Find a model or roster file that config.yaml spells relative to edge-server/.
+
+    The .bat changes into edge-server/ before starting, but "python edge-server/main.py" from the
+    repo root does not, and every relative asset path then points at a different place than the one
+    the operator read in the config. Candidates, in order: the string as given, the same string
+    under edge-server/, and just its file name under edge-server/. The configured string is
+    returned when nothing exists, so the failure names what was asked for instead of a guess.
+    """
+    root = root or _PACKAGE_PARENT
+    for candidate in (value, os.path.join(root, value),
+                      os.path.join(root, os.path.basename(value))):
+        if os.path.exists(candidate):
+            return candidate
+    return value
 
 
 def _now_ms() -> int:
@@ -146,8 +167,12 @@ class ClassroomPipeline:
         sync_cfg = cfg.get("sync", {})
         io_cfg = cfg.get("local_output", {})
 
+        # The weights name is resolved the same way the eye model is. It matters more than it looks:
+        # ultralytics happily DOWNLOADS a model it cannot find, so running from the repo root with the
+        # weights sitting in edge-server/ silently fetched a second 5.4 MB copy into the wrong folder
+        # instead of failing - and a machine with no internet then waits instead of measuring.
         detector = Detector(
-            model=det_cfg.get("model", "yolo11m.pt"),
+            model=resolve_asset(det_cfg.get("model", "yolo11m.pt")),
             conf=float(det_cfg.get("conf", 0.35)),
             tracker=det_cfg.get("tracker", "bytetrack.yaml"),
             person_class=int(det_cfg.get("person_class", 0)),
@@ -165,15 +190,21 @@ class ClassroomPipeline:
             # reason has to appear on the same screen the operator is watching.
             print("identity off (%s: %s) - every track stays a guest" % (type(e).__name__, e))
 
-        roster_path = cfg.get("roster", "roster.json")
+        roster_path = resolve_asset(cfg.get("roster", "roster.json"))
         roster = Roster.load(roster_path) if isinstance(roster_path, str) else roster_path
         if embedder is not None and not roster.entries():
             # The other half of the same silence: insightface loaded, but there is nobody to
             # match against. Enroll with tools/enroll_roster.py before expecting student rows.
             print("roster %r has no enrolled students - nobody can be bound" % (roster_path,))
 
+        eye_model = resolve_asset(cfg.get("face_landmarker_task", "face_landmarker.task"))
+        if not os.path.exists(eye_model):
+            # Printed, not raised past: without the model no face is ever measured, and an operator
+            # watching boxes appear would blame the camera. Naming the path tried is the whole fix.
+            print("eye model NOT FOUND at %r - config.yaml face_landmarker_task is relative to "
+                  "edge-server/; copy face_landmarker.task there or fix the path" % (eye_model,))
         analyzer = FaceAnalyzer(
-            model_asset_path=cfg.get("face_landmarker_task", "face_landmarker.task"),
+            model_asset_path=eye_model,
             num_faces=1,
         )
         scheduler = Scheduler(
