@@ -14,6 +14,12 @@ onnxruntime-gpu>=1.17.0     # backs insightface; swap to onnxruntime for CPU-onl
 # Same face_landmarker.task asset the Android app ships, so blendshapes line up 1:1.
 mediapipe>=0.10.14
 
+# --- On-screen text ---
+# main.py draws the HUD and the plate text with PIL, lazily inside the draw helpers: a machine
+# without Pillow opens the window and then fails the first time it paints a line, which is worse
+# than failing at install. opencv's own putText cannot do the Vietnamese diacritics.
+Pillow>=10.0.0
+
 # --- Cloud sync (Layer 5) ---
 firebase-admin>=6.4.0
 PyYAML>=6.0

@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
 
 from .constants import HabitFeature, Situation
 from .habit import HabitProfile
@@ -29,6 +29,24 @@ def _now_ms() -> int:
 
 def _wall_ms() -> int:
     return int(time.time() * 1000)
+
+
+class DetectionView(NamedTuple):
+    """What layer 1 saw on the last frame, kept only so the --show window can draw it.
+
+    step() returns PersonResults, and a result exists only for a face the scheduler chose to
+    measure on this tick. That is the right thing for the numbers column and the wrong thing for
+    "show me YOLO": with a face budget of 2, four students in frame would draw two boxes and an
+    operator would conclude the detector missed two. So the raw layer-1 output travels here
+    instead - every box ByteTrack returned, every context object that fell inside no box, and the
+    face window each person box was cut into. Measured values never read from it, so nothing in
+    this struct can change a number that goes to Firestore.
+    """
+
+    persons: tuple = ()                    # PersonTrack: .bbox .track_id .conf .nearby_objects
+    objects: tuple = ()                    # (name, bbox, conf) assigned to no person
+    face_regions: Tuple[Tuple[int, tuple], ...] = ()   # (track_id, face box) fed to FaceLandmarker
+    frame_size: Tuple[int, int] = (0, 0)   # (w, h) the coordinates belong to
 
 
 @dataclass
@@ -51,6 +69,10 @@ class TrackRuntime:
     # written to Firestore would be short without anything on screen saying so.
     alert_count: int = 0
     measured_frames: int = 0
+    # Wall clock of the moment this session started. The phone derives it from its session id,
+    # which IS the start timestamp; here the id is a per-student counter, so the start time is
+    # remembered separately rather than recomputed from the measured time.
+    session_started_wall_ms: int = 0
 
 
 class ClassroomPipeline:
@@ -79,6 +101,9 @@ class ClassroomPipeline:
         sync = cfg.get("sync", {})
 
         self.class_id = cfg.get("class_id", "class")
+        # What the operator and the judges read on the preview. class_id stays the document key and
+        # is an ASCII slug, so the two are deliberately different strings.
+        self.class_label = cfg.get("class_label") or self.class_id
         self._track_ttl_ms = int(det.get("track_ttl_ms", 15000))
         self._sensitivity = int(person.get("sensitivity", 1))
         self._habit_learn = bool(person.get("habit_learn", True))
@@ -94,8 +119,9 @@ class ClassroomPipeline:
         self._resolver = None
 
         self._tracks: Dict[int, TrackRuntime] = {}
-        self._session_counter: Dict[str, int] = {}
         self._alerts: Deque[Dict] = deque(maxlen=200)
+        # Preview-only: the last frame's raw layer-1 output. Overwritten every step().
+        self.last_boxes = DetectionView()
 
         self._last_class_live_ms = 0
         self._last_heartbeat_ms = 0
@@ -125,7 +151,7 @@ class ClassroomPipeline:
             conf=float(det_cfg.get("conf", 0.35)),
             tracker=det_cfg.get("tracker", "bytetrack.yaml"),
             person_class=int(det_cfg.get("person_class", 0)),
-            imgsz=int(cfg.get("input", {}).get("process_width", 1280)),
+            imgsz=int(det_cfg.get("imgsz") or cfg.get("input", {}).get("process_width", 1280)),
             device=det_cfg.get("device"),
         )
         # Identity is optional: without insightface/roster templates the pipeline
@@ -191,10 +217,6 @@ class ClassroomPipeline:
             self._profiles[student_id] = p
         return p
 
-    def _next_session_id(self, student_id: str) -> int:
-        self._session_counter[student_id] = self._session_counter.get(student_id, 0) + 1
-        return self._session_counter[student_id]
-
     # ------------------------------------------------------------------
     def step(self, frame_bgr, now_ms: Optional[int] = None,
              wall_ms: Optional[int] = None) -> List[PersonResult]:
@@ -205,13 +227,16 @@ class ClassroomPipeline:
         self._last_step_ms = now_ms
 
         h, w = frame_bgr.shape[:2]
-        persons, _scene_objects = self._detector.run(frame_bgr)
+        persons, scene_objects = self._detector.run(frame_bgr)
+        self.last_boxes = DetectionView(persons=tuple(persons), objects=tuple(scene_objects),
+                                        frame_size=(w, h))
 
         seen: Dict[int, bool] = {p.track_id: True for p in persons}
         results: List[PersonResult] = []
 
         # -- update tracks: identity + face candidates --------------------
         candidates = []
+        regions: Dict[int, tuple] = {}
         for p in persons:
             rt = self._tracks.get(p.track_id)
             if rt is None:
@@ -229,6 +254,7 @@ class ClassroomPipeline:
             rt.nearby = p.nearby_objects
 
             face_box = self._face_region(p.bbox, w, h)
+            regions[p.track_id] = face_box
             crop = self._crop(frame_bgr, face_box)
 
             # identity (throttled internally by the resolver window)
@@ -244,6 +270,7 @@ class ClassroomPipeline:
             ))
 
         # -- schedule + measure the chosen faces --------------------------
+        self.last_boxes = self.last_boxes._replace(face_regions=tuple(regions.items()))
         chosen = self._scheduler.select(candidates, now_ms)
         by_track = {rt.track_id: rt for rt in self._tracks.values()}
         gray = None  # converted at most once per frame, and only if a face actually got measured
@@ -275,6 +302,11 @@ class ClassroomPipeline:
             )
             rt.last_measured_ms = now_ms
             rt.measured_frames += 1
+            # The preview draws this frame, so the pixels the numbers came from ride along with
+            # them: box + landmarks are in this frame's coordinates and stay valid only here.
+            res.face_bbox = cand.face_bbox
+            res.landmarks = lm
+            res.calibration_progress = rt.pipeline.calibration_progress
             rt.last_result = res
             results.append(res)
             if res.alert:
@@ -283,7 +315,12 @@ class ClassroomPipeline:
         # -- start sessions for freshly bound, measurable people ----------
         for rt in self._tracks.values():
             if rt.student_id and rt.pipeline.session is None and rt.last_result and rt.last_result.measurable:
-                rt.pipeline.start_session(self._next_session_id(rt.student_id))
+                # The id IS the wall clock of the start, the phone's rule (HabitSession is keyed
+                # the same way). A per-process counter restarted at 1 on every run, so a second
+                # run of the same child wrote sessions/<id>-cam-1 again and set() replaced the
+                # first run's record - and the saved habit profile replaced its stored session too.
+                rt.pipeline.start_session(wall_ms)
+                rt.session_started_wall_ms = wall_ms
 
         # -- retire dead tracks -------------------------------------------
         for tid in list(self._tracks.keys()):
@@ -361,9 +398,10 @@ class ClassroomPipeline:
             band_outcomes=s.band_outcomes(), ended_at_wall_ms=wall_ms, device=str(self._device),
             ineligible_reason=profile.ineligible_reason(summary),
             alerts_total=rt.alert_count,
-            # None, not 0: nobody on the camera side can mark an alert as wrong, and writing a
-            # zero would put "no false alerts happened" on a session where that was never checked.
-            false_alerts=None,
+            # 0, the same number the phone writes for a session in which nobody pressed
+            # "Canh bao sai". The camera has no such button, so that count really is zero here;
+            # "source" and the "-cam-" in the key are what tell the two instruments apart.
+            false_alerts=0,
             csv_rows=summary.count[HabitFeature.SEI],
             avg_fps=avg_fps,
         )
@@ -401,14 +439,13 @@ class ClassroomPipeline:
             if rt.student_id is None or rt.pipeline.session is None:
                 continue
             r = rt.pipeline.last_result
-            sei = float(rt.pipeline.sei.average_sei()) if rt.pipeline.last_sei is not None else None
             state = r.situation.name.lower() if r else "unknown"
-            active_ms = rt.pipeline.session.active_ms if rt.pipeline.session else 0
             self._writer.write_presence(
                 student_id=rt.student_id, student_name=rt.student_name,
-                session_id=rt.pipeline.session.id if rt.pipeline.session else 0,
-                started_at_wall_ms=wall_ms - active_ms, beat_at_wall_ms=wall_ms,
-                active_ms=active_ms, sei_mean=sei, state=state,
+                s=rt.pipeline.session.to_summary(),
+                started_at_wall_ms=rt.session_started_wall_ms, beat_at_wall_ms=wall_ms,
+                active_ms=rt.pipeline.session.active_ms,
+                alerts_total=rt.alert_count, device=str(self._device), state=state,
             )
 
     # ------------------------------------------------------------------
@@ -467,6 +504,19 @@ class ClassroomPipeline:
     @property
     def active_tracks(self) -> int:
         return len(self._tracks)
+
+    @property
+    def measurable_tracks(self) -> int:
+        """Head count the machine can actually defend: a track that produced numbers recently.
+
+        YOLO boxes anything shaped like a person, and in this project's own room that includes the
+        photographs taped to the wall. Counting those as students would put a number on screen that
+        no measurement supports, so the preview prints this next to the raw box count.
+        """
+        now_ms = _now_ms()
+        return sum(1 for rt in self._tracks.values()
+                   if rt.last_result is not None and rt.last_result.measurable
+                   and now_ms - rt.last_measured_ms <= self._track_ttl_ms // 3)
 
     @property
     def profiles(self) -> Dict[str, HabitProfile]:

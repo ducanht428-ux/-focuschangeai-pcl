@@ -181,6 +181,17 @@ class HabitBaseline:
     def spread(self, f: int) -> Optional[float]:
         return self._spreads[f] if self._ok[f] else None
 
+    def threshold(self, f: int, k: float, lo: float, hi: float) -> Optional[float]:
+        """threshold() in HabitModel.kt:418: |mean| + k * spread, clamped into [lo, hi].
+
+        The absolute value is on purpose and is what makes a signed feature usable as a gate: a
+        student who habitually turns 5 degrees left and one who turns 5 degrees right get the same
+        threshold, because the alert is about deviation from frontal, not about direction.
+        """
+        if not self._ok[f]:
+            return None
+        return max(lo, min(hi, abs(self._means[f]) + k * self._spreads[f]))
+
     def band(self, f: int, k: float = HabitConfig.BAND_K) -> Optional[ToleranceBand]:
         if not self._ok[f]:
             return None

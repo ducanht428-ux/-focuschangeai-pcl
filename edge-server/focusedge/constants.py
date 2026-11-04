@@ -92,6 +92,10 @@ class SignalQuality:
     YAW_UNRELIABLE_DEG = 35.0
     PITCH_UNRELIABLE_DEG = 30.0
 
+    # MainActivity.kt:337 - at or above this score the phone still trusts the frame. Below it the
+    # HUD leads with the weak-signal line and says which deduction caused it.
+    QUALITY_OK = 50
+
 
 # ---------------------------------------------------------------------------
 # Situations (SituationEngine.kt). csvCode is the on-disk column value.
@@ -177,10 +181,34 @@ DROWSY_CLOSURE_MS = 1500
 EYE_MAX_YAW_DEG = 28.0
 EYE_MAX_PITCH_DEG = 35.0
 MIN_SAFE_DISTANCE_CM = 30.0
-LOW_BLINK_BPM = 12.0
-HIGH_BLINK_BPM = 25.0
-PERCLOS_ALERT = 30.0
-BPM_RELIABLE_AFTER_MS = 20000
+# Hysteresis off-line, MainActivity.kt:241. Without it a face sitting at exactly 30 cm flickers the
+# distance alert on and off every frame, and each flicker is a violation the phone would not count.
+DISTANCE_RECOVER_CM = 32.0
+# Both blink rates were written wrong here: the server called anything under 12 bpm "too few blinks"
+# while the phone's line is 8 (MainActivity.kt:271), and called anything over 25 "too many" while the
+# phone's line is 30 (:272). A tired student read as normal on the phone and as an alert here.
+LOW_BLINK_BPM = 8.0
+HIGH_BLINK_BPM = 30.0
+# MainActivity.kt:280. The server carried 30.0, exactly twice the phone's line, so a PERCLOS the phone
+# already calls fatigue only reaches half the severity on this machine - and the alert that does fire
+# here was hard-coded to the same wrong number instead of reading this constant.
+PERCLOS_ALERT = 15.0
+# MainActivity.kt:269. The server waited 20 s for a trustworthy blink rate; the phone waits 15 s, so
+# for five seconds every session showed "--" on this machine and a number on that one.
+BPM_RELIABLE_AFTER_MS = 15000
+# "Your focus is lower than your own usual level" - MainActivity.kt:137-139. The phone holds the
+# comparison for 45 s before it says anything and floors the spread at 8 points so a very steady
+# profile cannot be undercut by one bad frame. The server compared against 2.5 spreads with no hold
+# at all, which fires on ordinary noise.
+LOW_VS_PERSONAL_MS = 45000
+LOW_VS_PERSONAL_K = 1.5
+PERSONAL_SEI_MIN_SPREAD = 8.0
+# The 20-20-20 reminder, MainActivity.kt:354-355: it shows for a 30 s window, not forever.
+BREAK_REMINDER_MS = 20 * 60 * 1000
+BREAK_REMINDER_SHOW_MS = 30000
+# MainActivity.kt:356. An empty frame only counts as a break after this long; a shorter gap leaves
+# the work clock running, so the reminder cannot be reset by looking away for a second.
+BREAK_DETECT_MS = 20000
 
 SEI_TOO_CLOSE_PENALTY = 15.0
 SEI_CHRONIC_PENALTY = 20.0
@@ -218,6 +246,21 @@ class MuscleSensitivity:
         on the phone and here - "eyes shut 1,5 s" means the same thing whatever the slider says.
         """
         return {0: 1.5, 2: 0.6, 3: 0.35}.get(level, 1.0)
+
+    @staticmethod
+    def sens_thr(level: int) -> float:
+        """sensThr() in MainActivity.kt:3143: scales the head-angle and gaze ENTRY gates, the amount
+        of turn or lie that counts as "away" before the timer even starts. Distinct from time_factor,
+        which scales how long that condition must hold; the phone has both and the slider moves them
+        independently."""
+        return {0: 1.15, 2: 0.85, 3: 0.72}.get(level, 1.0)
+
+    @staticmethod
+    def sens_smooth(level: int) -> float:
+        """sensSmooth() in MainActivity.kt:3151: how tightly the SEI follows the instant score. It is
+        not a gate and changes no verdict - but it changes every SEI number printed, so a session
+        compared across devices needs the same value on both."""
+        return {0: 0.7, 2: 1.6, 3: 2.4}.get(level, 1.0)
 
     @classmethod
     def mouth_threshold(cls, level: int, base: float) -> float:

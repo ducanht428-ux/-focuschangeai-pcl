@@ -13,17 +13,23 @@ the SAME collection, so a profile is still read by studentId, but under a key ca
 "-cam-":
   * sessions/<id>-cam-<n>   never collides with the phone's <id>-<n>
   * bands/<id>-cam          sits beside the phone's band for the same child
-  * presence/<id>           merged, every camera field prefixed cam_, so a beat from the
-                            camera cannot blank the phone's beat
+  * presence/<id>-cam       sits beside the phone's live row
+
+The namespacing lives in the KEY and nowhere else. Inside the three documents every
+column is the phone's column: same names, same set, same conditions, same rounding, so a
+teacher's query reads one instrument or the other with no special case. The only extra
+column is "source", and the only camera-only table is class_live, which the phone never
+had a way to fill.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from typing import Dict, List, Optional
 
-from .constants import HabitFeature
+from .constants import HabitConfig, HabitFeature
 from .habit import HabitProfile, SessionSummary
 
 
@@ -72,6 +78,19 @@ class FirestoreWriter:
         self._load_pending()
         if service_account and os.path.exists(service_account):
             self._connect(service_account)
+        # Say which mode was chosen, in as many words. Without this, a wrong key path and a
+        # deliberately-offline run look identical from the outside, and the operator spends the
+        # test staring at a document that never appears. The path only - never the key contents.
+        if not service_account:
+            print("sync: no key configured -> local only, documents land in %s/" % self._local_dir)
+        elif not os.path.exists(service_account):
+            print("sync: key file %r not found -> local only, documents land in %s/"
+                  % (service_account, self._local_dir))
+        elif self._db is not None:
+            print("sync: connected to Firestore using %r" % service_account)
+        else:
+            print("sync: key %r found but connect failed (%s) -> local only"
+                  % (service_account, self.last_error))
 
     # ------------------------------------------------------------------
     @property
@@ -95,7 +114,7 @@ class FirestoreWriter:
                       band_outcomes, ended_at_wall_ms: int, device: str,
                       ineligible_reason: Optional[str], alerts_total: int,
                       csv_rows: int, avg_fps: float,
-                      false_alerts: Optional[int] = None) -> None:
+                      false_alerts: int = 0) -> None:
         payload = self.build_session_payload(
             student_id, student_name, s, band_outcomes, ended_at_wall_ms, device,
             ineligible_reason, alerts_total, false_alerts, csv_rows, avg_fps)
@@ -120,11 +139,12 @@ class FirestoreWriter:
             "app_version": self.app_version,
             "source": "edge-camera",
             "eligible": ineligible_reason is None,
+            # Always written, like FirebaseSync.kt:502. The column counts taps on "Canh bao sai",
+            # and a session where nobody tapped it has the true count 0 - the phone writes that 0
+            # too. What tells the two instruments apart is "source" and the "-cam-" in the key,
+            # not a missing column.
+            "false_alerts": false_alerts,
         }
-        # Only when someone actually counted them. A camera run has no way to mark an alert wrong,
-        # and writing 0 there reads exactly like "checked, none were wrong".
-        if false_alerts is not None:
-            out["false_alerts"] = false_alerts
         if s.quality_count > 0:
             out["quality_mean"] = _round2(s.quality)
         if ineligible_reason is not None:
@@ -139,7 +159,7 @@ class FirestoreWriter:
                 out[f"std_{key}"] = _round2(s.std[f])
                 out[f"n_{key}"] = n
         if band_outcomes:
-            out["band_k"] = 2.5
+            out["band_k"] = float(HabitConfig.BAND_K)
             for b in band_outcomes:
                 key = HabitFeature.KEYS[b.feature]
                 out[f"band_min_{key}"] = _round2(b.min)
@@ -153,12 +173,14 @@ class FirestoreWriter:
     def write_band(self, student_id: str, student_name: str, profile: HabitProfile,
                    updated_at_wall_ms: int, device: str) -> None:
         base = profile.baseline()
+        # (feature, band) pairs, because ToleranceBand holds only the three numbers and the
+        # column names are built from the feature: a bare band list loses which row is whose.
         bands = []
         for f in HabitFeature.BAND_FEATURES:
             b = base.band(f)
             if b is None:
                 continue
-            bands.append(b)
+            bands.append((f, b))
         if not bands:
             return
         out: Dict = {
@@ -167,39 +189,72 @@ class FirestoreWriter:
             "student_name": student_name,
             "sessions_used": profile.session_count(),
             "updated_at_wall_ms": updated_at_wall_ms,
-            "band_k": 2.5,
+            "band_k": float(HabitConfig.BAND_K),
             "device": device,
             "app_version": self.app_version,
         }
-        for b in bands:
-            key = HabitFeature.KEYS[b.feature]
+        for f, b in bands:
+            key = HabitFeature.KEYS[f]
             out[f"band_typical_{key}"] = _round2(b.mean)
             out[f"band_min_{key}"] = _round2(b.min)
             out[f"band_max_{key}"] = _round2(b.max)
+            # The width the band was built from, so a reader can see why two children with the
+            # same typical value have different ranges. FirebaseSync.kt:428 has always sent it.
+            out[f"band_spread_{key}"] = _round2(base.spread(f))
         self._set(f"{BAND_COLLECTION}/{student_doc_key(student_id)}", out, kind="band")
 
-    def write_presence(self, student_id: str, student_name: str, session_id: int,
+    def write_presence(self, student_id: str, student_name: str, s: SessionSummary,
                        started_at_wall_ms: int, beat_at_wall_ms: int, active_ms: int,
-                       sei_mean: Optional[float], state: str) -> None:
-        # Every value carries the cam_ prefix and the write is a merge, because presence/<id> is
-        # one live row per child that the phone also beats into. A plain set() here would blank the
-        # phone's state and its session number the moment the camera pinged, and the teacher's
-        # screen would show "learning" for a child whose phone says otherwise.
+                       alerts_total: int, device: str, state: str,
+                       false_alerts: int = 0) -> None:
+        payload = self.build_heartbeat_payload(
+            student_id, student_name, s, started_at_wall_ms, beat_at_wall_ms, active_ms,
+            alerts_total, device, state, false_alerts)
+        self._set(f"{PRESENCE_COLLECTION}/{student_doc_key(student_id)}", payload,
+                  kind="presence", queue_on_fail=False)
+
+    def build_heartbeat_payload(self, student_id, student_name, s: SessionSummary,
+                                started_at_wall_ms, beat_at_wall_ms, active_ms,
+                                alerts_total, device, state, false_alerts) -> Dict:
+        """Same columns as buildHeartbeatPayload in FirebaseSync.kt:436-484, beat by beat.
+
+        The camera writes its own row (presence/<id>-cam) rather than merging into the phone's,
+        so it can use the phone's column names and a plain set() - no prefix, no half-overwritten
+        document. "state" is the one column the phone has no word for, because a phone measures one
+        fixed student and never has to say which situation it is looking at.
+        """
         out: Dict = {
             "schema_h": SCHEMA,
             "student_id": student_id,
             "student_name": student_name,
-            "cam_session_id": session_id,
-            "cam_started_at_wall_ms": started_at_wall_ms,
-            "cam_beat_at_wall_ms": beat_at_wall_ms,
-            "cam_active_ms": active_ms,
-            "cam_state": state,
+            "session_id": s.id,
+            "started_at_wall_ms": started_at_wall_ms,
+            "beat_at_wall_ms": beat_at_wall_ms,
+            "active_ms": active_ms,
+            "valid_ms": s.valid_ms,
+            "face_ratio": _round4(s.face_ratio),
+            "valid_ratio": _round4(s.valid_ratio),
+            "alerts_total": alerts_total,
+            "false_alerts": false_alerts,
+            "device": device,
+            "app_version": self.app_version,
             "source": "edge-camera",
+            "state": state,
         }
-        if sei_mean is not None:
-            out["cam_sei_mean"] = _round2(sei_mean)
-        self._set(f"{PRESENCE_COLLECTION}/{sanitize(student_id)}", out, kind="presence",
-                  queue_on_fail=False, merge=True)
+        if s.quality_count > 0:
+            out["quality_mean"] = _round2(s.quality)
+        sei_n = s.count[HabitFeature.SEI]
+        if sei_n > 0:
+            out["sei_mean"] = _round2(s.mean[HabitFeature.SEI])
+            out["sei_n"] = sei_n
+        if s.sensitivity_level >= 0:
+            out["sensitivity"] = s.sensitivity_level
+        if s.band_samples > 0:
+            out["band_k"] = float(HabitConfig.BAND_K)
+            out["band_frames"] = s.band_samples
+            out["band_below"] = s.band_below
+            out["band_above"] = s.band_above
+        return out
 
     def write_class_live(self, class_id: str, students: Dict[str, Dict],
                          alerts: List[Dict], updated_at_wall_ms: int) -> None:
@@ -214,23 +269,22 @@ class FirestoreWriter:
                   queue_on_fail=False)
 
     # ------------------------------------------------------------------
-    def _set(self, doc_path: str, payload: Dict, kind: str, queue_on_fail: bool = True,
-             merge: bool = False) -> None:
+    def _set(self, doc_path: str, payload: Dict, kind: str, queue_on_fail: bool = True) -> None:
         with self._lock:
             if self._db is None:
                 self._dump_local(doc_path, payload)
                 return
         try:
-            self._db.document(doc_path).set(payload, merge=merge)
+            self._db.document(doc_path).set(payload)
             self.sent += 1
         except Exception as e:  # boundary with an external SDK
             self.failed += 1
             self.last_error = type(e).__name__
             if queue_on_fail:
-                self._enqueue(doc_path, payload, merge)
+                self._enqueue(doc_path, payload)
 
-    def _enqueue(self, doc_path: str, payload: Dict, merge: bool = False) -> None:
-        rec = {"doc": doc_path, "payload": payload, "merge": merge}
+    def _enqueue(self, doc_path: str, payload: Dict) -> None:
+        rec = {"doc": doc_path, "payload": payload}
         with self._lock:
             # replace an older queued payload for the SAME document
             self._pending = [p for p in self._pending if p["doc"] != doc_path]
@@ -268,7 +322,7 @@ class FirestoreWriter:
             batch = list(self._pending)
         for rec in batch:
             try:
-                self._db.document(rec["doc"]).set(rec["payload"], merge=rec.get("merge", False))
+                self._db.document(rec["doc"]).set(rec["payload"])
                 accepted += 1
                 with self._lock:
                     self._pending = [p for p in self._pending if p is not rec]
@@ -287,15 +341,23 @@ class FirestoreWriter:
 
 
 def _round2(v: float) -> float:
-    return round(v, 2) if _finite(v) else 0.0
+    return _round_to(v, 100.0)
 
 
 def _round4(v: float) -> float:
-    return round(v, 4) if _finite(v) else 0.0
+    return _round_to(v, 10000.0)
 
 
-def _finite(v) -> bool:
+def _round_to(v: float, scale: float) -> float:
+    """FirebaseSync.kt:944 - (v * scale).roundToInt() / scale, and 0.0 when not finite.
+
+    Written out instead of using round() because Python's round() is banker's rounding: it sends
+    0.125 down to 0.12 where Kotlin sends it up to 0.13. Two instruments that measure the same
+    child must not disagree in the last digit by accident.
+    """
     try:
-        return v == v and v not in (float("inf"), float("-inf"))
+        if not math.isfinite(v):
+            return 0.0
     except TypeError:
-        return False
+        return 0.0
+    return math.floor(v * scale + 0.5) / scale

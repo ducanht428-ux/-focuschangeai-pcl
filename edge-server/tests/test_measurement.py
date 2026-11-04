@@ -204,8 +204,9 @@ def test_a_single_wide_mouth_frame_is_not_a_yawn():
     produces.
     """
     p = _pipeline()
-    confirmed, confused, recent = p._update_micro_expressions(0.9, [0, 0, 0, 0, 0.1], 0.2, 0.0, 1000)
-    assert (confirmed, confused, recent) == (False, False, 0)
+    confirmed, confused, recent, furrow = p._update_micro_expressions(
+        0.9, [0, 0, 0, 0, 0.1], 0.2, 0.0, 1000)
+    assert (confirmed, confused, recent, furrow) == (False, False, 0, False)
     confirmed = p._update_micro_expressions(0.9, [0, 0, 0, 0, 0.1], 0.2, 0.0, 1600)[0]
     assert confirmed is False          # 600 ms in, still under 1200
     confirmed = p._update_micro_expressions(0.9, [0, 0, 0, 0, 0.1], 0.2, 0.0, 2300)[0]

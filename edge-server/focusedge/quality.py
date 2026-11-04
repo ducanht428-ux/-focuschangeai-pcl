@@ -93,6 +93,60 @@ def face_light(gray, box, frame_w: int, frame_h: int) -> Optional[Tuple[float, b
     return f_mean, backlit, overexposed
 
 
+def signal_quality_detail(luma_mean: float, too_small: bool, yaw_abs: float,
+                          pitch_abs: float, iris_ok: bool, backlit: bool = False,
+                          overexposed: bool = False) -> Tuple[int, str, bool]:
+    """(score, the phone's reason string, whether this frame is still trustworthy).
+
+    The note is not decoration: the phone puts it in two HUD lines ("Chat luong tin hieu: N / 100
+    (note)" and the "Tin hieu kem (note)" alert), so a score without its reason cannot be shown the
+    same way on both screens. Same order as computeSignalQuality (MainActivity.kt:3316-3359): a
+    later deduction may only rename the note while it still says "Tot", which is why the brightness
+    reason wins over the distance one and both win over the pose one.
+
+    ``reliable`` is snapshotted before the pose and iris docks, exactly where MainActivity.kt:3347
+    does it - a turned head lowers the score but must not, on its own, silence the weak-signal
+    warning that is supposed to explain the low score.
+    """
+    q = 100.0
+    note = "Tốt"
+
+    if luma_mean < SQ.LUMA_VERY_LOW:
+        q -= 60.0
+        note = "Ánh sáng quá yếu"
+    elif luma_mean < SQ.LUMA_LOW:
+        q -= 35.0
+        note = "Ánh sáng yếu"
+    elif luma_mean > SQ.LUMA_HIGH:
+        q -= 20.0
+        note = "Ảnh quá sáng hoặc ngược sáng"
+
+    if too_small:
+        q -= 50.0
+        note = "Khuôn mặt quá xa"
+
+    if backlit:
+        q -= 15.0
+        if note == "Tốt":
+            note = "Ngược sáng, mặt bị tối"
+    if overexposed:
+        q -= 20.0
+        if note == "Tốt":
+            note = "Mặt bị cháy sáng"
+
+    reliable = q >= SQ.QUALITY_OK
+
+    if yaw_abs > SQ.YAW_UNRELIABLE_DEG or pitch_abs > SQ.PITCH_UNRELIABLE_DEG:
+        q -= 20.0
+        if note == "Tốt":
+            note = "Mặt quay nghiêng nhiều"
+
+    if not iris_ok:
+        q -= 10.0
+
+    return int(max(0.0, min(100.0, q))), note, reliable
+
+
 def signal_quality(luma_mean: float, too_small: bool, yaw_abs: float, pitch_abs: float,
                    iris_ok: bool, backlit: bool = False,
                    overexposed: bool = False) -> int:
@@ -103,31 +157,9 @@ def signal_quality(luma_mean: float, too_small: bool, yaw_abs: float, pitch_abs:
     passes yawDeg, and yawDeg is yawFilter.filter(yawRawDev) (MainActivity.kt:4148, call at :4195).
     The phone also zeroes both angles until calibration is done, so this is only ever called with
     a settled baseline - person_pipeline.py returns before scoring during calibration.
+
+    One function with signal_quality_detail(), not a second copy of the penalty table: the score
+    written to the session and the score printed on the preview must never be able to disagree.
     """
-    q = 100.0
-
-    if luma_mean < SQ.LUMA_VERY_LOW:
-        q -= 60.0
-    elif luma_mean < SQ.LUMA_LOW:
-        q -= 35.0
-    elif luma_mean > SQ.LUMA_HIGH:
-        q -= 20.0
-
-    if too_small:
-        q -= 50.0
-
-    if backlit:
-        q -= 15.0
-    if overexposed:
-        q -= 20.0
-
-    # The phone snapshots "reliable" at this point, before the pose and iris docks
-    # (MainActivity.kt:3347). The camera leg has no such flag: measurable in
-    # person_pipeline.py already plays that part, so the order is kept for reading only.
-    if yaw_abs > SQ.YAW_UNRELIABLE_DEG or pitch_abs > SQ.PITCH_UNRELIABLE_DEG:
-        q -= 20.0
-
-    if not iris_ok:
-        q -= 10.0
-
-    return int(max(0.0, min(100.0, q)))
+    return signal_quality_detail(luma_mean, too_small, yaw_abs, pitch_abs, iris_ok,
+                                 backlit, overexposed)[0]

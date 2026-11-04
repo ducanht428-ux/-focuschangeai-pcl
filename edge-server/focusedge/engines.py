@@ -50,6 +50,9 @@ class EyeFrame:
         self.asym_alert = False
         self.incomplete_alert = False
         self.using_blendshapes = False
+        # Per-eye opening ratios, the two numbers the phone prints on their own HUD lines.
+        self.ear1 = float("nan")
+        self.ear2 = float("nan")
 
 
 class EyeEngine:
@@ -112,6 +115,16 @@ class EyeEngine:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    @property
+    def baseline_ear(self) -> float:
+        """The neutral opening ratio learned for this person, averaged over the two eyes.
+
+        The phone's calibration line prints this ("EAR co so ..."); the closing threshold next to it
+        is in the phone's own EAR units, while this engine gates on a normalised openness ratio, so
+        there is no matching number to print and the HUD leaves it as a dash.
+        """
+        return (self._base1 + self._base2) / 2.0 if self._ready else float("nan")
 
     def set_sensitivity(self, level: int) -> None:
         self.close_o = {0: 0.54, 2: 0.66, 3: 0.70}.get(level, self.CLOSE_O)
@@ -237,12 +250,16 @@ class EyeEngine:
         o.blink_duration_ms = 0
         o.blink_incomplete = False
         o.using_blendshapes = bs is not None
+        # Measured first, before any gate can refuse the frame: MainActivity.kt computes ear1/ear2
+        # for the snapshot on its own, so the two HUD lines stay live even while the eye verdict is
+        # being withheld (big head turn, glitch, calibration not finished).
+        o.ear1 = self._ear5(lm, EYE_R_UP, EYE_R_LOW, EYE_R_OUT, EYE_R_IN, w, h)
+        o.ear2 = self._ear5(lm, EYE_L_UP, EYE_L_LOW, EYE_L_IN, EYE_L_OUT, w, h)
 
         if not self._ready:
             return self._mark_invalid(o, False)
 
-        e1 = self._ear5(lm, EYE_R_UP, EYE_R_LOW, EYE_R_OUT, EYE_R_IN, w, h)
-        e2 = self._ear5(lm, EYE_L_UP, EYE_L_LOW, EYE_L_IN, EYE_L_OUT, w, h)
+        e1, e2 = o.ear1, o.ear2
         wr = self._d(lm, EYE_R_OUT, EYE_R_IN, w, h)
         wl = self._d(lm, EYE_L_IN, EYE_L_OUT, w, h)
 

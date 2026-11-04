@@ -4,6 +4,9 @@
 
 # Which class this box serves. Every Firestore document is keyed under it.
 class_id: "lop12a"
+# The words printed on the preview window. Kept separate from class_id on purpose: that one is a
+# document key and has to stay an ASCII slug, this one is what a teacher or a judge reads.
+class_label: "Lớp học"
 
 # --- Assets loaded from disk (paths are relative to the folder you run main.py from) ---
 # FaceLandmarker asset: the SAME file the APK ships (app/src/main/assets, sha256 64184e22...), so a
@@ -12,21 +15,51 @@ face_landmarker_task: "../app/src/main/assets/face_landmarker.task"
 # ArcFace templates written by tools/enroll_roster.py. A missing or empty roster is not an error,
 # it just means nobody binds: every track stays a guest and no sessions document is ever written.
 roster: "roster.json"
-# yolo11m.pt (about 40 MB) and the insightface buffalo_l pack (about 280 MB) are NOT in git; each
-# library downloads them on first use, so the first run on a new machine needs internet.
+# Model weights are NOT in git; ultralytics downloads them on first use (yolo11n.pt = 5.6 MB,
+# yolo11m.pt = 40 MB, both measured here), and the insightface buffalo_l pack is about 280 MB.
+# The first run on a new machine therefore needs internet. insightface is deliberately absent on the
+# laptop used for this project: its onnxruntime backend crashes that process outright, and identity is
+# optional (see classroom.py "identity off").
 
 # --- Input: where frames come from ---
 input:
   # One of: camera index (0), a video file path, or an RTSP/HTTP stream URL.
+  # The Logitech C270 is the mandated lens for this project, so the laptop's built-in webcam is no
+  # longer competing for the index: it was disabled in Windows (USB\VID_0BDA&PID_5756, now Status
+  # Error in Get-PnpDevice) and a live probe of indexes 0-3 after that returned exactly one camera -
+  # index 0, "Logi C270 HD WebCam" (USB\VID_046D&PID_0825), 640x480 @ 30 fps. Indexes 1-3 did not
+  # open at all, so "0" is no longer a guess. If the picture is ever the wrong lens, re-enable the
+  # built-in camera rather than swapping numbers: with two cameras present the index order is
+  # decided by enumeration and is not predictable.
   source: 0
+  # What to ASK the capture device for. main.py sets these with cap.set() and then prints what the
+  # driver actually gave, because the two differ. Re-read from the C270 after the built-in was
+  # disabled: 640x480 @ 30 fps delivered, and the driver stays in YUY2 (the MJPG request does not
+  # take effect; uncompressed 720p does not fit USB 2.0 on this bus). The printed line stays truth.
+  width: 640
+  height: 480
+  fps: 30
+  fourcc: "MJPG"
   # Target processing width; frames are downscaled to this so YOLO/pose stay real-time.
-  process_width: 1280
+  # 640 matches the camera above. Leaving it larger than the device is not harmless: detection.imgsz
+  # used to be derived from this value, so a 640-wide feed was being upscaled to 1280 and paying four
+  # times the compute for pixels the lens never captured.
+  process_width: 640
   # Cap the analysis frame rate (detection runs at most this many times per second).
-  detect_fps: 12
+  # Measured ceiling on this box, not a wish: yolo11n at imgsz 640 takes 145 ms per call on the
+  # i5-5200U (2 cores, no GPU) = 6.9 steps/s, and at imgsz 480 it takes 100 ms = 10 steps/s.
+  # 8 sits between the two so a slower frame does not stall the loop.
+  detect_fps: 8
 
 # --- Layer 1: detection + tracking (YOLO + ByteTrack) ---
 detection:
-  model: "yolo11m.pt"        # person + COCO objects; drop to yolo11n.pt on weak GPUs
+  # yolo11n (5.6 MB) instead of yolo11m (40 MB): measured on the same 30 webcam frames, m costs
+  # 852 ms per detection = 1.2 steps/s on this CPU, which is why a 300-frame run needed over ten
+  # minutes. n costs 145 ms. m is still the right answer on a machine with a real GPU.
+  model: "yolo11n.pt"
+  # Inference size, decoupled from input.process_width (see the note there). 0 = follow
+  # process_width, which is what this key used to do implicitly.
+  imgsz: 640
   person_class: 0            # COCO class id for "person"
   conf: 0.35                 # minimum detection confidence
   tracker: "bytetrack.yaml"  # built into ultralytics
@@ -67,11 +100,14 @@ person:
 
 # --- Layer 5: cloud sync (Firestore) ---
 sync:
-  # Path to a service-account key. Empty/missing -> server runs local-only (JSONL dump).
-  service_account: ""
+  # Service-account key, relative to the folder you run main.py from. .gitignore already covers
+  # edge-server/service_account.json, so dropping the downloaded key there never commits it.
+  # If the file is absent the server still runs and only writes to local_output.dir; the startup
+  # line "sync: ..." prints which of the two modes it actually picked.
+  service_account: "service_account.json"
   # class_live is overwritten this often; independent of class size (single writer).
   class_live_ms: 20000
-  # presence/<student> heartbeat cadence (kept for the old phone clients).
+  # presence/<student>-cam heartbeat cadence; the phone beats on the same 5 minute timer.
   heartbeat_ms: 300000
   # Local queue for refused writes (mirrors PendingUploadStore on the phone).
   pending_file: "pending_upload.jsonl"
