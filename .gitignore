@@ -33,4 +33,14 @@ edge-server/*.key
 # Any weight file, wherever it lands. ultralytics writes the model into the CURRENT folder, so running
 # main.py from the repo root used to drop a second 5.4 MB yolo11n.pt there and leave it in git status
 # as an untracked binary someone might add. No .pt is tracked in this repo, so this costs nothing.
+# .onnx joins for the same reason: `yolo11n.pt.export(format='onnx')` writes it next to the .pt, and an
+# 11 MB export sitting in git status is exactly the trap the line above was written for.
 *.pt
+*.onnx
+# focuschange.db is written by database/database.py the first time the program runs, and every
+# session adds rows to it. It is measured data about named children, not source, so it must never
+# be added. No .db is tracked in this repo, so this costs nothing.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

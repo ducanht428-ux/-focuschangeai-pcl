@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
 
-from .constants import HabitFeature, Situation
+from .constants import HabitConfig, HabitFeature, Situation
 from .habit import HabitProfile
 from .landmarks import focal_px
 from .person_pipeline import PersonPipeline, PersonResult
@@ -148,6 +148,25 @@ class ClassroomPipeline:
         self._last_heartbeat_ms = 0
         self._last_step_ms = 0
         self._frame_dt_ms = 33.0
+
+        # SQLite mirror of everything the cloud writer receives, kept beside it rather than
+        # inside it: a disk that refuses the file must cost the run its local copy, never its
+        # measurement, so both the import and the connect live under this guard and the writer
+        # path above cannot see them fail.
+        self._sqlite = None
+        self._store = None
+        self._store_warned = False
+        try:
+            import sys as _sys
+            _repo_root = os.path.dirname(_PACKAGE_PARENT)
+            if _repo_root not in _sys.path:
+                _sys.path.insert(0, _repo_root)
+            from database import database as _sqlite
+            self._sqlite = _sqlite
+            self._store = _sqlite.connect()
+            print("sqlite mirror: %s" % _sqlite.default_path())
+        except Exception as e:  # boundary with the filesystem
+            print("sqlite mirror disabled: %s: %s" % (type(e).__name__, e))
 
     # ------------------------------------------------------------------
     # construction helper kept here so main.py stays thin
@@ -424,10 +443,12 @@ class ClassroomPipeline:
         # gap of whichever frame happened to come last, so one stutter at the end of a 40 minute
         # session reported the whole session as running at 3 fps.
         avg_fps = 1000.0 * rt.measured_frames / float(max(1, s.active_ms))
+        # Computed once so the cloud row and the SQLite row carry the same verdict.
+        ineligible = profile.ineligible_reason(summary)
         self._writer.write_session(
             student_id=rt.student_id, student_name=rt.student_name, s=summary,
             band_outcomes=s.band_outcomes(), ended_at_wall_ms=wall_ms, device=str(self._device),
-            ineligible_reason=profile.ineligible_reason(summary),
+            ineligible_reason=ineligible,
             alerts_total=rt.alert_count,
             # 0, the same number the phone writes for a session in which nobody pressed
             # "Canh bao sai". The camera has no such button, so that count really is zero here;
@@ -436,8 +457,11 @@ class ClassroomPipeline:
             csv_rows=summary.count[HabitFeature.SEI],
             avg_fps=avg_fps,
         )
+        self._mirror_session(rt.student_id, rt.student_name, summary, wall_ms, avg_fps,
+                             ineligible, rt.alert_count)
         if self._habit_learn:
             self._writer.write_band(rt.student_id, rt.student_name, profile, wall_ms, str(self._device))
+            self._mirror_bands(rt.student_id, rt.student_name, profile, wall_ms)
 
     def _write_class_live(self, wall_ms: int) -> None:
         students: Dict[str, Dict] = {}
@@ -478,6 +502,69 @@ class ClassroomPipeline:
                 active_ms=rt.pipeline.session.active_ms,
                 alerts_total=rt.alert_count, device=str(self._device), state=state,
             )
+            self._mirror_presence(rt.student_id, rt.student_name,
+                                  rt.pipeline.session.to_summary(),
+                                  rt.session_started_wall_ms, wall_ms,
+                                  rt.pipeline.session.active_ms, rt.alert_count, state)
+
+    # ------------------------------------------------------------------
+    # SQLite mirror - the same rows the cloud writer gets, written beside it
+    # ------------------------------------------------------------------
+    def _mirror(self, fn, **kwargs) -> None:
+        if self._store is None:
+            return
+        try:
+            fn(self._store, **kwargs)
+        except Exception as e:  # boundary with the filesystem
+            if not self._store_warned:
+                self._store_warned = True
+                print("sqlite mirror write failed, cloud copy unaffected: %s: %s"
+                      % (type(e).__name__, e))
+
+    def _mirror_session(self, student_id: str, student_name: str, s, wall_ms: int,
+                        avg_fps: float, ineligible_reason, alerts_total: int) -> None:
+        # Only features with at least one observation, the same rule the cloud payload uses:
+        # a feature nobody measured stays an absent row instead of a zero.
+        features = [(HabitFeature.KEYS[f], s.mean[f], s.std[f], s.count[f])
+                    for f in range(HabitFeature.COUNT) if s.count[f] > 0]
+        self._mirror(self._sqlite.save_session,
+                     student_id=student_id, student_name=student_name, session_id=s.id,
+                     ended_at_wall_ms=wall_ms, valid_ms=s.valid_ms,
+                     face_ratio=s.face_ratio, valid_ratio=s.valid_ratio,
+                     quality_mean=s.quality if s.quality_count > 0 else None,
+                     sensitivity=s.sensitivity_level if s.sensitivity_level >= 0 else None,
+                     alerts_total=alerts_total, false_alerts=0,
+                     csv_rows=s.count[HabitFeature.SEI], avg_fps=avg_fps,
+                     device=str(self._device), app_version=self._writer.app_version,
+                     ineligible_reason=ineligible_reason, features=features)
+
+    def _mirror_bands(self, student_id: str, student_name: str, profile, wall_ms: int) -> None:
+        base = profile.baseline()
+        bands = []
+        for f in HabitFeature.BAND_FEATURES:
+            b = base.band(f)
+            if b is None:
+                continue
+            bands.append((HabitFeature.KEYS[f], b.mean, b.min, b.max, base.spread(f)))
+        if not bands:
+            return
+        self._mirror(self._sqlite.save_bands, student_id=student_id,
+                     student_name=student_name, bands=bands,
+                     sessions_used=profile.session_count(),
+                     band_k=float(HabitConfig.BAND_K), updated_at_wall_ms=wall_ms)
+
+    def _mirror_presence(self, student_id: str, student_name: str, s, started_ms: int,
+                         beat_ms: int, active_ms: int, alerts_total: int, state: str) -> None:
+        sei_n = s.count[HabitFeature.SEI]
+        self._mirror(self._sqlite.save_presence, student_id=student_id,
+                     student_name=student_name, session_id=s.id,
+                     started_at_wall_ms=started_ms, beat_at_wall_ms=beat_ms,
+                     active_ms=active_ms, valid_ms=s.valid_ms,
+                     face_ratio=s.face_ratio, valid_ratio=s.valid_ratio,
+                     alerts_total=alerts_total, false_alerts=0,
+                     sei_mean=s.mean[HabitFeature.SEI] if sei_n > 0 else None,
+                     sei_n=sei_n if sei_n > 0 else None, state=state,
+                     device=str(self._device), app_version=self._writer.app_version)
 
     # ------------------------------------------------------------------
     def shutdown(self, wall_ms: Optional[int] = None) -> None:
@@ -488,6 +575,9 @@ class ClassroomPipeline:
         self._tracks.clear()
         # one last live snapshot so the teacher screen reflects the stop
         self._write_class_live(wall_ms)
+        if self._store is not None:
+            self._store.close()
+            self._store = None
 
     # --- geometry helpers ----------------------------------------------
     def _face_region(self, bbox, w: int, h: int):
