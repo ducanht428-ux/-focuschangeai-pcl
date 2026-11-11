@@ -84,7 +84,7 @@ def main(argv=None) -> int:
     global frame_label
     ap = argparse.ArgumentParser(description="Enroll a student's face template")
     ap.add_argument("--roster", default="roster.json")
-    ap.add_argument("--id", required=True, help="studentId (Firestore key)")
+    ap.add_argument("--id", required=True, help="studentId (the key stored rows are found by)")
     ap.add_argument("--name", default=None)
     ap.add_argument("--seat", default=None)
     ap.add_argument("--pack", default="buffalo_l")

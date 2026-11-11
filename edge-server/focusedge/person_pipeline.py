@@ -243,6 +243,26 @@ class HudState:
     fps: float = float("nan")
 
 
+def phone_context_penalty(nearby_objects: Dict[str, float], pitch_dev: float,
+                          gaze_v_dev: float) -> float:
+    """The scene half of the score: how much a visible phone takes off this frame.
+
+    detection.py only reports that a cell phone box is in the frame; this is the rule that turns
+    that into a number, and it is the only place the detector touches the measurement. Two tests
+    have to pass together: the box has to clear 0.4 - above the detector's own 0.35 bar, so a
+    one-frame flicker of an object on someone else's desk cannot move the score - and the head has
+    to already be down or looking down, because a phone lying on the table while the student faces
+    the screen is not inattention.
+
+    Extracted out of process() so desktop/_dev/parity/gen_parity_cases.py can run it over a table
+    of inputs: the browser port reimplements this rule in js/detect.mjs, and a rule that only
+    exists inline in two files is a rule nobody can prove the two files share.
+    """
+    if nearby_objects.get("phone", 0.0) > 0.4 and (pitch_dev > 12.0 or gaze_v_dev > GAZE_V_DRIFT):
+        return 25.0
+    return 0.0
+
+
 class PersonPipeline:
     # calibration collects a neutral-pose baseline for this individual. Equal to CALIBRATION_FRAMES
     # in MainActivity.kt:258 on purpose: the phone needs 60 settled frames before it will call an
@@ -739,9 +759,7 @@ class PersonPipeline:
         expr_sc = expression_score(yawn_confirmed, yawns_recent, bfr, self.baseline_bfr, confused)
 
         # context penalty: a phone in hand while head pitched down reads as inattention
-        context_penalty = 0.0
-        if nearby_objects.get("phone", 0.0) > 0.4 and (pitch_dev > 12.0 or gaze_v_dev > GAZE_V_DRIFT):
-            context_penalty = 25.0
+        context_penalty = phone_context_penalty(nearby_objects, pitch_dev, gaze_v_dev)
 
         chronic_level = 0
         if context_penalty > 0 or look_away_long:

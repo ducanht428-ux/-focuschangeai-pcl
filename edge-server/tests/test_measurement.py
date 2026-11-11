@@ -23,6 +23,7 @@ from focusedge.constants import (
     FOREHEAD,
     EYE_L_OUT,
     EYE_R_OUT,
+    GAZE_V_DRIFT,
     LM_COUNT,
     MOUTH_L,
     MOUTH_LOW,
@@ -32,7 +33,7 @@ from focusedge.constants import (
 )
 from focusedge.detection import PersonTrack, assign_objects
 from focusedge.landmarks import Landmarks, estimate_distance_cm, focal_px, head_pose_deg
-from focusedge.person_pipeline import PersonPipeline
+from focusedge.person_pipeline import PersonPipeline, phone_context_penalty
 
 def _face(spots=None):
     """A 478-point landmark set with only the named indices given coordinates.
@@ -189,6 +190,25 @@ def test_object_outside_every_person_stays_unassigned():
     left = assign_objects([a], [("book", (500, 500, 560, 560), 0.6)])
     assert left == [("book", (500, 500, 560, 560), 0.6)]
     assert "book" not in a.nearby_objects
+
+
+def test_phone_context_needs_both_the_box_and_a_head_already_down():
+    # This is the only place the detector touches the measurement, and desktop/js/detect.mjs
+    # reimplements it for the browser leg, so the corners of the rule are pinned as numbers rather
+    # than left to prose. The 0.4 floor sits above detection's own 0.35 bar on purpose.
+    assert phone_context_penalty({}, 30.0, 1.0) == 0.0
+    assert phone_context_penalty({"phone": 0.4}, 30.0, 1.0) == 0.0
+    assert phone_context_penalty({"phone": 0.41}, 30.0, 1.0) == 25.0
+    # A phone on the desk in front of a student facing the screen changes nothing.
+    assert phone_context_penalty({"phone": 0.9}, 0.0, 0.0) == 0.0
+    # 12 degrees is the pitched-down bar, and the comparison is strict on both sides of it.
+    assert phone_context_penalty({"phone": 0.9}, 12.0, 0.0) == 0.0
+    assert phone_context_penalty({"phone": 0.9}, 12.1, 0.0) == 25.0
+    # Looking down without pitching the head counts too, at the same strict bar.
+    assert phone_context_penalty({"phone": 0.9}, 0.0, GAZE_V_DRIFT) == 0.0
+    assert phone_context_penalty({"phone": 0.9}, 0.0, GAZE_V_DRIFT + 0.01) == 25.0
+    # A book or a laptop is context, but not this deduction: only the phone class is.
+    assert phone_context_penalty({"book": 0.9, "laptop": 0.9}, 30.0, 1.0) == 0.0
 
 
 def _pipeline(level=1):

@@ -7,7 +7,8 @@ Five layers, mirroring the architecture agreed for the classroom build:
   3. scheduler   ROI budget        -> "who gets measured this frame"
   4. person      MediaPipe + the ported Kotlin engines (EyeEngine, SituationEngine,
                  PersonGuard, habit model, SEI) -> "how focused is this person"
-  5. sync        Firestore writer keyed by studentId (sessions / class_live / bands)
+  5. storage     SQLite writer keyed by studentId (sessions / features / bands / alerts)
+                 plus the two live views as JSON - nothing leaves this machine
 
 The measurement math in ``engines``/``habit``/``sei`` is a faithful port of the
 Android app under ``app/src/main/java/com/focuschange/ai`` so a number means the

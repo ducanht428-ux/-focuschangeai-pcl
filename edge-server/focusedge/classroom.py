@@ -3,9 +3,9 @@
 This is the only module that knows about every other one. Its job per frame:
 
   detect (YOLO)  ->  bind identity (ArcFace+roster)  ->  schedule faces (ROI budget)
-  ->  measure (MediaPipe + PersonPipeline)  ->  aggregate & sync (Firestore)
+  ->  measure (MediaPipe + PersonPipeline)  ->  aggregate & store (SQLite + out/)
 
-Third-party imports (cv2/numpy/ultralytics/insightface/mediapipe/firebase) are all
+Third-party imports (cv2/numpy/ultralytics/insightface/mediapipe) are all
 lazy: the module imports and its bookkeeping is testable without a GPU or models,
 and the heavy objects are only built when ``ClassroomPipeline`` is constructed.
 """
@@ -17,7 +17,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
 
-from .constants import HabitConfig, HabitFeature, Situation
+from .activity import (
+    CONTEXT_T, ClassContext, ClassContextEngine, ClassSnapshot, Signals, head_signals, room_objects,
+)
+from .constants import HabitFeature, Situation
 from .habit import HabitProfile
 from .landmarks import focal_px
 from .person_pipeline import PersonPipeline, PersonResult
@@ -61,13 +64,34 @@ class DetectionView(NamedTuple):
     operator would conclude the detector missed two. So the raw layer-1 output travels here
     instead - every box ByteTrack returned, every context object that fell inside no box, and the
     face window each person box was cut into. Measured values never read from it, so nothing in
-    this struct can change a number that goes to Firestore.
+    this struct can change a stored number.
     """
 
     persons: tuple = ()                    # PersonTrack: .bbox .track_id .conf .nearby_objects
     objects: tuple = ()                    # (name, bbox, conf) assigned to no person
     face_regions: Tuple[Tuple[int, tuple], ...] = ()   # (track_id, face box) fed to FaceLandmarker
     frame_size: Tuple[int, int] = (0, 0)   # (w, h) the coordinates belong to
+
+
+class PersonView(NamedTuple):
+    """One entry of the head menu: who is in frame, and how sure the machine is about the name.
+
+    Layer 4 is deliberately absent. The preview has to be able to say "em 2/3 · Nam Nguyen · điểm
+    khớp 0.61" about a child whose face the scheduler did not pick this tick, and the only honest
+    source for that half of the sentence is layer 2.
+    """
+
+    track_id: int
+    student_id: Optional[str]
+    student_name: str
+    identity_conf: str
+    score: float = 0.0                     # cosine the gates were compared against, 0 before any
+    margin: float = 0.0                    # how far that template beats the next-closest student
+    samples: int = 0                       # face samples averaged behind the score
+    runner_up: str = ""                    # second-closest student_id, "" when there is only one
+    gate: float = 0.0                      # bind_hi as configured, so the line can name the bar
+    margin_gate: float = 0.0               # min_margin as configured
+    measurable: bool = False               # did this face produce numbers recently at all
 
 
 @dataclass
@@ -87,8 +111,11 @@ class TrackRuntime:
     nearby: Dict[str, float] = field(default_factory=dict)
     # Counted here instead of read back out of the alert log: that log is a 200-item ring,
     # so a busy classroom would quietly lose the earliest alerts of a session and the number
-    # written to Firestore would be short without anything on screen saying so.
+    # stored would be short without anything on screen saying so. ``alerts`` is the same list
+    # kept per session rather than per run, so the alerts table gets one row per alert and the
+    # count in the session's notes can never disagree with the rows beside it.
     alert_count: int = 0
+    alerts: List[Dict] = field(default_factory=list)
     measured_frames: int = 0
     # Wall clock of the moment this session started. The phone derives it from its session id,
     # which IS the start timestamp; here the id is a per-student counter, so the start time is
@@ -119,10 +146,10 @@ class ClassroomPipeline:
         ident = cfg.get("identity", {})
         sched = cfg.get("scheduler", {})
         person = cfg.get("person", {})
-        sync = cfg.get("sync", {})
+        storage = cfg.get("storage", {})
 
         self.class_id = cfg.get("class_id", "class")
-        # What the operator and the judges read on the preview. class_id stays the document key and
+        # What the operator and the judges read on the preview. class_id stays the stored key and
         # is an ASCII slug, so the two are deliberately different strings.
         self.class_label = cfg.get("class_label") or self.class_id
         self._track_ttl_ms = int(det.get("track_ttl_ms", 15000))
@@ -132,8 +159,11 @@ class ClassroomPipeline:
         self._reverify_ms = int(ident.get("reverify_ms", 30000))
         self._identity_enabled = embedder is not None
 
-        self._class_live_ms = int(sync.get("class_live_ms", 20000))
-        self._heartbeat_ms = int(sync.get("heartbeat_ms", 300000))
+        # Layer 5 used to be two copies of every number - the cloud writer and a 5-table mirror
+        # beside it. There is one copy now: the writer IS the database, so a disk that refuses the
+        # file is reported by the writer's own counter and nothing here has to guard it twice.
+        self._class_live_ms = int(storage.get("class_live_ms", 20000))
+        self._heartbeat_ms = int(storage.get("heartbeat_ms", 300000))
         self._device = cfg.get("input", {}).get("source", "edge")
         # from_config() installs a real IdentityResolver; a directly built pipeline
         # (tests) keeps identity off.
@@ -144,29 +174,18 @@ class ClassroomPipeline:
         # Preview-only: the last frame's raw layer-1 output. Overwritten every step().
         self.last_boxes = DetectionView()
 
+        # What the room is doing, one label for the whole class rather than one per head. Kept here
+        # because only step() has the meshes, the boxes and the objects of one and the same frame, and
+        # a room label built from two different frames is a claim nobody can check.
+        self.activity = ClassContextEngine()
+        self.last_activity: Optional[ClassSnapshot] = None
+        self._activity_at_ms = 0
+        self._activity_sample_ms = int(CONTEXT_T["SAMPLE_MS"])
+
         self._last_class_live_ms = 0
         self._last_heartbeat_ms = 0
         self._last_step_ms = 0
         self._frame_dt_ms = 33.0
-
-        # SQLite mirror of everything the cloud writer receives, kept beside it rather than
-        # inside it: a disk that refuses the file must cost the run its local copy, never its
-        # measurement, so both the import and the connect live under this guard and the writer
-        # path above cannot see them fail.
-        self._sqlite = None
-        self._store = None
-        self._store_warned = False
-        try:
-            import sys as _sys
-            _repo_root = os.path.dirname(_PACKAGE_PARENT)
-            if _repo_root not in _sys.path:
-                _sys.path.insert(0, _repo_root)
-            from database import database as _sqlite
-            self._sqlite = _sqlite
-            self._store = _sqlite.connect()
-            print("sqlite mirror: %s" % _sqlite.default_path())
-        except Exception as e:  # boundary with the filesystem
-            print("sqlite mirror disabled: %s: %s" % (type(e).__name__, e))
 
     # ------------------------------------------------------------------
     # construction helper kept here so main.py stays thin
@@ -175,15 +194,15 @@ class ClassroomPipeline:
     def from_config(cls, cfg: dict) -> "ClassroomPipeline":
         from .detection import Detector
         from .face_landmarker import FaceAnalyzer
-        from .firestore_writer import FirestoreWriter
         from .identity import FaceEmbedder, IdentityResolver
+        from .local_store import LocalStore
         from .roster import Roster
         from .scheduler import Scheduler
 
         det_cfg = cfg.get("detection", {})
         ident_cfg = cfg.get("identity", {})
         sched_cfg = cfg.get("scheduler", {})
-        sync_cfg = cfg.get("sync", {})
+        storage_cfg = cfg.get("storage", {})
         io_cfg = cfg.get("local_output", {})
 
         # The weights name is resolved the same way the eye model is. It matters more than it looks:
@@ -205,7 +224,7 @@ class ClassroomPipeline:
             embedder = FaceEmbedder(pack=ident_cfg.get("recognition_pack", "buffalo_l"))
         except Exception as e:  # boundary with an external SDK
             # Printed rather than swallowed: with no embedder every track stays a guest, which
-            # means a run that looks fine on screen writes no sessions document at all. The
+            # means a run that looks fine on screen writes no session rows at all. The
             # reason has to appear on the same screen the operator is watching.
             print("identity off (%s: %s) - every track stays a guest" % (type(e).__name__, e))
 
@@ -232,19 +251,22 @@ class ClassroomPipeline:
             starve_ms=int(sched_cfg.get("starve_ms", 1500)),
             hot_multiplier=float(sched_cfg.get("hot_multiplier", 3)),
         )
-        writer = FirestoreWriter(
-            service_account=sync_cfg.get("service_account", ""),
-            pending_file=sync_cfg.get("pending_file", "pending_upload.jsonl"),
-            pending_max=int(sync_cfg.get("pending_max", 300)),
+        writer = LocalStore(
+            db_path=storage_cfg.get("db", ""),
             local_dir=io_cfg.get("dir", "out"),
+            class_id=cfg.get("class_id", "class"),
+            class_label=cfg.get("class_label") or cfg.get("class_id", "class"),
+            school_year=storage_cfg.get("school_year", ""),
         )
         # stash the resolver so step() can reach it without another import
         obj = cls(cfg, detector, embedder, roster, analyzer, scheduler, writer)
         if embedder is not None:
             obj._resolver = IdentityResolver(
                 embedder, roster,
-                bind_hi=float(ident_cfg.get("bind_hi", 0.45)),
-                bind_lo=float(ident_cfg.get("bind_lo", 0.30)),
+                bind_hi=float(ident_cfg.get("bind_hi", 0.52)),
+                bind_lo=float(ident_cfg.get("bind_lo", 0.38)),
+                min_margin=float(ident_cfg.get("min_margin", 0.05)),
+                min_samples=int(ident_cfg.get("min_samples", 10)),
                 embed_window=int(ident_cfg.get("embed_window", 40)),
                 unbind_hold_ms=int(ident_cfg.get("unbind_hold_ms", 10000)),
             )
@@ -327,6 +349,7 @@ class ClassroomPipeline:
         # One focal length for the whole frame: face crops are pixel windows of this same image, so
         # they share its scale. Nominal 60 deg horizontal field of view, like the phone.
         frame_focal = focal_px(w)
+        measured = []
         for cand in chosen:
             rt = by_track.get(cand.track_id)
             if rt is None:
@@ -359,8 +382,12 @@ class ClassroomPipeline:
             res.calibration_progress = rt.pipeline.calibration_progress
             rt.last_result = res
             results.append(res)
+            measured.append((res.landmarks, res.face_bbox, rt.nearby))
             if res.alert:
                 self._register_alert(rt, res.alert, wall_ms)
+
+        # -- what the room as a whole is doing -----------------------------
+        self._update_activity(measured, persons, scene_objects, w, h, now_ms)
 
         # -- start sessions for freshly bound, measurable people ----------
         for rt in self._tracks.values():
@@ -388,6 +415,39 @@ class ClassroomPipeline:
             self._last_heartbeat_ms = now_ms
 
         return results
+
+    # ------------------------------------------------------------------
+    def _update_activity(self, measured, persons, scene_objects, w: int, h: int,
+                         now_ms: int) -> None:
+        """One Classroom Context Engine sample, paced by ``CONTEXT_T["SAMPLE_MS"]``.
+
+        Purely a reading of numbers this frame already produced: no model, no extra pass. It is paced
+        anyway because the geometry is per head and the pair/group rules compare every head with every
+        other, which on a 2-core box is arithmetic that does not have to run at frame rate. The web leg
+        paces the same way, so both screens update on the same rhythm.
+
+        Only heads with a mesh FROM THIS FRAME are fed. A track the scheduler did not pick this tick is
+        left out rather than represented by its previous tick's landmarks: see the note in activity.py.
+        """
+        if self._activity_at_ms and now_ms - self._activity_at_ms < self._activity_sample_ms:
+            return
+        self._activity_at_ms = now_ms
+        snap = self.activity.update(Signals(
+            heads=head_signals(measured, w, h),
+            persons=len(persons),
+            room=room_objects(persons, scene_objects),
+        ), now_ms)
+        if self.last_activity is None or snap.context != self.last_activity.context:
+            # One line per switch, never per frame: the label is the slow quantity here, and a stdout
+            # that prints it 8 times a second would bury the alerts the operator is watching for.
+            # ASCII only, on purpose - this console's code page cannot encode the Vietnamese label and
+            # raising inside step() would stop a measuring run over a log line. The screen owns the
+            # readable sentence; this line is for a run started without --show.
+            prev = self.last_activity.context if self.last_activity is not None else None
+            print("class-context: %s -> %s" % (
+                ClassContext(prev).name if prev is not None else "-",
+                ClassContext(snap.context).name))
+        self.last_activity = snap
 
     # ------------------------------------------------------------------
     def _sync_binding(self, rt: TrackRuntime) -> None:
@@ -422,6 +482,7 @@ class ClassroomPipeline:
 
     def _register_alert(self, rt: TrackRuntime, code: str, wall_ms: int) -> None:
         rt.alert_count += 1
+        rt.alerts.append({"code": code, "wall_ms": wall_ms})
         self._alerts.append({
             "student_id": rt.student_id or ("guest-%d" % rt.track_id),
             "student_name": rt.student_name,
@@ -443,7 +504,7 @@ class ClassroomPipeline:
         # gap of whichever frame happened to come last, so one stutter at the end of a 40 minute
         # session reported the whole session as running at 3 fps.
         avg_fps = 1000.0 * rt.measured_frames / float(max(1, s.active_ms))
-        # Computed once so the cloud row and the SQLite row carry the same verdict.
+        # Computed once so the session row and the learned band row carry the same verdict.
         ineligible = profile.ineligible_reason(summary)
         self._writer.write_session(
             student_id=rt.student_id, student_name=rt.student_name, s=summary,
@@ -452,16 +513,14 @@ class ClassroomPipeline:
             alerts_total=rt.alert_count,
             # 0, the same number the phone writes for a session in which nobody pressed
             # "Canh bao sai". The camera has no such button, so that count really is zero here;
-            # "source" and the "-cam-" in the key are what tell the two instruments apart.
+            # what tells the two instruments apart is the "source" column, nothing else.
             false_alerts=0,
             csv_rows=summary.count[HabitFeature.SEI],
             avg_fps=avg_fps,
+            alerts=list(rt.alerts),
         )
-        self._mirror_session(rt.student_id, rt.student_name, summary, wall_ms, avg_fps,
-                             ineligible, rt.alert_count)
         if self._habit_learn:
             self._writer.write_band(rt.student_id, rt.student_name, profile, wall_ms, str(self._device))
-            self._mirror_bands(rt.student_id, rt.student_name, profile, wall_ms)
 
     def _write_class_live(self, wall_ms: int) -> None:
         students: Dict[str, Dict] = {}
@@ -502,69 +561,6 @@ class ClassroomPipeline:
                 active_ms=rt.pipeline.session.active_ms,
                 alerts_total=rt.alert_count, device=str(self._device), state=state,
             )
-            self._mirror_presence(rt.student_id, rt.student_name,
-                                  rt.pipeline.session.to_summary(),
-                                  rt.session_started_wall_ms, wall_ms,
-                                  rt.pipeline.session.active_ms, rt.alert_count, state)
-
-    # ------------------------------------------------------------------
-    # SQLite mirror - the same rows the cloud writer gets, written beside it
-    # ------------------------------------------------------------------
-    def _mirror(self, fn, **kwargs) -> None:
-        if self._store is None:
-            return
-        try:
-            fn(self._store, **kwargs)
-        except Exception as e:  # boundary with the filesystem
-            if not self._store_warned:
-                self._store_warned = True
-                print("sqlite mirror write failed, cloud copy unaffected: %s: %s"
-                      % (type(e).__name__, e))
-
-    def _mirror_session(self, student_id: str, student_name: str, s, wall_ms: int,
-                        avg_fps: float, ineligible_reason, alerts_total: int) -> None:
-        # Only features with at least one observation, the same rule the cloud payload uses:
-        # a feature nobody measured stays an absent row instead of a zero.
-        features = [(HabitFeature.KEYS[f], s.mean[f], s.std[f], s.count[f])
-                    for f in range(HabitFeature.COUNT) if s.count[f] > 0]
-        self._mirror(self._sqlite.save_session,
-                     student_id=student_id, student_name=student_name, session_id=s.id,
-                     ended_at_wall_ms=wall_ms, valid_ms=s.valid_ms,
-                     face_ratio=s.face_ratio, valid_ratio=s.valid_ratio,
-                     quality_mean=s.quality if s.quality_count > 0 else None,
-                     sensitivity=s.sensitivity_level if s.sensitivity_level >= 0 else None,
-                     alerts_total=alerts_total, false_alerts=0,
-                     csv_rows=s.count[HabitFeature.SEI], avg_fps=avg_fps,
-                     device=str(self._device), app_version=self._writer.app_version,
-                     ineligible_reason=ineligible_reason, features=features)
-
-    def _mirror_bands(self, student_id: str, student_name: str, profile, wall_ms: int) -> None:
-        base = profile.baseline()
-        bands = []
-        for f in HabitFeature.BAND_FEATURES:
-            b = base.band(f)
-            if b is None:
-                continue
-            bands.append((HabitFeature.KEYS[f], b.mean, b.min, b.max, base.spread(f)))
-        if not bands:
-            return
-        self._mirror(self._sqlite.save_bands, student_id=student_id,
-                     student_name=student_name, bands=bands,
-                     sessions_used=profile.session_count(),
-                     band_k=float(HabitConfig.BAND_K), updated_at_wall_ms=wall_ms)
-
-    def _mirror_presence(self, student_id: str, student_name: str, s, started_ms: int,
-                         beat_ms: int, active_ms: int, alerts_total: int, state: str) -> None:
-        sei_n = s.count[HabitFeature.SEI]
-        self._mirror(self._sqlite.save_presence, student_id=student_id,
-                     student_name=student_name, session_id=s.id,
-                     started_at_wall_ms=started_ms, beat_at_wall_ms=beat_ms,
-                     active_ms=active_ms, valid_ms=s.valid_ms,
-                     face_ratio=s.face_ratio, valid_ratio=s.valid_ratio,
-                     alerts_total=alerts_total, false_alerts=0,
-                     sei_mean=s.mean[HabitFeature.SEI] if sei_n > 0 else None,
-                     sei_n=sei_n if sei_n > 0 else None, state=state,
-                     device=str(self._device), app_version=self._writer.app_version)
 
     # ------------------------------------------------------------------
     def shutdown(self, wall_ms: Optional[int] = None) -> None:
@@ -575,9 +571,7 @@ class ClassroomPipeline:
         self._tracks.clear()
         # one last live snapshot so the teacher screen reflects the stop
         self._write_class_live(wall_ms)
-        if self._store is not None:
-            self._store.close()
-            self._store = None
+        self._writer.close()
 
     # --- geometry helpers ----------------------------------------------
     def _face_region(self, bbox, w: int, h: int):
@@ -625,6 +619,40 @@ class ClassroomPipeline:
     @property
     def active_tracks(self) -> int:
         return len(self._tracks)
+
+    def people(self) -> List[PersonView]:
+        """Who is in frame and how sure the machine is of each name, lowest track id first.
+
+        Ordered by id and not by quality because the preview keys a row of this list: a menu that
+        reshuffles itself every frame would make "press 2" mean a different child each time.
+        """
+        rows: List[PersonView] = []
+        gate = float(getattr(self._resolver, "bind_hi", 0.0) or 0.0)
+        margin_gate = float(getattr(self._resolver, "min_margin", 0.0) or 0.0)
+        for rt in sorted(self._tracks.values(), key=lambda r: r.track_id):
+            st = rt.identity
+            rows.append(PersonView(
+                track_id=rt.track_id, student_id=rt.student_id, student_name=rt.student_name,
+                identity_conf=rt.identity_conf,
+                score=float(getattr(st, "score", 0.0) or 0.0),
+                margin=float(getattr(st, "margin", 0.0) or 0.0),
+                samples=int(getattr(st, "samples", 0) or 0),
+                runner_up=str(getattr(st, "runner_up", "") or ""),
+                gate=gate, margin_gate=margin_gate,
+                measurable=bool(rt.last_result is not None and rt.last_result.measurable)))
+        return rows
+
+    def person_result(self, track_id: Optional[int]):
+        """The newest PersonResult for one track, even if the scheduler skipped that face this tick.
+
+        Returning nothing here is what makes the column fall back to whichever face WAS measured,
+        and that silent swap is the behaviour the operator cannot tell apart from mixed-up numbers.
+        A stale row of the same child is honest; a fresh row of the other child is not.
+        """
+        if track_id is None:
+            return None
+        rt = self._tracks.get(track_id)
+        return rt.last_result if rt is not None else None
 
     @property
     def measurable_tracks(self) -> int:

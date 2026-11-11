@@ -319,12 +319,23 @@ def calibration_text(h) -> str:
 # ---------------------------------------------------------------------------
 # The whole column
 # ---------------------------------------------------------------------------
-def hud_lines(result, face_count: int, processing_ms: float, fps: float) -> List[Line]:
+def hud_lines(result, face_count: int, processing_ms: float, fps: float, identity=None,
+              activity=None) -> List[Line]:
     """Every text line the phone shows between its title and its camera preview.
 
     ``result`` is the PersonResult the pipeline produced for the person being shown (or None when
     the frame holds nobody); the blink count and the calibration progress ride inside its HudState,
     because both belong to one person, not to the window.
+
+    ``identity`` is that person's PersonView from layer 2, and it is this leg's own addition: the
+    phone has one holder and one face, so it never has to admit how close a name call was. Here the
+    line carries the score and the gap to the next-closest student, which is how an operator can
+    tell "the roster has no such child" from "the room is too dark to be sure".
+
+    ``activity`` is the room-level ClassSnapshot from focusedge.activity, also not a phone line: the
+    phone measures one head and has nothing to say about what the class is doing. When the caller has
+    no context layer the row keeps its place with a dash, because a column that silently loses a line
+    looks like a column that changed.
     """
     h = result.hud if result is not None else None
     calibrated = bool(result is not None and result.calibrated)
@@ -380,6 +391,8 @@ def hud_lines(result, face_count: int, processing_ms: float, fps: float) -> List
     else:
         add(Line(_habit_status(h), _SMALL))
     add(Line("Máy này đang gắn với: %s" % (name or "chưa gắn tên"), _SMALL))
+    if identity is not None:
+        add(Line(_identity_evidence(identity), _SMALL))
 
     add(Line("Số khuôn mặt: %d" % face_count, _TITLE_M))
     add(Line("Số điểm mốc: %d" % (h.landmark_count if h else 0)))
@@ -405,6 +418,16 @@ def hud_lines(result, face_count: int, processing_ms: float, fps: float) -> List
     add(Line("Tư thế đầu: %s" % head_pose_text(h)))
     add(Line("Hướng nhìn: %s" % gaze_status(h)))
     add(Line("Tình huống: %s" % sit_text))
+    # The room-level label, directly under the per-head situation, because the two answers belong
+    # together: "this child is turned sideways" and "the room is doing pair work" are the same geometry
+    # read at two scales. The sentence after the evidence is not decoration - these rules were written
+    # by hand and no labelled classroom video has ever been scored against them, so the number column
+    # has to say that in the same breath as the label. tests/test_activity.py pins the wording.
+    add(Line("Hoạt động lớp: %s" % (activity.label if activity is not None else "--"),
+             _TITLE_M, _C.PRIMARY if activity is not None else _C.GRAY))
+    if activity is not None:
+        add(Line("%s · luật viết tay, chưa kiểm định bằng dữ liệu có nhãn" % activity.evidence,
+                 _SMALL, _C.GRAY))
     add(Line("Vi biểu cảm: %s" % expression_status(h)))
     if h is not None and h.mar == h.mar and h.bfr == h.bfr:
         add(Line("Chỉ số: BFR %.2f | MAR %.2f | Ngáp (5 phút): %d" % (
@@ -453,10 +476,13 @@ def hud_lines(result, face_count: int, processing_ms: float, fps: float) -> List
     return [l._replace(bold=l.style in _MEDIUM_STYLES) for l in out]
 
 
+# The phone's privacy line (MainActivity.kt) still mentions Firebase, because on the phone that is
+# a switch the student can see. This machine has no such switch any more, so the sentence is its
+# own: copying the phone's line here would claim a cloud path the camera leg does not have.
 PRIVACY_NOTE = (
-    "Mọi phép đo chạy trên máy này; app không lưu ảnh, không lưu video. "
-    "Khi bật Firebase, app tự gửi ba bản tổng kết (kèm tên do chính bạn nhập). "
-    "Bấm Chia sẻ báo cáo là cách duy nhất bạn chủ động đẩy thêm gì đi."
+    "Mọi phép đo chạy trên máy này; chương trình không lưu ảnh, không lưu video. "
+    "Kết quả chỉ ghi vào data/focuschange.db và các tệp JSON trong thư mục out/ trên cùng máy. "
+    "Không có bất kỳ dữ liệu nào rời khỏi máy quay."
 )
 
 
@@ -468,6 +494,33 @@ def _habit_status(h) -> str:
     profile this leg cannot have, so it is not printed with invented numbers.
     """
     return "Đang học thói quen: hồ sơ chưa gắn tên nên chưa có phiên nào được lưu."
+
+
+def _identity_evidence(v) -> str:
+    """The number a name was decided on, or the reason there is no name yet.
+
+    Written from the PersonView rather than from the verdict string, so the screen cannot say
+    "chưa đủ chắc" about a face that scored above the bar and vice versa. The gap to the
+    next-closest classmate is the part that matters in a classroom: two scores that differ by
+    nothing is the machine guessing, and a negative gap says so out loud.
+    """
+    if not v.samples:
+        return "Nhận diện: chưa có mẫu mặt nào để so với danh sách lớp"
+    if not v.score:
+        return "Nhận diện: chưa so được với danh sách lớp (%d mẫu mặt)" % v.samples
+    if v.student_id:
+        if not v.runner_up:
+            return ("Nhận diện: điểm khớp %.2f · %d mẫu mặt · danh sách lớp chưa có em thứ hai để so"
+                    % (v.score, v.samples))
+        return ("Nhận diện: điểm khớp %.2f · chênh với %s %.2f · %d mẫu mặt"
+                % (v.score, v.runner_up, v.margin, v.samples))
+    need = []
+    if v.gate:
+        need.append("cần ≥ %.2f" % v.gate)
+    if v.margin_gate:
+        need.append("chênh ≥ %.2f" % v.margin_gate)
+    return ("Nhận diện: chưa gắn tên, điểm cao nhất %.2f (%s) · %d mẫu mặt"
+            % (v.score, " và ".join(need) if need else "chưa đạt", v.samples))
 
 
 def landmark_to_frame_px(lm, i: int, face_bbox, frame_w: int, frame_h: int):

@@ -110,7 +110,7 @@ def test_a_held_alert_names_the_situation_that_is_holding_it():
 
 
 def test_quality_score_printed_is_the_score_recorded():
-    """One penalty table, so the HUD can never disagree with the number written to Firestore."""
+    """One penalty table, so the HUD can never disagree with the quality_mean that gets stored."""
     for args in [((200.0, False, 5.0, 5.0, True), {}),
                  ((30.0, False, 5.0, 5.0, True), {}),
                  ((20.0, True, 40.0, 35.0, False), {}),

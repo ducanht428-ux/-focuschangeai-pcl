@@ -9,19 +9,46 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-# COCO class ids we care about for classroom context.
+# COCO class id for the only box this project treats as a subject rather than as context.
 COCO_PERSON = 0
-COCO_CELL_PHONE = 67
-COCO_BOOK = 73
-COCO_LAPTOP = 63
-COCO_BACKPACK = 24
 
-CONTEXT_CLASSES = {
-    COCO_CELL_PHONE: "phone",
-    COCO_BOOK: "book",
-    COCO_LAPTOP: "laptop",
-    COCO_BACKPACK: "backpack",
+# The object vocabulary this leg names on screen. Same forty entries as CONTEXT_VI in the browser leg's
+# js/detect.mjs, so "trong khung: chai nước 0.62" means the same desk item on both legs. Furniture is
+# deliberately absent: chair and dining table are in every frame of a classroom and would out-number the
+# desk items they are supposed to be background for.
+#
+# This list is not decoration. activity.py's break and practice rules read exactly these names, and
+# while the detector whitelisted four objects the BREAK label could never fire from room evidence here
+# even though it fires on the web leg. Widening it costs no inference: ultralytics scores all eighty
+# COCO classes on every pass, this is a filter over boxes that already exist.
+#
+# Parity, stated rather than glossed: the only rule that can move a SCORE reads one name, 'phone'
+# (person_pipeline.phone_context_penalty), and that name has always been here - so the two legs still
+# cannot disagree about attention, only about labels.
+CONTEXT_VI = {
+    "phone": "điện thoại", "book": "sách", "laptop": "laptop", "backpack": "ba lô",
+    "bottle": "chai nước", "cup": "cốc nước", "scissors": "cái kéo", "handbag": "túi xách",
+    "clock": "đồng hồ", "teddy bear": "gấu bông", "mouse": "chuột máy tính",
+    "keyboard": "bàn phím", "remote": "điều khiển", "umbrella": "cái ô",
+    "sports ball": "quả bóng", "tv": "tivi", "kite": "con diều", "frisbee": "đĩa ném",
+    "skateboard": "ván trượt", "tennis racket": "cái vợt", "baseball bat": "gậy bóng chày",
+    "baseball glove": "găng bóng chày", "wine glass": "ly nước", "fork": "cái nĩa",
+    "knife": "con dao", "spoon": "cái thìa", "bowl": "cái bát", "banana": "quả chuối",
+    "apple": "quả táo", "sandwich": "bánh sandwich", "orange": "quả cam",
+    "broccoli": "bông cải", "carrot": "củ cà rốt", "hot dog": "bánh mì hot dog",
+    "pizza": "bánh pizza", "donut": "bánh donut", "cake": "bánh ngọt", "tie": "cà vạt",
+    "potted plant": "chậu cây", "vase": "lọ hoa",
 }
+
+# ultralytics spells the class "cell phone"; every other file in this project, and the web leg, call it
+# "phone". The canonical key is what nearby_objects holds, so the penalty rule never has to know.
+CONTEXT_ALIASES = {"cell phone": "phone"}
+
+
+def canonical_name(name: str) -> str:
+    """A model's class label spelled the way this project's rules spell it."""
+    return CONTEXT_ALIASES.get(name, name)
+
 
 
 @dataclass
@@ -98,6 +125,23 @@ class Detector:
         self._device = device
         # Face boxes are produced separately by the FaceLandmarker/BlazeFace; the
         # detector only yields bodies + context objects.
+        #
+        # The object ids are read out of the weights' OWN label table instead of being typed in here,
+        # because the number depends on which table a checkpoint carries: the 80-name COCO set puts
+        # "book" at 73 while the 91-name variant puts it at 75, and a hand-typed dict would quietly
+        # name a sink "book" on the other one. Whatever the model calls a class, the name is what the
+        # rules match, so this is the one place a class number is trusted.
+        names = dict(getattr(self._model, "names", {}) or {})
+        self._context_ids = {i: canonical_name(str(n)) for i, n in names.items()
+                             if canonical_name(str(n)) in CONTEXT_VI}
+        # A person-shaped box is the subject of every rule downstream, so a weights file whose label
+        # table does not call class ``person_class`` "person" would make this leg measure nothing at all.
+        # Failing here, at load, names the mismatch; letting it pass would show up as an empty room.
+        if names and canonical_name(str(names.get(self._person_class, ""))) != "person":
+            raise ValueError("model %r has no 'person' at class id %d (it is %r) - set "
+                             "detection.person_class to the id this checkpoint uses"
+                             % (model, self._person_class, names.get(self._person_class)))
+
 
     def run(self, frame_bgr) -> "tuple[List[PersonTrack], List[tuple]]":
         """Return (person_tracks, other_object_boxes).
@@ -130,8 +174,8 @@ class Detector:
         for tid, box, c, cf in zip(ids, xyxy, cls, conf):
             if c == self._person_class:
                 raw_persons.append(PersonTrack(track_id=int(tid), bbox=tuple(box), conf=float(cf)))
-            elif c in CONTEXT_CLASSES:
-                raw_objects.append((CONTEXT_CLASSES[c], tuple(box), float(cf)))
+            elif c in self._context_ids:
+                raw_objects.append((self._context_ids[c], tuple(box), float(cf)))
 
         # Assign each object to the person whose box contains its center.
         unassigned = assign_objects(raw_persons, raw_objects)

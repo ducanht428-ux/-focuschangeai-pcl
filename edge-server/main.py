@@ -2,9 +2,10 @@
 """FocusChangeAI edge server - classroom entrypoint.
 
 Reads a YAML config, opens a camera/video/RTSP source, and runs the five-layer
-pipeline frame by frame. Bound students are written to Firestore keyed by their
-studentId (sessions/bands/presence) plus one aggregate class_live document; if no
-service-account is configured the same payloads are dumped under ``local_output.dir``.
+pipeline frame by frame. Bound students are stored on this machine: one row per
+session in ``data/focuschange.db`` (see ``database/focuschange_db.py``), and the two
+live views - the per-student heartbeat and the class board - as ``out/*.json``.
+Nothing leaves the box.
 
 Examples:
     python main.py --config config.yaml
@@ -23,8 +24,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from focusedge.classroom import ClassroomPipeline  # noqa: E402
+from focusedge.detection import CONTEXT_VI  # noqa: E402
 from focusedge.hud import (  # noqa: E402
-    DOT_COLOURS, EYE_DRAW, IRIS_FIRST, Line, _C, _SMALL, landmark_to_frame_px)
+    DOT_COLOURS, EYE_DRAW, IRIS_FIRST, Line, _C, _SMALL, _TITLE_M, landmark_to_frame_px)
 
 _FONTS: dict = {}
 
@@ -242,6 +244,9 @@ def _pick_person(results):
     finished calibrating, then any measurable person, then the first track. A wall photograph that
     YOLO boxed as a person never outranks a real face, and if the chosen person is a photograph the
     column says so in the phone's own words instead of showing another person's numbers.
+
+    This is the fallback for a caller with no selection state; a run with two children in shot uses
+    _shown_track instead, because "best this frame" recomputed every frame is a column that moves.
     """
     if not results:
         return None
@@ -250,6 +255,68 @@ def _pick_person(results):
         return max(measuring, key=lambda r: r.quality if r.quality is not None else -1)
     any_face = [r for r in results if r.measurable]
     return any_face[0] if any_face else results[0]
+
+
+def _shown_track(people, state: dict):
+    """Whose numbers the column shows now, and which mode got it there.
+
+    Asking "who looks best this frame" every frame hands the column to whichever child moved
+    closer to the lens a second ago. On screen that swap is indistinguishable from a machine that
+    mixed the two children up - which is exactly what this is answering - so the shown person is
+    remembered: a key wins while that person is in frame, otherwise the column stays on whoever it
+    already shows, and only an empty selection or a person who left the frame picks somebody new.
+    """
+    if not people:
+        return None, ""
+    ids = [p.track_id for p in people]
+    focus = state.get("focus")
+    if focus in ids:
+        return focus, "chọn bằng phím"
+    shown = state.get("shown")
+    if shown in ids:
+        return shown, "đang theo dõi"
+    measurable = [p for p in people if p.measurable]
+    named = [p for p in measurable if p.student_id]
+    return (named or measurable or people)[0].track_id, "tự động"
+
+
+def _cycle_focus(people, current, step: int = 1):
+    """The track id a key press lands on, walking the menu in the order the menu shows it."""
+    if not people:
+        return None
+    ids = [p.track_id for p in people]
+    if current not in ids:
+        return ids[0]
+    return ids[(ids.index(current) + step) % len(ids)]
+
+
+def _whom_note(state: dict) -> str:
+    """The line naming whose numbers are on the screen, and how that person came to be chosen.
+
+    Numbers with no name over them cannot be read by a second person, and with two children in the
+    same frame the name plus "em 2/3" is the whole difference between a switch and a mix-up.
+    """
+    view = state.get("identity")
+    if view is None:
+        return "Không có ai trong khung hình"
+    people = state.get("people") or []
+    ids = [p.track_id for p in people]
+    who = view.student_name or "chưa gắn tên"
+    if view.student_id:
+        who = "%s (%s)" % (view.student_name, view.student_id)
+    mode = state.get("shown_mode") or "tự động"
+    if len(ids) > 1:
+        pos = ids.index(view.track_id) + 1 if view.track_id in ids else 1
+        return "Số liệu của em %d/%d · %s · %s (N hoặc 1..9 để đổi em)" % (pos, len(ids), who, mode)
+    return "Số liệu của %s · %s" % (who, mode)
+
+
+def _history_for(histories: dict, track_id: int) -> "deque":
+    """This person's own SEI curve, created empty on first use and never shared with another."""
+    hist = histories.get(track_id)
+    if hist is None:
+        hist = histories[track_id] = deque(maxlen=120)
+    return hist
 
 
 def _ema(prev: float, value: float) -> float:
@@ -263,6 +330,18 @@ def _camera_note(cap, source) -> str:
     return "cam %s %dx%d @%.0f fps" % (
         source, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
         float(cap.get(cv2.CAP_PROP_FPS) or 0.0))
+
+
+def _store_note(store) -> str:
+    """Where the numbers go, in the words the operator needs before they need the path.
+
+    The failure half matters more than the success half: a run whose database never opened measures
+    a whole lesson, shows every box and number on screen, and stores nothing. Saying "đang lưu"
+    while that happens would be the one lie this line could tell.
+    """
+    if not getattr(store, "enabled", False):
+        return "KHÔNG LƯU ĐƯỢC - database (%s)" % (getattr(store, "last_error", "") or "?")
+    return "đang lưu %s + %s/" % (os.path.basename(store.db_path), store.local_dir)
 
 
 def _screen_work_size() -> tuple:
@@ -321,6 +400,10 @@ def _handle_key(key: int, state: dict) -> bool:
     lines of the parameter column are simply unreachable on a short screen. One press moves most of
     a screen rather than 120 px: on this panel 120 px was about an eighth of the hidden part, so
     reaching the bottom took eight presses and read as "scrolling does not work".
+
+    N (or Tab), 1..9 and A belong to a different problem: with two children in one frame the
+    operator has to be able to say which one the numbers are about, and change that on purpose
+    rather than watch the choice change under them.
     """
     if key == 27:
         return True
@@ -330,6 +413,23 @@ def _handle_key(key: int, state: dict) -> bool:
         return False
     if key in (ord('y'), ord('Y')):
         state["yolo"] = not state.get("yolo", False)
+        return False
+    people = state.get("people") or []
+    if key in (ord('n'), ord('N'), 9):
+        state["focus"] = _cycle_focus(people, state.get("focus", state.get("shown")))
+        if state["focus"] is not None:
+            state["shown"] = state["focus"]
+        return False
+    if ord('1') <= key <= ord('9'):
+        idx = key - ord('1')
+        if idx < len(people):
+            state["focus"] = people[idx].track_id
+            state["shown"] = people[idx].track_id
+        return False
+    if key in (ord('a'), ord('A')):
+        # Back to the machine's choice - which is still the person already on screen, not whoever
+        # happens to look best this frame.
+        state["focus"] = None
         return False
     step = max(160, int(_screen_work_size()[1] * 0.55))
     if key in (ord('w'), ord('W')):
@@ -435,10 +535,17 @@ def render(frame, results, state: dict) -> "np.ndarray":
 
     from focusedge.hud import CHART_ROW, hud_lines
 
-    person = _pick_person(results)
+    person = state.get("person")
+    if person is None:
+        person = _pick_person(results)
     lines = list(hud_lines(person, len(results),
                            state.get("processing_ms", float("nan")),
-                           state.get("fps", float("nan"))))
+                           state.get("fps", float("nan")),
+                           identity=state.get("identity"),
+                           activity=state.get("activity")))
+    # Under the headline, not at the bottom: the question this line answers is "are these the
+    # numbers of the child I am looking at", and it has to be answered before the SEI is read.
+    lines.insert(1, Line(_whom_note(state), _TITLE_M, _C.PRIMARY, True))
     lines.append(Line(_run_state(state), _SMALL, _C.GRAY))
     history = list(state.get("sei_history", ()))
     view = state.get("boxes") if state.get("yolo") else None
@@ -558,7 +665,10 @@ _YOLO_PERSON = (0, 190, 80)
 _YOLO_FACE = (255, 205, 0)
 _YOLO_OBJECT = (255, 130, 40)
 _YOLO_PLATE = (12, 12, 14, 235)
-_OBJ_VI = {"phone": "điện thoại", "book": "sách", "laptop": "laptop", "backpack": "ba lô"}
+# The names layer 1 reports, spelled the way the operator reads them. Imported rather than retyped:
+# this table used to be a four-entry copy of detection's whitelist, so a box the detector named was
+# plates on screen and an object nobody could say the name of.
+_OBJ_VI = CONTEXT_VI
 
 
 def _plate(d, x: int, y: int, text: str, colour: tuple, size: int = 13, bold: bool = True,
@@ -683,7 +793,7 @@ def _run_state(state: dict) -> str:
     return ("%s · %d người đo được · %d khung người · %.1f lượt đo/giây · %s · %s%s · "
             "ESC để tắt" % (
                 state["class_label"], state["measurable"], state["tracks"], state["det_rate"],
-                "đang gửi Firestore" if state["synced"] else "chỉ lưu máy, thư mục out/",
+                state["store_note"],
                 state["camera_note"], tail))
 
 
@@ -720,21 +830,26 @@ def main(argv=None) -> int:
     last_results = []
     det_count, det_window_ms, det_rate = 0, 0.0, 0.0
 
-    # The values behind the phone's recognition-time line and its SEI sparkline. The curve is
-    # one sample per second and 120 deep (MainActivity.kt HISTORY_SIZE), and it belongs to one
-    # student, so it is emptied the moment a different face takes the column over - otherwise the
-    # picture would be two people averaged into one line.
+    # The values behind the phone's recognition-time line and its SEI sparkline. The curve is one
+    # sample per second and 120 deep (MainActivity.kt HISTORY_SIZE) and it belongs to ONE student,
+    # so there is a curve per track rather than one shared curve: with two children in frame the
+    # shared version was cleared the moment the column moved, which made the second child look like
+    # the first one with a blank history.
     processing_ms = float("nan")
     fps = float("nan")
-    sei_history = deque(maxlen=120)
-    shown_track = None
-    last_sample_ms = 0.0
+    histories: dict = {}
+    sample_ms: dict = {}
     last_step_ms = 0.0
     state = {"class_label": getattr(pipeline, "class_label", pipeline.class_id),
              "measurable": 0, "tracks": 0, "det_rate": 0.0,
-             "synced": bool(pipeline._writer.enabled),
+             "store_note": _store_note(pipeline._writer),
              "camera_note": _camera_note(cap, io_cfg.get("source", 0)),
-             "processing_ms": processing_ms, "fps": fps, "sei_history": sei_history,
+             "processing_ms": processing_ms, "fps": fps,
+             "sei_history": deque(maxlen=120), "histories": histories, "sample_ms": sample_ms,
+             # Who the column is showing right now. "shown" is the machine's sticky choice, "focus"
+             # is the operator's, and a key press only ever changes the second one.
+             "people": [], "shown": None, "focus": None, "shown_mode": "",
+             "identity": None, "person": None,
              "scroll": 0, "overlay": False,
              # Boxes on by default: the request was to see YOLO working on the main screen, not in a
              # separate debug window. Y turns them off, and that is the view that matches the phone.
@@ -749,7 +864,9 @@ def main(argv=None) -> int:
         # ASCII only, like the .bat launcher: the title bar is drawn by Windows through a narrow
         # code page, so any accented word arrives as mojibake. Everything inside the window goes
         # through Pillow and keeps its accents fine - it is only this OS-drawn string that cannot.
-        cv2.setWindowTitle("FocusChangeAI", "FocusChangeAI - Y boxes, O overlay, W/S scroll, ESC quit")
+        cv2.setWindowTitle("FocusChangeAI",
+                           "FocusChangeAI - Y boxes, O overlay, W/S scroll, N or 1-9 head, A auto, "
+                           "ESC quit")
 
     try:
         while True:
@@ -773,6 +890,7 @@ def main(argv=None) -> int:
             results = pipeline.step(frame)
             last_results = results
             state["boxes"] = pipeline.last_boxes
+            state["activity"] = pipeline.last_activity
             step_ms = time.monotonic() * 1000 - step_started
             if last_step_ms:
                 dt = step_started - last_step_ms
@@ -794,16 +912,34 @@ def main(argv=None) -> int:
                 started_wall = int(time.time() * 1000)
 
             if args.show:
-                person = _pick_person(results)
-                track = person.track_id if person is not None else None
-                if track != shown_track:
-                    shown_track = track
-                    sei_history.clear()
-                    last_sample_ms = 0.0
-                if (person is not None and person.calibrated and person.sei is not None
-                        and step_started - last_sample_ms >= 1000.0):
-                    last_sample_ms = step_started
-                    sei_history.append(person.sei)
+                people = pipeline.people()
+                shown, mode = _shown_track(people, state)
+                state["people"], state["shown"], state["shown_mode"] = people, shown, mode
+                state["identity"] = next((p for p in people if p.track_id == shown), None)
+                person = next((r for r in results if r.track_id == shown), None)
+                if person is None:
+                    # The scheduler measures a few faces per tick, so the chosen child is not
+                    # always in this frame's results. Their own last numbers, never somebody
+                    # else's fresh ones.
+                    person = pipeline.person_result(shown)
+                state["person"] = person
+
+                # Every measured person keeps their own curve, sampled once a second, whether or
+                # not the column is on them - so pressing N shows a real history at once instead of
+                # starting to collect one from now.
+                for r in results:
+                    if (r.calibrated and r.sei is not None
+                            and step_started - sample_ms.get(r.track_id, 0.0) >= 1000.0):
+                        sample_ms[r.track_id] = step_started
+                        _history_for(histories, r.track_id).append(r.sei)
+                alive = {p.track_id for p in people}
+                for dead in [t for t in histories if t not in alive]:
+                    # A retired track is a finished session; its curve stays in the database and
+                    # has no business holding memory for the rest of the school year.
+                    del histories[dead]
+                    sample_ms.pop(dead, None)
+                state["sei_history"] = (_history_for(histories, shown) if shown is not None
+                                         else deque(maxlen=120))
                 state["measurable"] = pipeline.measurable_tracks
                 state["tracks"] = pipeline.active_tracks
                 cv2.imshow("FocusChangeAI", render(frame, results, state))
@@ -815,15 +951,23 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\nstopping...")
     finally:
+        # Asked before shutdown(), because shutdown() closes the database and LocalStore.enabled is
+        # "_conn is not None" - read afterwards it is false for every run on earth, and a healthy run
+        # that stored six sessions would end by telling the operator "database NOT open".
+        db_was_open = pipeline._writer.enabled
         pipeline.shutdown()
         cap.release()
         if args.show:
             cv2.destroyAllWindows()
 
-    writer = pipeline._writer
-    print("frames=%d tracks_active=%d uploaded=%d failed=%d class=%s%s" % (
-        frame_count, pipeline.active_tracks, writer.sent, writer.failed,
-        pipeline.class_id, " (offline->local)" if not writer.enabled else ""))
+    store = pipeline._writer
+    print("frames=%d tracks_active=%d stored=%d failed=%d class=%s%s" % (
+        frame_count, pipeline.active_tracks, store.sent, store.failed,
+        pipeline.class_id, "" if db_was_open else " (database NOT open - nothing stored)"))
+    # The run used to end by pointing at a Firestore console; with nothing leaving the box the
+    # evidence has to appear here, or an operator cannot tell "nothing eligible" from "nothing
+    # written".
+    print(store.report())
     return 0
 
 

@@ -1,9 +1,9 @@
 """Per-student habit profile, ported from HabitModel.kt.
 
 Answers two questions the whole system is built around:
-  * "how did this session go"   -> SessionSummary (one Firestore `sessions` row)
+  * "how did this session go"   -> SessionSummary (one observation_sessions row + feature_records)
   * "what is normal for this student right now" -> HabitBaseline / ToleranceBand
-    (one Firestore `bands` document)
+    (one baseline_profiles row)
 
 Nothing here raises an alert; the band is a description, alerts keep their own
 thresholds. That separation is deliberate and copied from the app.

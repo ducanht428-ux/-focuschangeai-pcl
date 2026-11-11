@@ -31,6 +31,8 @@ mediapipe>=0.10.14
 # than failing at install. opencv's own putText cannot do the Vietnamese diacritics.
 Pillow>=10.0.0
 
-# --- Cloud sync (Layer 5) ---
-firebase-admin>=6.4.0
+# --- Configuration (and Layer 5's data file) ---
+# PyYAML reads config.yaml. Layer 5 itself needs no package at all: it is sqlite3, which ships with
+# Python. firebase-admin used to be listed here and is gone - nothing in edge-server talks to a
+# cloud service any more, so a machine with no internet stores exactly what it measures.
 PyYAML>=6.0

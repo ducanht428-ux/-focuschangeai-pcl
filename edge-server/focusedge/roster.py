@@ -61,22 +61,24 @@ class Roster:
         return e
 
     # --- matching --------------------------------------------------------
+    def rank(self, embedding: List[float], k: int = 2) -> List[Tuple[str, str, float]]:
+        """The ``k`` closest enrolled templates as (student_id, name, cosine), best first.
+
+        ``best_match`` says who is nearest; this says by how much. Inside one class of same-age
+        students the nearest template is often the desk next door, and the gap between the two
+        scores is the only evidence this machine has that a name is not a guess.
+        """
+        scored = [(e.student_id, e.name, cosine(embedding, e.template))
+                  for e in self._by_id.values() if e.template]
+        scored.sort(key=lambda r: -r[2])
+        return scored[:max(1, k)]
+
     def best_match(self, embedding: List[float]) -> Tuple[Optional[str], str, float]:
         """Return (student_id, name, cosine) of the closest enrolled template."""
-        best_id = None
-        best_name = ""
-        best_score = -1.0
-        for e in self._by_id.values():
-            if not e.template:
-                continue
-            s = cosine(embedding, e.template)
-            if s > best_score:
-                best_score = s
-                best_id = e.student_id
-                best_name = e.name
-        if best_id is None:
+        top = self.rank(embedding, 1)
+        if not top:
             return None, "", 0.0
-        return best_id, best_name, best_score
+        return top[0]
 
     # --- persistence -----------------------------------------------------
     @classmethod

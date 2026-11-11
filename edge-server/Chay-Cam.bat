@@ -55,6 +55,14 @@ echo.
 "%PY%" -u main.py --show
 
 echo.
-echo Finished. Every document this run would have sent to Firestore is in the "out" folder
-echo next to this file, so the run is never wasted even without the cloud.
+echo Finished.
+rem Said here rather than discovered later: with "identity off" every face is a guest, and a guest is
+rem refused by classroom.py - _retire and _write_heartbeats both require a student_id - so the ten
+rem tables stay empty however long the run was. The live view is written either way.
+echo If the log above says "identity off", this run stored NO sessions: every face was a
+echo guest, and only its live view was written (out\class_live_*.json).
+echo With identity on, the measurements land on this machine in:
+echo   ..\data\focuschange.db          (the measurements: sessions, features, bands, alerts)
+echo   out\class_live_*.json, out\presence_*.json   (the last few seconds, as they were)
+echo To see what is in the database:  %PY% ..\database\focuschange_db.py
 pause

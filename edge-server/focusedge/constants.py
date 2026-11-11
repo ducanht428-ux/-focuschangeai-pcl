@@ -13,7 +13,7 @@ from enum import IntEnum
 
 # ---------------------------------------------------------------------------
 # The 12 learned features (HabitFeature in HabitModel.kt). Index order is the
-# contract with the CSV header and the Firestore columns - never reorder.
+# contract with the CSV header and the stored feature names - never reorder.
 # ---------------------------------------------------------------------------
 class HabitFeature:
     BPM = 0
