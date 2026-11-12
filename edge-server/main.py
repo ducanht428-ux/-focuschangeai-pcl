@@ -393,6 +393,35 @@ def _scroll_view(canvas, state: dict):
     return out
 
 
+def _bind_manual(state: dict) -> None:
+    """m: say who the chosen head is, for the machines where the camera cannot be asked.
+
+    Without a working ArcFace backend every track stays a guest, and _retire refuses to store a
+    guest's session - so a run that looked perfectly measured on screen leaves the ten tables empty
+    and everything is gone once the live view is overwritten. Who is sitting in the chair is the one
+    fact somebody standing at the camera does know, and it is stored as identity_conf "manual" so a
+    declared name can never be read back as a face match.
+    """
+    pipeline = state.get("pipeline")
+    people = state.get("people") or []
+    if pipeline is None or not people:
+        # Said out loud rather than ignored: a key that does nothing looks like a broken key, and the
+        # real answer here is "pick a head first".
+        print("bind: nobody in frame - press N or 1-9 first")
+        return
+    ids = [p.track_id for p in people]
+    tid = state.get("focus")
+    if tid not in ids:
+        tid = ids[0]
+        state["focus"] = state["shown"] = tid
+    sid = pipeline.bind_manual_next(tid)
+    # Read back into the menu: the column repaints next frame, and whoever just pressed the key needs
+    # the answer now. ASCII only, like the class-context line - a Vietnamese name in roster.json would
+    # otherwise be able to stop a measuring run over a log line.
+    state["people"] = pipeline.people()
+    print("bind: track %d -> %s" % (tid, sid if sid else "released"))
+
+
 def _handle_key(key: int, state: dict) -> bool:
     """True when the window should close.
 
@@ -403,7 +432,8 @@ def _handle_key(key: int, state: dict) -> bool:
 
     N (or Tab), 1..9 and A belong to a different problem: with two children in one frame the
     operator has to be able to say which one the numbers are about, and change that on purpose
-    rather than watch the choice change under them.
+    rather than watch the choice change under them. M answers the question those keys cannot: which
+    student that chosen head actually is, when recognition is unavailable and refuses to guess.
     """
     if key == 27:
         return True
@@ -430,6 +460,9 @@ def _handle_key(key: int, state: dict) -> bool:
         # Back to the machine's choice - which is still the person already on screen, not whoever
         # happens to look best this frame.
         state["focus"] = None
+        return False
+    if key in (ord('m'), ord('M')):
+        _bind_manual(state)
         return False
     step = max(160, int(_screen_work_size()[1] * 0.55))
     if key in (ord('w'), ord('W')):
@@ -850,6 +883,9 @@ def main(argv=None) -> int:
              # is the operator's, and a key press only ever changes the second one.
              "people": [], "shown": None, "focus": None, "shown_mode": "",
              "identity": None, "person": None,
+             # The m key has to reach the pipeline: naming a head by hand is a decision about the
+             # measurement, not about the view, so it belongs there rather than in a screen variable.
+             "pipeline": pipeline,
              "scroll": 0, "overlay": False,
              # Boxes on by default: the request was to see YOLO working on the main screen, not in a
              # separate debug window. Y turns them off, and that is the view that matches the phone.
@@ -866,7 +902,7 @@ def main(argv=None) -> int:
         # through Pillow and keeps its accents fine - it is only this OS-drawn string that cannot.
         cv2.setWindowTitle("FocusChangeAI",
                            "FocusChangeAI - Y boxes, O overlay, W/S scroll, N or 1-9 head, A auto, "
-                           "ESC quit")
+                           "M name, ESC quit")
 
     try:
         while True:

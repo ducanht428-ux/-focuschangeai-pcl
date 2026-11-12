@@ -189,7 +189,8 @@ class LocalStore:
                       band_outcomes, ended_at_wall_ms: int, device: str,
                       ineligible_reason: Optional[str], alerts_total: int,
                       csv_rows: int, avg_fps: float, false_alerts: int = 0,
-                      alerts: Sequence[Dict] = ()) -> None:
+                      alerts: Sequence[Dict] = (),
+                      identity: Optional[str] = None) -> None:
         """One measured session: its row, its per-feature statistics, its alerts.
 
         ``s.id`` IS the wall clock of the session start (``start_session(wall_ms)`` in
@@ -205,7 +206,7 @@ class LocalStore:
                 self._replace_session(student_id, s.id)
                 row = self._insert_session(
                     student_id, s, ended_at_wall_ms, device, ineligible_reason, alerts_total,
-                    false_alerts, csv_rows, avg_fps, band_outcomes)
+                    false_alerts, csv_rows, avg_fps, band_outcomes, identity)
                 self._insert_features(row, s)
                 self._insert_alerts(row, student_id, alerts)
                 self._conn.commit()
@@ -277,7 +278,7 @@ class LocalStore:
     def _insert_session(self, student_id: str, s: SessionSummary, ended_at_wall_ms: int,
                         device: str, ineligible_reason: Optional[str], alerts_total: int,
                         false_alerts: int, csv_rows: int, avg_fps: float,
-                        band_outcomes) -> int:
+                        band_outcomes, identity: Optional[str] = None) -> int:
         meta: Dict = {
             "face_ratio": _round4(s.face_ratio),
             "valid_ratio": _round4(s.valid_ratio),
@@ -289,6 +290,10 @@ class LocalStore:
             # without knowing that a missing reason means eligible.
             "eligible": ineligible_reason is None,
         }
+        # "manual" means a human said this head belongs to that id, with no face compared to prove it.
+        # Without this the declared rows and the recognised rows sit in one table indistinguishable.
+        if identity:
+            meta["identity"] = identity
         if ineligible_reason is not None:
             meta["ineligible_reason"] = ineligible_reason
         if s.quality_count > 0:

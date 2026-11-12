@@ -104,6 +104,9 @@ class TrackRuntime:
     student_id: Optional[str] = None
     student_name: str = ""
     identity_conf: str = "unbound"
+    # The operator's own answer to "who is this", set with the m key. Kept beside, not instead of,
+    # the recognition state: releasing the manual binding has to leave the ArcFace verdict intact.
+    manual_student_id: Optional[str] = None
     last_seen_ms: int = 0
     last_measured_ms: int = 0
     eye_span_px: float = 0.0               # 0 -> bootstrap candidate until first measured
@@ -132,11 +135,15 @@ class ClassroomPipeline:
     CLIP_MAX_FRACTION = 0.25
 
     def __init__(self, cfg: dict, detector, embedder, roster, analyzer, scheduler,
-                 writer, profiles: Optional[Dict[str, HabitProfile]] = None) -> None:
+                 writer, profiles: Optional[Dict[str, HabitProfile]] = None,
+                 roster_path: Optional[str] = None) -> None:
         self._cfg = cfg
         self._detector = detector
         self._embedder = embedder          # may be None (identity disabled)
         self._roster = roster
+        # Where the roster was loaded from, so a name typed at the keyboard by the operator can be
+        # written back. Tests hand in a Roster object and no path, and then it stays unsaved.
+        self._roster_path = roster_path if isinstance(roster_path, str) else None
         self._analyzer = analyzer
         self._scheduler = scheduler
         self._writer = writer
@@ -259,7 +266,8 @@ class ClassroomPipeline:
             school_year=storage_cfg.get("school_year", ""),
         )
         # stash the resolver so step() can reach it without another import
-        obj = cls(cfg, detector, embedder, roster, analyzer, scheduler, writer)
+        obj = cls(cfg, detector, embedder, roster, analyzer, scheduler, writer,
+                  roster_path=roster_path if isinstance(roster_path, str) else None)
         if embedder is not None:
             obj._resolver = IdentityResolver(
                 embedder, roster,
@@ -451,6 +459,18 @@ class ClassroomPipeline:
 
     # ------------------------------------------------------------------
     def _sync_binding(self, rt: TrackRuntime) -> None:
+        if rt.manual_student_id is not None:
+            # The operator said who this is, and that outranks a machine which cannot say. Stored as
+            # identity_conf "manual" (see _retire, which carries it into the row's notes) so a table
+            # of measurements can always tell a declared name from a recognised one.
+            sid = rt.manual_student_id
+            rt.student_id = sid
+            rt.student_name = self._roster.name_of(sid)
+            rt.identity_conf = "manual"
+            rt.pipeline.profile = self._profile_for(sid)
+            if rt.pipeline._baseline is None:
+                rt.pipeline._baseline = rt.pipeline.profile.baseline()
+            return
         st = rt.identity
         sid = getattr(st, "bound_student_id", None)
         conf = getattr(st, "confidence", "unbound")
@@ -467,6 +487,67 @@ class ClassroomPipeline:
             rt.student_id = None
             rt.student_name = "guest-%d" % rt.track_id
             rt.identity_conf = conf or "guest"
+
+    # ------------------------------------------------------------------
+    # naming a head by hand, for the runs where recognition cannot answer at all
+    # ------------------------------------------------------------------
+    def bind_manual_next(self, track_id: int) -> Optional[str]:
+        """The m key: give the chosen head a name the operator is stating, not a match.
+
+        Recognition is not always available. On the laptop used for this project the ArcFace backend
+        crashes the process the moment it is imported, so nothing is ever bound, and a run of any
+        length leaves the ten tables empty because a session row is keyed by student_id. The one
+        thing somebody standing at the camera does know is who is sitting in front of it.
+
+        The first press takes the first roster slot no other head has claimed; later presses walk
+        the rest, and the step past the last one releases the track back to the machine's verdict.
+        """
+        rt = self._tracks.get(track_id)
+        if rt is None:
+            return None
+        ids = [e.student_id for e in self._roster.entries()]
+        if not ids:
+            ids = [self._add_manual_slot(1)]
+        current = rt.manual_student_id
+        if current is None:
+            taken = set(t.manual_student_id for tid, t in self._tracks.items() if tid != track_id)
+            free = [s for s in ids if s not in taken]
+            nxt = free[0] if free else self._add_manual_slot(len(ids) + 1)
+        elif current in ids:
+            i = ids.index(current)
+            nxt = ids[i + 1] if i + 1 < len(ids) else None
+        else:
+            nxt = None
+        rt.manual_student_id = nxt
+        self._sync_binding(rt)
+        return rt.student_id
+
+    def name_of(self, student_id: str) -> str:
+        return self._roster.name_of(student_id)
+
+    def _add_manual_slot(self, index: int) -> str:
+        """hs1, hs2 ...: the numbering the phone and the web leg both start their roster with.
+
+        A cv2 window has no text field, so a name has to be derivable from the slot alone. Real names
+        go into roster.json by hand afterwards - the id never changes, so the sessions already stored
+        under hs1 stay that child's sessions when the readable name appears.
+        """
+        sid = "hs%d" % index
+        while self._roster.get(sid) is not None:
+            index += 1
+            sid = "hs%d" % index
+        self._roster.add(sid, "Học sinh %d" % index)
+        self._save_roster()
+        return sid
+
+    def _save_roster(self) -> None:
+        if not self._roster_path:
+            return
+        try:
+            self._roster.save(self._roster_path)
+        except Exception as e:  # the roster is a convenience; a measurement never is
+            print("roster NOT saved (%s: %s) - this run keeps the name, a restart loses it"
+                  % (type(e).__name__, e))
 
     def _is_hot(self, rt: TrackRuntime) -> bool:
         r = rt.last_result
@@ -518,6 +599,10 @@ class ClassroomPipeline:
             csv_rows=summary.count[HabitFeature.SEI],
             avg_fps=avg_fps,
             alerts=list(rt.alerts),
+            # high/medium (earned from a face) or manual (declared on the keyboard) or unbound. In
+            # the row's notes because the two are not the same kind of measurement and a table has to
+            # be able to say which names were recognised and which somebody stated.
+            identity=rt.identity_conf,
         )
         if self._habit_learn:
             self._writer.write_band(rt.student_id, rt.student_name, profile, wall_ms, str(self._device))

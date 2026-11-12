@@ -14,13 +14,18 @@ class_label: "Lớp học"
 # landmark means the same 478-point thing on both devices. No download needed - it is in git.
 face_landmarker_task: "../app/src/main/assets/face_landmarker.task"
 # ArcFace templates written by tools/enroll_roster.py. A missing or empty roster is not an error,
-# it just means nobody binds: every track stays a guest and no session row is ever written.
+# it just means nobody is bound automatically: every track stays a guest and no session row is
+# written for it until somebody names it (see the M key below, or enroll templates for ArcFace).
 roster: "roster.json"
 # Model weights are NOT in git; ultralytics downloads them on first use (yolo11n.pt = 5.6 MB,
 # yolo11m.pt = 40 MB, both measured here), and the insightface buffalo_l pack is about 280 MB.
 # The first run on a new machine therefore needs internet. insightface is deliberately absent on the
-# laptop used for this project: its onnxruntime backend crashes that process outright, and identity is
-# optional (see classroom.py "identity off").
+# laptop used for this project: its onnxruntime backend crashes that process outright (measured again
+# here: import onnxruntime -> SIGSEGV, exit 139, three runs out of three, onnxruntime 1.31.1), and
+# identity is optional (see classroom.py "identity off").
+# A guest can still be named without any of that: in the preview, 1-9 picks a head and M declares
+# which student it is. That is enough for _retire to store the session, and the row carries
+# identity "manual" in its notes, so a table of declared names never reads as a table of matches.
 
 # --- Input: where frames come from ---
 input:

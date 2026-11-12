@@ -51,17 +51,21 @@ exit /b 1
 echo Starting the camera...
 echo The first 5-10 seconds look frozen while the model loads. That is normal, wait.
 echo Watch the top-left corner of the picture window for a line like "SEI 81".
+echo If the line "identity off" appears, press 1-9 for a head and then M to name it: a session is
+echo only stored for a face that carries a student id, and M is the way to give one without ArcFace.
 echo.
 "%PY%" -u main.py --show
 
 echo.
 echo Finished.
-rem Said here rather than discovered later: with "identity off" every face is a guest, and a guest is
-rem refused by classroom.py - _retire and _write_heartbeats both require a student_id - so the ten
-rem tables stay empty however long the run was. The live view is written either way.
-echo If the log above says "identity off", this run stored NO sessions: every face was a
-echo guest, and only its live view was written (out\class_live_*.json).
-echo With identity on, the measurements land on this machine in:
+rem Said here rather than discovered later: a session row is keyed by student id, and classroom.py
+rem refuses to store one for a guest - _retire and _write_heartbeats both require a student_id. So a
+rem run that never named anybody leaves the ten tables empty, however long it measured. M is the fix;
+rem a named head is stored with identity "manual" in its notes so a declared name is never mistaken
+rem for a face match. The live view is written in every case.
+echo If the log above says "identity off" and no head was named with M, this run stored NO sessions:
+echo every face stayed a guest and only its live view was written (out\class_live_*.json).
+echo Sessions that were stored - recognised or named with M - land on this machine in:
 echo   ..\data\focuschange.db          (the measurements: sessions, features, bands, alerts)
 echo   out\class_live_*.json, out\presence_*.json   (the last few seconds, as they were)
 echo To see what is in the database:  %PY% ..\database\focuschange_db.py

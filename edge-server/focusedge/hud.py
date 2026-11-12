@@ -503,7 +503,13 @@ def _identity_evidence(v) -> str:
     "chưa đủ chắc" about a face that scored above the bar and vice versa. The gap to the
     next-closest classmate is the part that matters in a classroom: two scores that differ by
     nothing is the machine guessing, and a negative gap says so out loud.
+
+    A name declared with the m key has no number behind it at all, and it says so first: without
+    that line a table full of typed-in names reads exactly like a table full of recognised ones.
     """
+    if v.identity_conf == "manual":
+        return ("Nhận diện: tự khai - người vận hành gán tên bằng phím, không có khuôn mặt nào "
+                "được so với danh sách lớp")
     if not v.samples:
         return "Nhận diện: chưa có mẫu mặt nào để so với danh sách lớp"
     if not v.score:
