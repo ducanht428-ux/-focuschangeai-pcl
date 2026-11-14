@@ -140,3 +140,12 @@ storage:
 # has no equivalent, so frame-level rows only exist in the live overlay.
 local_output:
   dir: "out"
+
+# --- The preview window ---
+# One column of the phone's full HUD per person in frame (the 2026-11-14 request): every child gets
+# their own SEI, alerts, habit and calibration lines, with their own sparkline. The cap is what a
+# 1366 px screen holds at readable type; beyond it the extra people are named on a plate under the
+# camera and reached with 1-9. Set 1 to force the legacy single-column view even with several
+# people in shot.
+display:
+  max_panels: 3

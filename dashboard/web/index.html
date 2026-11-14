@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="vi" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FocusChange AI - Giám sát và phân tích hành vi học sinh</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+  <!-- Thanh bên trái: điều hướng 8 mục theo đặc tả 5.1 -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-logo" id="brand-logo"></div>
+      <div class="brand-text">
+        <strong>FocusChange AI</strong>
+        <span>AI cho lớp học thông minh</span>
+      </div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="sidebar-foot">
+      <div class="foot-chip" id="foot-chip"></div>
+      <span>FocusChange AI v1.0</span>
+    </div>
+  </aside>
+
+  <div id="main">
+    <!-- Thanh trên cùng: lớp / offline / SQLite / mạng lớp (đặc tả 5.2) -->
+    <header id="topbar">
+      <div class="top-left">
+        <span class="top-icon" id="top-class-icon"></span>
+        <label class="class-picker">
+          <select id="class-select" title="Chọn lớp"></select>
+        </label>
+      </div>
+      <div class="top-right">
+        <span class="chip-mode"><i class="dot dot-green"></i> Chế độ: <b>Offline (Xử lý tại máy)</b></span>
+        <span class="top-sep"></span>
+        <span class="chip-db" id="chip-db"></span>
+        <span class="top-sep"></span>
+        <span class="chip-lan" id="chip-lan" title="Mạng nội bộ lớp - giai đoạn 3"></span>
+      </div>
+    </header>
+
+    <div id="demo-banner" hidden></div>
+    <main id="view"></main>
+  </div>
+</div>
+
+<div id="modal-root" hidden></div>
+<div id="toast-root"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -27,6 +27,8 @@ from focusedge.classroom import ClassroomPipeline  # noqa: E402
 from focusedge.detection import CONTEXT_VI  # noqa: E402
 from focusedge.hud import (  # noqa: E402
     DOT_COLOURS, EYE_DRAW, IRIS_FIRST, Line, _C, _SMALL, _TITLE_M, landmark_to_frame_px)
+from focusedge.panels import (  # noqa: E402
+    FONT_FACTORS, clamp_scroll, fit_factor, panel_layout, panel_people)
 
 _FONTS: dict = {}
 
@@ -466,12 +468,32 @@ def _handle_key(key: int, state: dict) -> bool:
         return False
     step = max(160, int(_screen_work_size()[1] * 0.55))
     if key in (ord('w'), ord('W')):
-        state["scroll"] = max(0, int(state.get("scroll", 0)) - step)
+        _scroll_by(state, -step)
     elif key in (ord('s'), ord('S')):
-        state["scroll"] = int(state.get("scroll", 0)) + step
+        _scroll_by(state, step)
     elif key in (ord('t'), ord('T')):
-        state["scroll"] = 0
+        _scroll_by(state, None)
     return False
+
+
+def _scroll_by(state: dict, delta) -> None:
+    """W/S/T move the reading window of whichever column the operator is on.
+
+    With one person in frame that is the whole canvas, exactly as before. With a column per person
+    each column keeps its own offset: scrolling the focused child must not move the neighbour's
+    text, or the columns stop being independent instruments. None means "back to the top".
+    """
+    if len(state.get("people") or []) >= 2:
+        scrolls = state.setdefault("panel_scroll", {})
+        tid = state.get("shown")
+        if delta is None:
+            scrolls[tid] = 0
+        else:
+            scrolls[tid] = max(0, int(scrolls.get(tid, 0)) + delta)
+    elif delta is None:
+        state["scroll"] = 0
+    else:
+        state["scroll"] = max(0, int(state.get("scroll", 0)) + delta)
 
 
 def _scaled(ln: Line, factor: float) -> Line:
@@ -548,6 +570,109 @@ def _render_overlay(frame, person, lines, state: dict, view=None):
     return np.ascontiguousarray(np.array(canvas)[:, :, ::-1])
 
 
+def _render_panels(frame, results, state: dict, people, person) -> "np.ndarray":
+    """One full phone column per person in frame - the 2026-11-14 request, drawn.
+
+    Every column IS the single-person column: same hud_lines, same order, same colours, its own SEI
+    sparkline from its own history. Nothing is summarised away to make room; when a column's wrapped
+    text is taller than the screen it scrolls inside its own rectangle (W/S on the focused column)
+    and says how many lines are below, because a quietly dropped line is how a judge reads a missing
+    number as a zero. The focused column carries a purple border so "whose numbers am I scrolling"
+    is never a guess, and the machine's own run line sits once in the footer instead of once per
+    child - it describes the box, not the student.
+    """
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    from focusedge.hud import CHART_ROW, hud_lines
+
+    taken, extra = panel_people(people, state.get("focus") or state.get("shown"),
+                                state.get("max_panels", 3))
+    fh, fw = frame.shape[:2]
+    work_w, work_h = _screen_work_size()
+    geo = panel_layout(work_w, work_h, len(taken), fw, fh)
+    margin = geo["margin"]
+    canvas = Image.new("RGB", (geo["win_w"], work_h), _C.SURFACE)
+    d = ImageDraw.Draw(canvas, "RGBA")
+    cam_x, cam_y, cam_w, cam_h = geo["cam"]
+    _blit_camera(canvas, frame, cam_y, cam_x, cam_w, cam_h,
+                 person.landmarks if person is not None and person.measurable else None,
+                 person.face_bbox if person is not None else None,
+                 state.get("boxes") if state.get("yolo") else None)
+    if extra:
+        _plate(d, cam_x, cam_y + cam_h + 6,
+               "+%d người nữa trong khung · phím 1-9 để chọn" % extra,
+               (235, 235, 235), size=12, bold=False, max_x=cam_x + cam_w)
+
+    by_id = {r.track_id: r for r in results}
+    pipeline = state.get("pipeline")
+    scrolls = state.setdefault("panel_scroll", {})
+    factors = state.setdefault("panel_factor", {})
+    now = time.monotonic()
+    shown = state.get("shown")
+    for i, view in enumerate(taken):
+        tid = view.track_id
+        x, y, w, h = geo["panels"][i]
+        r = by_id.get(tid)
+        if r is None and pipeline is not None:
+            # Their own last numbers, never a neighbour's fresh ones - the single-column rule.
+            r = pipeline.person_result(tid)
+        lines = list(hud_lines(r, 1 if (r is not None and r.measurable) else 0,
+                               state.get("processing_ms", float("nan")),
+                               state.get("fps", float("nan")),
+                               identity=view, activity=state.get("activity")))
+        who = view.student_name or "chưa gắn tên"
+        if view.student_id:
+            who = "%s (%s)" % (view.student_name, view.student_id)
+        head = "Em %d/%d · %s" % (i + 1, len(people), who)
+        if tid == shown:
+            head += " · %s" % (state.get("shown_mode") or "tự động")
+        lines.insert(1, Line(head, _TITLE_M, _C.PRIMARY, True))
+        history = list((state.get("histories") or {}).get(tid, ()))
+        chart_h = 52 if len(history) >= 2 else 0
+        text_w = w - 16
+
+        # The type ladder is measured, not guessed, but re-measuring five wraps per column per frame
+        # is arithmetic a 2-core box does not need at 30 fps: the answer is cached per column width
+        # and refreshed every 1.5 s, slower than any child moves between chairs.
+        key = (tid, w)
+        cached = factors.get(key)
+        if cached is None or now - cached[0] > 1.5:
+            heights = [sum(row[0] for row in _layout([_scaled(ln, f) for ln in lines],
+                                                    text_w, chart_h))
+                       for f in FONT_FACTORS]
+            factor = fit_factor(heights, h)
+            factors[key] = (now, factor)
+        else:
+            factor = cached[1]
+        rows = _layout([_scaled(ln, factor) for ln in lines], text_w, chart_h)
+        content_h = sum(row[0] for row in rows)
+        offset = clamp_scroll(scrolls.get(tid, 0), content_h, h)
+        scrolls[tid] = offset
+
+        border = _C.PRIMARY + (255,) if tid == shown else (214, 208, 220, 255)
+        d.rectangle([x - 3, y - 3, x + w + 3, y + h + 3], outline=border, width=2)
+        py, hidden = y - offset, 0
+        for lead, indent, sym, sym_font, piece, font, colour in rows:
+            if py >= y + h:
+                hidden += 1
+            elif py >= y and py + lead <= y + h:
+                if piece == CHART_ROW:
+                    if chart_h:
+                        _draw_sei_chart(d, x + 8, py, text_w, chart_h - 8, history)
+                else:
+                    if sym:
+                        d.text((x + 8, py), sym, font=sym_font, fill=colour + (255,))
+                    if piece:
+                        d.text((x + 8 + indent, py), piece, font=font, fill=colour + (255,))
+            py += lead
+        if content_h > h:
+            hint = ("còn %d dòng dưới · S" % hidden) if hidden else "W: về đầu cột"
+            _plate(d, x + 4, y + h - 22, hint, (255, 205, 0), size=12, max_x=x + w)
+    d.text((margin, geo["footer_y"]), _run_state(state), font=_font(12), fill=_C.GRAY + (255,))
+    return np.ascontiguousarray(np.array(canvas)[:, :, ::-1])
+
+
 def render(frame, results, state: dict) -> "np.ndarray":
     """The phone's content, arranged for a wide screen: camera on the left, column on the right.
 
@@ -571,6 +696,10 @@ def render(frame, results, state: dict) -> "np.ndarray":
     person = state.get("person")
     if person is None:
         person = _pick_person(results)
+    people = state.get("people") or []
+    if (not state.get("overlay") and len(people) >= 2
+            and int(state.get("max_panels", 3)) >= 2):
+        return _render_panels(frame, results, state, people, person)
     lines = list(hud_lines(person, len(results),
                            state.get("processing_ms", float("nan")),
                            state.get("fps", float("nan")),
@@ -887,6 +1016,9 @@ def main(argv=None) -> int:
              # measurement, not about the view, so it belongs there rather than in a screen variable.
              "pipeline": pipeline,
              "scroll": 0, "overlay": False,
+             # One reading window and one cached type factor per column, keyed by track id.
+             "panel_scroll": {}, "panel_factor": {},
+             "max_panels": int((cfg.get("display") or {}).get("max_panels", 3)),
              # Boxes on by default: the request was to see YOLO working on the main screen, not in a
              # separate debug window. Y turns them off, and that is the view that matches the phone.
              "yolo": True, "boxes": None}
@@ -901,8 +1033,8 @@ def main(argv=None) -> int:
         # code page, so any accented word arrives as mojibake. Everything inside the window goes
         # through Pillow and keeps its accents fine - it is only this OS-drawn string that cannot.
         cv2.setWindowTitle("FocusChangeAI",
-                           "FocusChangeAI - Y boxes, O overlay, W/S scroll, N or 1-9 head, A auto, "
-                           "M name, ESC quit")
+                           "FocusChangeAI - one column per person, Y boxes, O overlay, W/S scroll, "
+                           "N or 1-9 head, A auto, M name, ESC quit")
 
     try:
         while True:
@@ -974,6 +1106,9 @@ def main(argv=None) -> int:
                     # has no business holding memory for the rest of the school year.
                     del histories[dead]
                     sample_ms.pop(dead, None)
+                    state["panel_scroll"].pop(dead, None)
+                    for k in [k for k in state["panel_factor"] if k[0] == dead]:
+                        del state["panel_factor"][k]
                 state["sei_history"] = (_history_for(histories, shown) if shown is not None
                                          else deque(maxlen=120))
                 state["measurable"] = pipeline.measurable_tracks
