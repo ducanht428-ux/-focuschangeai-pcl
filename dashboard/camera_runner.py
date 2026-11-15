@@ -38,6 +38,7 @@ class CameraRunner:
     def __init__(self, on_minute: Optional[Callable[[int, Dict], None]] = None):
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._pipeline = None   # ClassroomPipeline đang chạy, để API gắn tên gọi bind_manual_name
         self._stop = threading.Event()
         self._jpeg: Optional[bytes] = None
         self._info: Dict = {"people": [], "fps": 0.0, "processing_ms": 0.0,
@@ -100,6 +101,30 @@ class CameraRunner:
                           "activity": "", "started_ms": 0, "frames": 0}
         return {"ok": True}
 
+    # ------------------------------------------------------------------ gắn tên (nút "Gắn tên" trên thẻ người)
+    def bind(self, track_id: int, name: str = "") -> Dict:
+        """Khai báo tên cho một track đang trong khung hình - cùng thẩm quyền phím M của main.py.
+
+        Gọi từ luồng HTTP trong khi luồng camera đang step(): các phép gán bên trong
+        bind_manual_name là nguyên tử dưới GIL, tệ nhất một khung hình đọc nhầm trạng thái
+        rồi khung sau tự sửa - giống cách main.py gọi bind giữa hai lần step.
+        """
+        pipeline = self._pipeline
+        if pipeline is None or not self.running():
+            return {"ok": False, "error": "camera chưa chạy - bật camera trước khi gắn tên"}
+        sid = pipeline.bind_manual_name(track_id, name)
+        if sid is None:
+            return {"ok": False, "error": "không thấy track %d trong khung hình" % track_id}
+        return {"ok": True, "student_id": sid, "name": pipeline.name_of(sid)}
+
+    def unbind(self, track_id: int) -> Dict:
+        pipeline = self._pipeline
+        if pipeline is None or not self.running():
+            return {"ok": False, "error": "camera chưa chạy"}
+        if not pipeline.unbind_manual(track_id):
+            return {"ok": False, "error": "không thấy track %d trong khung hình" % track_id}
+        return {"ok": True}
+
     # ------------------------------------------------------------------ luồng nền
     def _run(self, cfg: Dict) -> None:
         import cv2
@@ -110,6 +135,7 @@ class CameraRunner:
         cap = None
         try:
             pipeline = ClassroomPipeline.from_config(cfg)
+            self._pipeline = pipeline
             source = (cfg.get("input") or {}).get("source", 0)
             cap = cv2.VideoCapture(source if isinstance(source, int) else str(source))
             if not cap.isOpened():
@@ -172,6 +198,7 @@ class CameraRunner:
         except Exception as e:  # ranh giới với camera và lõi đo: lỗi phải hiện lên màn hình
             self.error = "%s: %s" % (type(e).__name__, e)
         finally:
+            self._pipeline = None
             if pipeline is not None:
                 try:
                     pipeline.shutdown()   # chốt mọi phiên đang mở vào SQLite, đúng luật lõi
@@ -206,6 +233,10 @@ class CameraRunner:
                 cv2.putText(view, "SEI %d" % rt_result.sei, (x0, min(view.shape[0] - 6, y1 + 16)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 2)
         for tid, region in boxes.face_regions:
+            if region is None:
+                # _face_region trả None khi cửa sổ mặt bị mép khung hình ăn quá nhiều;
+                # không bỏ qua thì unpack None đánh chết luồng camera chỉ vì một người ngồi lệch.
+                continue
             x0, y0, x1, y1 = [int(v) for v in region]
             cv2.rectangle(view, (x0, y0), (x1, y1), (0, 220, 220), 1)
         return view

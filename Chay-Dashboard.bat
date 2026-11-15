@@ -54,6 +54,7 @@ echo     lists exactly what is missing if they are not installed yet.
 echo.
 "%PY%" -u dashboard/server.py
 
-echo.
-echo Dashboard stopped.
-pause
+rem Thanh cong (ke ca truong hop "dashboard dang chay san, chi mo trinh duyet") thi cua so
+rem den tu dong dong, nguoi dung khong phai bam phim thua. Chi giu man hinh lai khi co loi
+rem (errorlevel 1) de doc thong bao loi Python / thieu PyYAML.
+if errorlevel 1 pause

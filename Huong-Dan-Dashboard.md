@@ -55,7 +55,41 @@ không đụng dữ liệu thật.
 - `python tests/test_local_store.py` — kiểm thử tầng lưu trữ lõi.
 Cả hai dùng database tạm, không đụng dữ liệu thật.
 
-## 7. Chưa làm ở đợt này (theo lộ trình đặc tả mục 12)
+## 7. Bản web công khai — bấm link là thấy giao diện
+
+Link: **https://focuschange-dashboard-hkvmgndp8ax.qoder.website** (công khai, không cần đăng nhập).
+Bấm link là thấy ngay giao diện 8 màn ở mọi máy, mọi trình duyệt.
+
+- **DEMO**: máy mở link chưa chạy server cục bộ → giao diện hiện đầy đủ với **lớp học mô phỏng
+  đang chạy ngay khi mở link**: camera demo vẽ 4 em trong khung, số liệu nhảy mỗi giây,
+  cảnh báo nổ theo trạng thái (nhắm mắt / ngáp / quay đầu), biểu đồ cập nhật theo phút.
+  Mọi nơi gắn nhãn DEMO/MÔ PHỎNG, không phải số đo thật. Bấm **Dừng** / **Bắt đầu** để
+  tắt/bật mô phỏng; các màn Học sinh, Cảnh báo, Báo cáo, Sao lưu, Cài đặt đều thao tác được.
+- **LIVE**: máy mở link đang chạy `Chay-Dashboard.bat` → bản web đọc thẳng số liệu máy đó
+  (chip "Bản web · LIVE máy này"), camera đo thật bằng webcam. Chrome có thể hỏi một lần
+  quyền "truy cập mạng cục bộ" — bấm **Cho phép/Allow**; hoặc bấm nút **Kết nối LIVE** trên
+  băng DEMO để dò lại, nút **Mở bản cục bộ** mở thẳng app đầy đủ trên máy này.
+- **Bấm Bắt đầu là thấy mặt mình**: nếu bản web lỡ mở ở DEMO trong khi máy này đang chạy
+  dashboard, bấm **Bắt đầu** sẽ tự chuyển sang LIVE và bật camera thật ngay (một lần bấm).
+  Nếu trình duyệt chặn luồng video MJPEG, giao diện tự đổi sang kéo từng ảnh qua
+  `/api/camera/snapshot` — mặt vẫn hiện, chỉ chậm hơn một chút. Muốn chủ động xem mô phỏng
+  thì mở link kèm `?mode=demo`.
+- **Gắn tên thì mới lưu phiên**: máy này không chạy nhận diện khuôn mặt (ArcFace lỗi trên
+  laptop), nên mọi khuôn mặt mới vào đều là `guest-N`: đo trực tiếp thì có số (SEI, góc đầu,
+  khoảng cách) nhưng lõi KHÔNG ghi phiên của guest vào SQLite, và EAR/MAR/PERCLOS chỉ hiện
+  khi phiên đã mở. Trên thẻ mỗi người ở màn Camera có nút **Gắn tên** (đổi tên / bỏ tên sau
+  khi gắn): gõ tên vào là track thành học sinh `hs1…` với `identity_conf = manual` — đúng
+  thẩm quyền phím M của cửa sổ lõi, tên ghi vào `roster.json`. Đo tiếp rồi bấm **Dừng**
+  (hoặc rời khỏi khung hình) là phiên được chốt vào `data/focuschange.db`, xem lại ở các màn
+  Tổng quan / Học sinh / Phân tích / Báo cáo. Guest chưa gắn tên luôn kèm dòng chữ
+  "Chưa gắn tên nên không lưu phiên" để không ai tưởng nhầm là đã lưu.
+- Link cũ `focuschangeai-pc-….qoder.website` là bản webcam cũ, KHÔNG phải giao diện này.
+- Riêng tư: bản web không gửi dữ liệu lớp lên đám mây; LIVE chỉ đọc máy của chính người mở,
+  DEMO chỉ là số mẫu. Muốn riêng tư lại: đổi chế độ truy cập trong bảng điều khiển site Qoder.
+- Mã nguồn bản web: thư mục `site/` (sinh từ `dashboard/web/` bằng `python tools/build_site.py`;
+  dựng số mẫu bằng `python tools/make_site_fixture.py` khi server cục bộ đang chạy và đã nạp demo).
+
+## 8. Chưa làm ở đợt này (theo lộ trình đặc tả mục 12)
 
 - Đăng nhập / vai trò / khoá tạm / 2 bước (giai đoạn 1–2, mục 9).
 - Ghép nối điện thoại làm camera / màn xem qua wifi lớp, PIN/QR + TLS (giai đoạn 3).

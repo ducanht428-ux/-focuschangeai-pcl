@@ -117,7 +117,15 @@ def seed(conn, cfg) -> dict:
 def purge(conn) -> dict:
     ids = [r[0] for r in conn.execute("SELECT student_id FROM students WHERE student_id LIKE ?",
                                       (DEMO_PREFIX + "%",))]
+    n_alerts = 0
     for sid in ids:
+        # Cảnh báo và feature_records khoá theo session_row / student_id: không xoá cùng
+        # phiên thì nút "Xóa dữ liệu mẫu" xong vẫn còn "40 chưa xem" treo trên màn Cảnh báo.
+        rows = [r[0] for r in conn.execute(
+            "SELECT rowid FROM observation_sessions WHERE student_id = ?", (sid,))]
+        for row in rows:
+            conn.execute("DELETE FROM feature_records WHERE session_row = ?", (row,))
+        n_alerts += conn.execute("DELETE FROM alerts WHERE student_id = ?", (sid,)).rowcount
         conn.execute("DELETE FROM observation_sessions WHERE student_id = ?", (sid,))
         conn.execute("DELETE FROM baseline_profiles WHERE student_id = ?", (sid,))
         conn.execute("DELETE FROM class_memberships WHERE student_id = ?", (sid,))
@@ -127,4 +135,4 @@ def purge(conn) -> dict:
     cur = conn.execute("DELETE FROM class_trend WHERE source = 'demo'")
     trend = cur.rowcount
     conn.commit()
-    return {"ok": True, "students": len(ids), "trend_buckets": trend}
+    return {"ok": True, "students": len(ids), "trend_buckets": trend, "alerts": n_alerts}

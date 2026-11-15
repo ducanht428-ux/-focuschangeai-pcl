@@ -620,6 +620,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass   # console ASCII và yên tĩnh; lỗi thật đã in ở chỗ khác
 
+    # CORS cho bản web hosted (trang https://*.qoder.website gọi về máy này). Server chỉ
+    # bind 127.0.0.1 nên không lộ ra mạng; chỉ chấp nhận Origin là site Qoder hoặc trang
+    # cục bộ (127.0.0.1/localhost) để một trang web lạ bất kỳ không đọc trộm số liệu học
+    # sinh qua trình duyệt của người dùng. Origin do trình duyệt đặt, trang remote không
+    # giả mạo được thành loopback.
+    def end_headers(self):
+        origin = self.headers.get("Origin") or ""
+        if (origin.endswith(".qoder.website") or origin.startswith("http://127.0.0.1:")
+                or origin.startswith("http://localhost:")):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            # Chrome chặn trang public (https) gọi về máy cục bộ nếu preflight thiếu
+            # header Private Network Access này; thêm vào để bản web LIVE đọc được máy.
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
     # ------------------------------------------------------------- tiện ích trả lời
     def _json(self, obj, code=200):
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -691,6 +713,19 @@ class Handler(BaseHTTPRequestHandler):
         cfg = load_cfg()
         if path == "/api/camera/stream":
             return self._mjpeg()
+        if path == "/api/camera/snapshot":
+            # Một JPEG duy nhất cho trình duyệt bị chặn luồng MJPEG (watchStream trong
+            # app.js sẽ kéo đường này bằng fetch). CORS + PNA do end_headers() lo.
+            jpeg, _ = self.runner.snapshot()
+            if not jpeg:
+                return self._json({"error": "chua co khung hinh"}, 404)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.end_headers()
+            self.wfile.write(jpeg)
+            return
         conn = db()
         try:
             if path == "/api/overview":
@@ -824,6 +859,13 @@ class Handler(BaseHTTPRequestHandler):
                     if key in body:
                         self.runner.options[key] = bool(body[key])
                 return self._json({"ok": True, "options": self.runner.options})
+            if path == "/api/camera/bind":
+                # Nút "Gắn tên" trên thẻ người: khai báo tên như phím M của main.py,
+                # identity_conf "manual". Có tên thì lõi mới mở phiên và ghi SQLite.
+                return self._json(self.runner.bind(int(body.get("track_id", -1)),
+                                                   str(body.get("name", ""))))
+            if path == "/api/camera/unbind":
+                return self._json(self.runner.unbind(int(body.get("track_id", -1))))
             if path == "/api/demo/seed":
                 res = demo_data.seed(conn, cfg)
                 app.audit(conn, "teacher", "demo_seed", json.dumps(res))
@@ -875,6 +917,18 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "changed": changed}
 
 
+def _dashboard_alive(url):
+    """True neu cong dang nghe la chinh dashboard nay, khong phai ung dung khac.
+    GET /api/system tra JSON co key 'app' chi khi la server nay; qua han 2s thi coi nhu khong."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url + "/api/system", timeout=2) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return isinstance(data, dict) and "app" in data
+    except Exception:
+        return False
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Dashboard FocusChangeAI (web cuc bo)")
@@ -901,9 +955,19 @@ def main():
         finally:
             c.close()
 
+    url = "http://127.0.0.1:%d" % args.port
+    # Hoi "dashboard nay dang chay chua?" TRUOC khi bind. Tren Windows http.server dat
+    # SO_REUSEADDR nen bind lan 2 van thanh cong (khong nem OSError) -> hai server cung
+    # nghe mot cong, instance sau nuot instance truoc. Bat buoc phai do bang GET /api/system
+    # truoc; neu dung la minh thi chi mo trinh duyet roi thoat (bam shortcut lan 2 van thay
+    # giao dien ngay, khong traceback, khong server ma).
+    if _dashboard_alive(url):
+        print("dashboard: %s dang chay san, mo trinh duyet" % url)
+        if not args.no_open:
+            webbrowser.open(url)
+        return
     Handler.runner = camera_runner.CameraRunner(on_minute=on_minute)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    url = "http://127.0.0.1:%d" % args.port
     print("dashboard: %s  (db: %s)" % (url, resolve_db_path(load_cfg().get("storage", {}).get("db", ""))))
     print("retention: %d ngay, da don %d phien qua han" % (days, removed))
     print("nhan Ctrl-C de dung")

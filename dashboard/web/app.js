@@ -46,7 +46,7 @@ function stamp() {
 async function api(path, body) {
   const opt = body === undefined ? {} : {
     method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
-  const res = await fetch(path, opt);
+  const res = await fetch((window.FC_API_BASE || "") + path, opt);
   const ct = res.headers.get("Content-Type") || "";
   if (!ct.includes("json")) {
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -60,7 +60,7 @@ async function api(path, body) {
 /* Tải CSV qua fetch để bắt được lỗi 403 (bậc chưa đủ) và toast thay vì mở tab JSON. */
 async function downloadCsv(url, filename) {
   try {
-    const res = await fetch(url);
+    const res = await fetch((window.FC_API_BASE || "") + url);
     const ct = res.headers.get("Content-Type") || "";
     if (ct.includes("json")) {
       const data = await res.json();
@@ -133,6 +133,7 @@ const ICON_PATHS = {
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>',
   check: '<path d="M20 6L9 17l-5-5"/>',
   x: '<path d="M18 6L6 18M6 6l12 12"/>',
+  wifi: '<path d="M5 12.55a10.94 10.94 0 0 1 14.08 0"/><path d="M1.42 9a15.91 15.91 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><path d="M12 20h.01"/>',
   wifioff: '<path d="M1 1l22 22"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><path d="M12 20h.01"/>',
   refresh: '<path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
@@ -311,9 +312,63 @@ function buildShell() {
     '<path d="M50 18h14M50 25h14M50 32h9" stroke="#3b5f96" stroke-width="2" stroke-linecap="round"/>' +
     '<path d="M8 50h68l-5 8H13z" fill="#123f7b"/></svg>';
   $("top-class-icon").innerHTML = ico("users");
-  $("chip-lan").innerHTML = ico("wifioff") + "<span>Mạng lớp: Chưa kết nối</span>";
+  // Mạng lớp là tính năng GIAI ĐOẠN 3 chưa xây: trước đây chip đỏ "Chưa kết nối"
+  // trông như một lỗi thật. Nay trung tính + bấm mở popover giải thích đúng bản chất.
+  $("chip-lan").innerHTML = ico("wifi") + "<span>Mạng lớp: Giai đoạn 3</span>" + ico("info");
+  $("chip-lan").onclick = toggleLanPop;
   $("modal-root").addEventListener("click", (e) => { if (e.target === $("modal-root")) closeModal(); });
 }
+
+/* ============================== popover Mạng lớp ============================== */
+function lanPopEl() {
+  let el = document.getElementById("lan-pop");
+  if (el) return el;
+  el = document.createElement("div");
+  el.id = "lan-pop";
+  el.className = "lan-pop";
+  el.hidden = true;
+  el.setAttribute("role", "dialog");
+  el.setAttribute("aria-label", "Giải thích mục Mạng lớp");
+  el.innerHTML =
+    "<h4>" + ico("wifi") + "Mạng lớp là gì?</h4>" +
+    "<p>Là tính năng ghép nối điện thoại học sinh hoặc nhiều camera thành mạng nội bộ trong lớp, " +
+    "để đo nhiều góc cùng lúc. Tính năng này thuộc <b>giai đoạn 3</b> — chưa xây, nên không có kết nối nào bị lỗi ở đây.</p>" +
+    '<div class="lan-road">' +
+    '<div class="lan-step"><i class="dot dot-green"></i><span>GĐ1 · Đo bằng camera máy này</span><b>Đã xong</b></div>' +
+    '<div class="lan-step"><i class="dot dot-green"></i><span>GĐ2 · Dashboard web 8 màn</span><b>Đã xong</b></div>' +
+    '<div class="lan-step"><i class="dot dot-grey"></i><span>GĐ3 · Mạng lớp / ghép nối điện thoại</span><b>Chưa làm</b></div>' +
+    "</div>" +
+    '<p class="lan-note">Việc đo hiện tại dùng camera của máy này và không bị ảnh hưởng bởi mục này.</p>' +
+    '<div class="modal-actions"><button class="btn btn-primary btn-sm" id="lan-pop-ok" type="button">Đã hiểu</button></div>';
+  document.body.appendChild(el);
+  el.querySelector("#lan-pop-ok").onclick = closeLanPop;
+  return el;
+}
+function toggleLanPop() {
+  const el = lanPopEl();
+  if (!el.hidden) { closeLanPop(); return; }
+  el.hidden = false;
+  const r = $("chip-lan").getBoundingClientRect();
+  const w = el.offsetWidth;
+  el.style.left = Math.min(Math.max(8, r.right - w), window.innerWidth - w - 8) + "px";
+  el.style.top = (r.bottom + 8) + "px";
+}
+function closeLanPop() {
+  const el = document.getElementById("lan-pop");
+  if (el) el.hidden = true;
+}
+document.addEventListener("click", (e) => {
+  const el = document.getElementById("lan-pop");
+  if (el && !el.hidden && !el.contains(e.target) && !$("chip-lan").contains(e.target)) closeLanPop();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLanPop(); });
+// Thẻ người vẽ lại mỗi nhịp nên uỷ quyền click ở document: nút Gắn tên / Đổi tên / Bỏ tên.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("[data-bind]");
+  if (b) { bindPerson(parseInt(b.getAttribute("data-bind"), 10)); return; }
+  const u = e.target.closest && e.target.closest("[data-unbind]");
+  if (u) unbindPerson(parseInt(u.getAttribute("data-unbind"), 10));
+});
 
 async function loadClasses() {
   try { S.classes = await api("/api/classes"); } catch (e) { S.classes = []; }
@@ -405,6 +460,22 @@ function systemRows() {
     (bad ? "status-bad" : ok ? "status-ok" : "status-off") + '"><i class="dot ' +
     (bad ? "dot-red" : ok ? "dot-green" : "dot-grey") + '"></i>' + text + "</span></div>";
   const d = st.deps || {};
+  // Bản web DEMO không cài Python/MediaPipe trong trình duyệt: engine mô phỏng của
+  // hosted-bridge.js mới là thứ chạy, nên nhãn phải nói đúng "mô phỏng", không đổ lỗi
+  // "chưa cài" như máy thật (trông như hỏng app trong khi demo vẫn chạy đủ chức năng).
+  if (window.FC_MODE === "demo") {
+    const on = !!st.camera_running;
+    return row("Ứng dụng", true, "Bản xem trước web (demo)") +
+      row("MediaPipe", on, on ? "Mô phỏng đang chạy" : "Mô phỏng (chưa bật)") +
+      row("YOLO (ultralytics)", on, on ? "Mô phỏng đang chạy" : "Mô phỏng (chưa bật)") +
+      row("OpenCV", on, on ? "Mô phỏng đang chạy" : "Mô phỏng (chưa bật)") +
+      row("Model khuôn mặt", true, "Không cần cho bản demo") +
+      row("Cơ sở dữ liệu", true, "Bộ nhớ trình duyệt (demo)") +
+      row("Camera", on, on ? "Đang chạy (demo)" : "Chưa bật") +
+      row("Mạng nội bộ lớp", false, "Giai đoạn 3") +
+      row("Đám mây (Firebase)", false, "Không dùng") +
+      row("Bậc sản phẩm", true, TIER_LABEL[st.tier] || st.tier);
+  }
   return row("Ứng dụng", true, st.app) +
     row("MediaPipe", d.mediapipe, d.mediapipe ? "Đã cài" : "Chưa cài", !d.mediapipe) +
     row("YOLO (ultralytics)", d.ultralytics, d.ultralytics ? "Đã cài" : "Chưa cài", !d.ultralytics) +
@@ -461,30 +532,65 @@ function syncStream(imgId, emptyId, fpsId) {
   const running = !!(cam && cam.running);
   if (running) {
     img.hidden = false;
-    if (!img.getAttribute("src")) img.src = "/api/camera/stream";
+    if (!img.getAttribute("src")) img.src = (window.FC_API_BASE || "") + "/api/camera/stream";
     empty.hidden = true;
     if (fps) { fps.hidden = false; fps.textContent = num(S.live.fps, 1) + " FPS"; }
+    watchStream(img);
   } else {
+    unwatchStream(img);
     img.removeAttribute("src");
     // Không có src thì Chrome vẫn vẽ alt + icon ảnh hỏng cho img đã đặt cỡ bằng CSS,
     // nên phải ẩn hẳn thẻ img khi camera dừng (luật [hidden] trong app.css lo phần còn lại).
     img.hidden = true;
     empty.hidden = false;
     if (fps) fps.hidden = true;
-    let msg = "Camera chưa bật. Bấm <b>Bắt đầu</b> để đo bằng webcam máy này.";
+    let msg = window.FC_MODE === "demo"
+      ? "Camera demo chưa bật. Bấm <b>Bắt đầu</b> để chạy mô phỏng lớp học ngay trong trình duyệt."
+      : "Camera chưa bật. Bấm <b>Bắt đầu</b> để đo bằng webcam máy này.";
     if (cam && cam.error) msg = "<b>Camera gặp lỗi:</b> " + esc(cam.error);
-    const miss = [];
-    if (S.system && S.system.deps) {
-      if (!S.system.deps.mediapipe) miss.push("mediapipe");
-      if (!S.system.deps.ultralytics) miss.push("ultralytics");
-    }
-    if (miss.length) msg += "<br><br>Thiếu thư viện: <b>" + miss.join(", ") +
-      "</b><br>Cài: <code>python -m pip install " + miss.join(" ") + "</code>";
-    if (S.system && S.system.model && !S.system.model.present) {
-      msg += "<br><br>Thiếu model <b>face_landmarker.task</b> (chép từ app Android sang thư mục dự án).";
+    if (window.FC_MODE !== "demo") {
+      const miss = [];
+      if (S.system && S.system.deps) {
+        if (!S.system.deps.mediapipe) miss.push("mediapipe");
+        if (!S.system.deps.ultralytics) miss.push("ultralytics");
+      }
+      if (miss.length) msg += "<br><br>Thiếu thư viện: <b>" + miss.join(", ") +
+        "</b><br>Cài: <code>python -m pip install " + miss.join(" ") + "</code>";
+      if (S.system && S.system.model && !S.system.model.present) {
+        msg += "<br><br>Thiếu model <b>face_landmarker.task</b> (chép từ app Android sang thư mục dự án).";
+      }
     }
     empty.innerHTML = "<div>" + ico("camera") + "<div>" + msg + "</div></div>";
   }
+}
+
+/* Một số trình duyệt chặn thẻ <img> kéo luồng MJPEG từ máy cục bộ (quyền mạng nội bộ
+   cấp cho fetch nhưng không cấp cho ảnh). Nếu camera ĐANG chạy mà ảnh không tải được
+   sau 3 giây, chuyển sang kéo từng JPEG qua /api/camera/snapshot bằng fetch — đường
+   fetch đã được cấp quyền thì mặt vẫn hiện, chỉ chậm hơn MJPEG một chút. */
+function watchStream(img) {
+  if (img._sw || img._poll) return;
+  const t0 = Date.now();
+  img._sw = setInterval(() => {
+    if (img.naturalWidth > 0) { clearInterval(img._sw); img._sw = null; return; }
+    if (Date.now() - t0 < 3000) return;
+    clearInterval(img._sw); img._sw = null;
+    img._poll = setInterval(async () => {
+      try {
+        const r = await fetch((window.FC_API_BASE || "") + "/api/camera/snapshot", {cache: "no-store"});
+        if (!r.ok) return;
+        const u = URL.createObjectURL(await r.blob());
+        const old = img.src;
+        img.src = u;
+        if (old && old.indexOf("blob:") === 0) URL.revokeObjectURL(old);
+      } catch (e) { /* nhịp sau thử lại */ }
+    }, 700);
+  }, 1000);
+}
+function unwatchStream(img) {
+  if (img._sw) { clearInterval(img._sw); img._sw = null; }
+  if (img._poll) { clearInterval(img._poll); img._poll = null; }
+  if (img.src && img.src.indexOf("blob:") === 0) URL.revokeObjectURL(img.src);
 }
 
 function cameraButtons(prefix) {
@@ -643,6 +749,18 @@ function updateCameraParts() {
   $("cam-people").innerHTML = people.map((p) => {
     const sit = SIT_LABEL[p.situation] || ["--", "warn"];
     const seiColor = p.sei == null ? "var(--ink-soft)" : p.sei >= 70 ? "var(--green)" : p.sei >= 45 ? "var(--orange)" : "var(--red)";
+    // Nút gắn tên chỉ có ở LIVE: DEMO là người mô phỏng, không có track thật để khai báo.
+    let bindRow = "";
+    if (window.FC_MODE !== "demo") {
+      if (!p.student_id) {
+        bindRow = '<div class="person-bind"><button class="btn btn-sm btn-primary" data-bind="' + p.track_id + '">' +
+          ico("edit") + " Gắn tên</button>" +
+          '<span class="muted small">Chưa gắn tên nên không lưu phiên</span></div>';
+      } else if (p.identity_conf === "manual") {
+        bindRow = '<div class="person-bind"><button class="btn btn-sm" data-bind="' + p.track_id + '">Đổi tên</button>' +
+          '<button class="btn btn-sm" data-unbind="' + p.track_id + '">Bỏ tên</button></div>';
+      }
+    }
     return '<div class="card person-card' + (p.track_id === S.focusTrack ? " focused" : "") + '">' +
       '<div class="person-head"><span class="person-name">' + esc(p.name) + "</span>" +
       '<span class="person-id">' + esc(p.student_id || "guest-" + p.track_id) + "</span></div>" +
@@ -655,6 +773,7 @@ function updateCameraParts() {
       '<div class="person-kv"><span>Khoảng cách</span><b>' + num(p.distance_cm, 0) + " cm</b></div>" +
       '<div class="person-kv"><span>Nhận diện</span><b>' + esc(p.identity_conf || "--") + "</b></div>" +
       (p.alert ? '<div class="person-alert">' + ico("warn") + " " + esc(p.alert) + "</div>" : "") +
+      bindRow +
       "</div>";
   }).join("");
 }
@@ -667,7 +786,7 @@ async function saveCameraSettings() {
     sensitivity: parseInt($("cam-sens").value, 10)}};
   try {
     const r = await api("/api/settings", body);
-    if (r.ok) { toast("Đã lưu vào config.yaml — áp dụng từ lần bật camera sau", "ok"); await tickSlow(); }
+    if (r.ok) { toast(window.FC_MODE === "demo" ? "Đã lưu cài đặt camera (demo trong trình duyệt)" : "Đã lưu vào config.yaml — áp dụng từ lần bật camera sau", "ok"); await tickSlow(); }
     else toast(r.error || "Không lưu được", "err");
   } catch (e) { toast(e.message, "err"); }
 }
@@ -682,15 +801,38 @@ async function setOption(key, value) {
 async function startCamera() {
   try {
     const r = await api("/api/camera/start", {});
-    if (r.ok) { toast("Đã bật camera", "ok"); await tickFast(); }
+    if (r.ok) { toast(window.FC_MODE === "demo" ? "Đã bật camera demo — đây là MÔ PHỎNG, không phải camera của bạn" : "Đã bật camera", "ok"); await tickFast(); }
     else toast((r.error || "Không bật được camera") + (r.hint ? " — " + r.hint : ""), "err");
   } catch (e) { toast(e.message, "err"); }
 }
 async function stopCamera() {
   try {
     await api("/api/camera/stop", {});
-    toast("Đã dừng camera — các phiên đang đo được chốt vào SQLite", "ok");
+    toast(window.FC_MODE === "demo" ? "Đã dừng camera demo" : "Đã dừng camera — các phiên đang đo được chốt vào SQLite", "ok");
     await tickFast();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* Gắn tên = khai báo danh tính như phím M của cửa sổ lõi (identity_conf "manual").
+   Có tên thì lõi mới mở phiên đo và ghi SQLite khi chốt; guest chỉ đo trực tiếp, không lưu. */
+async function bindPerson(trackId) {
+  const p = ((S.live && S.live.people) || []).find((x) => x.track_id === trackId);
+  const cur = p && p.student_id ? (p.name || "") : "";
+  const name = prompt("Tên của em này (ví dụ: Nguyễn Văn A):", cur);
+  if (name == null) return;
+  if (!name.trim()) { toast("Tên trống — chưa gắn", "err"); return; }
+  try {
+    const r = await api("/api/camera/bind", {track_id: trackId, name: name.trim()});
+    if (r.ok) { toast("Đã gắn tên “" + r.name + "” — đo tiếp rồi bấm Dừng camera để lưu phiên", "ok"); await tickFast(); }
+    else toast(r.error || "Không gắn được tên", "err");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function unbindPerson(trackId) {
+  if (!confirm("Bỏ tên track này? Khuôn mặt sẽ thành guest và KHÔNG lưu phiên mới cho tới khi gắn tên lại.")) return;
+  try {
+    const r = await api("/api/camera/unbind", {track_id: trackId});
+    if (r.ok) { toast("Đã bỏ tên — track về guest", "ok"); await tickFast(); }
+    else toast(r.error || "Không bỏ được tên", "err");
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -1090,7 +1232,7 @@ function renderReports() {
     t.onclick = () => { S.reportScope = t.dataset.rscope; renderReports(); };
   }
   $("rp-date").onchange = (e) => { S.reportDate = e.target.value || todayStr(); loadReport(); };
-  $("rp-print").onclick = () => window.open("/api/reports/print?scope=" + S.reportScope + "&date=" + S.reportDate, "_blank");
+  $("rp-print").onclick = () => window.open((window.FC_API_BASE || "") + "/api/reports/print?scope=" + S.reportScope + "&date=" + S.reportDate, "_blank");
   $("rp-csv").onclick = () => downloadCsv("/api/reports/csv?scope=" + S.reportScope + "&date=" + S.reportDate,
     "bao_cao_" + S.reportScope + "_" + S.reportDate + ".csv");
   $("rp-parent").onclick = () => toast("Mẫu báo cáo phụ huynh cần bậc Pro Max — phát hành ở giai đoạn 5", "err");
@@ -1365,6 +1507,10 @@ function route() {
 }
 
 async function init() {
+  // Bản web hosted: hosted-bridge.js thăm dò server cục bộ trước khi quyết định chế độ
+  // LIVE (gọi về 127.0.0.1:8730) hay DEMO (mock trong bộ nhớ). Bản cục bộ không có
+  // FC_READY nên bỏ qua nhịp chờ này, chạy như cũ.
+  if (window.FC_READY) { try { await window.FC_READY; } catch (e) { /* bridge lỗi: chạy như bản cục bộ */ } }
   buildShell();
   await refreshSettings();
   document.documentElement.dataset.theme = S.settings.theme === "dark" ? "dark" : "light";
@@ -1375,6 +1521,11 @@ async function init() {
   tickSlow();
   setInterval(tickFast, 5000);    // số liệu sống: tổng quan, camera, huy hiệu cảnh báo
   setInterval(tickSlow, 30000);   // biểu đồ 30 phút, trạng thái hệ thống, nhật ký
+  // ?autostart=1: cầu nối DEMO chuyển hướng sang LIVE khi người dùng bấm Bắt đầu
+  // mà dashboard cục bộ đang chạy — tới nơi thì bật camera thật ngay, khỏi bấm lần nữa.
+  if (window.FC_MODE === "live" && new URLSearchParams(location.search).get("autostart") === "1") {
+    startCamera();
+  }
 }
 
 init();
