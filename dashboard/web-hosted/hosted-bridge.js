@@ -1,32 +1,46 @@
 /* FocusChangeAI - cau noi cho ban web hosted (Qoder Sites).
-   Hai che do, quyet dinh TRUOC khi app.js khoi dong (app.js cho FC_READY):
+   Ba che do, quyet dinh TRUOC khi app.js khoi dong (app.js cho FC_READY):
    - LIVE: may nguoi xem dang chay dashboard cuc bo (127.0.0.1:8730). Moi loi goi API
      chuyen thang ve do; server cuc bo da mo CORS cho Origin *.qoder.website.
-   - DEMO: khong thay server cuc bo -> mock toan bo API trong bo nho tu fixture co nhan
-     DEMO (chup tu server that), de mo link la thay ngay giao dien 8 man voi so lieu mau.
+   - WEB (mac dinh khi khong thay server cuc bo): webdb-bridge.js doc chinh tep SQLite 10 bang
+     ma man do / app da ghi tren may nay (IndexedDB hoac userData/focuschange.db). So that,
+     hoac trang thai trong trung thuc - khong bom so mau.
+   - DEMO: chi khi goi tuong minh ?mode=demo. Mock toan bo API tu fixture co nhan DEMO.
    Ban cuc bo khong co file nay: FC_API_BASE / FC_READY undefined => hanh vi nhu cu.
-   ?mode=demo / ?mode=live ep che do de nghiem thu. */
+   ?mode=live ep LIVE, ?mode=demo ep DEMO, ?mode=web ep doc SQLite bo qua do server cuc bo. */
 (function () {
   "use strict";
   var LOCAL = "http://127.0.0.1:8730";
   var forced = new URLSearchParams(location.search).get("mode");
+  // A simple GET from https to loopback is denied without prompting; a non-simple header forces
+  // a preflight so Chrome shows its one-time local-network Allow prompt instead of a silent block.
+  var PROBE_HEADERS = { "Content-Type": "application/json" };
 
   window.FC_READY = (async function () {
     var live = false;
     if (forced === "live") live = true;
-    else if (forced !== "demo") {
+    else if (forced !== "demo" && forced !== "web") {
       try {
         var ctl = new AbortController();
         var t = setTimeout(function () { ctl.abort(); }, 1500);
-        var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal });
+        var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal, headers: PROBE_HEADERS });
         clearTimeout(t);
         var j = await r.json();
         live = !!(j && j.app);
       } catch (e) { live = false; }
     }
-    window.FC_MODE = live ? "live" : "demo";
-    if (live) window.FC_API_BASE = LOCAL;
-    else installDemo();
+    if (live) {
+      window.FC_MODE = "live";
+      window.FC_API_BASE = LOCAL;
+    } else if (forced === "demo") {
+      window.FC_MODE = "demo";
+      installDemo();
+    } else {
+      // No Python dashboard on this machine: read the SQLite file the measurement screen / installed
+      // app already wrote here. Real rows or an honest empty state - never the fixture.
+      window.FC_MODE = "web";
+      await window.FC_WEBDB.install();
+    }
     // app.js init() chay ngay sau khi FC_READY resolve (microtask), nen setTimeout 0
     // dam bao buildShell() da dung thanh tren xong roi moi chen chip che do.
     setTimeout(paintHostedChip, 0);
@@ -35,20 +49,30 @@
   function paintHostedChip() {
     var top = document.querySelector(".top-right");
     if (!top || document.getElementById("hosted-chip")) return;
-    var live = window.FC_MODE === "live";
+    var mode = window.FC_MODE;
+    var live = mode === "live";
+    var wi = window.FC_WEBDB_INFO || {};
+    var sessions = (wi.counts && wi.counts.observation_sessions) || 0;
+    var real = mode === "web" && !!wi.ok && sessions > 0;
+    var dot = live || real ? "dot-green" : "dot-grey";
+    var label = live ? "Bản web · LIVE máy này"
+      : mode === "web" ? (real ? "Bản web · SỐ ĐO THẬT" : "Bản web · CHƯA CÓ DỮ LIỆU")
+      : "Bản web · DEMO";
+    var title = live ? "Trang web đang đọc số liệu thật từ dashboard chạy trên máy này."
+      : mode === "web" ? (sessions ? "Đọc " + sessions + " phiên đo thật từ " + (wi.where || "SQLite máy này") + "."
+        : "Chưa có phiên đo nào trên máy này. Mở màn đo để đo thật; trang không hiển thị số mẫu.")
+      : "Không thấy dashboard cục bộ: đang hiển thị dữ liệu mẫu trong trình duyệt.";
     var chip = document.createElement("span");
     chip.id = "hosted-chip";
     chip.className = "chip-db";
-    chip.title = live ? "Trang web dang doc so lieu that tu dashboard chay tren may nay."
-      : "Khong thay dashboard cuc bo: dang hien thi du lieu mau trong trinh duyet.";
-    chip.innerHTML = '<i class="dot ' + (live ? "dot-green" : "dot-grey") + '"></i>' +
-      (live ? "Bản web · LIVE máy này" : "Bản web · DEMO");
+    chip.title = title;
+    chip.innerHTML = '<i class="dot ' + dot + '"></i>' + label;
     top.insertBefore(chip, top.firstChild);
-    var mode = document.querySelector(".chip-mode");
-    if (mode) mode.innerHTML = '<i class="dot ' + (live ? "dot-green" : "dot-grey") + '"></i> Chế độ: <b>' +
-      (live ? "LIVE (máy cục bộ)" : "Xem trước trên web") + "</b>";
+    var modeChip = document.querySelector(".chip-mode");
+    if (modeChip) modeChip.innerHTML = '<i class="dot ' + dot + '"></i> Chế độ: <b>' +
+      (live ? "LIVE (máy cục bộ)" : mode === "web" ? "Web · SQLite máy này" : "Xem trước trên web") + "</b>";
     var banner = document.getElementById("demo-banner");
-    if (banner && !live) {
+    if (banner && mode === "demo") {
       // updateChips() vẽ lại banner mỗi nhịp; observer đổi lời dẫn sang bản web và
       // gắn lại nút kết nối / mở bản cục bộ (giữ nút "Xóa dữ liệu mẫu" của app.js).
       var decorate = function () {
@@ -67,7 +91,7 @@
           try {
             var ctl = new AbortController();
             var t = setTimeout(function () { ctl.abort(); }, 2500);
-            var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal });
+            var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal, headers: PROBE_HEADERS });
             clearTimeout(t);
             var j = await r.json();
             if (j && j.app) {
@@ -389,114 +413,17 @@
       var src = (!date || date === todayStr()) ? D.reports : D.reports_empty;
       return src[scope] || src.day;
     }
-    function csvCell(v) {
-      var s = v == null ? "" : String(v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-    }
-    // The fixture was captured at tier=standard, so its csv_students / csv_reports fields hold the
-    // server's 403 error object, not CSV. Build the text from the same rows the screens show instead.
-    var STUDENT_COLS = ["student_id", "name", "birth_year", "gender", "consent", "sessions", "sei_mean"];
-    function studentsCsv() {
-      var lines = [STUDENT_COLS.join(",")];
-      D.students.forEach(function (s) {
-        lines.push(STUDENT_COLS.map(function (c) { return csvCell(s[c]); }).join(","));
-      });
-      return lines.join("\n") + "\n";
-    }
-    function reportsCsv(scope, date) {
-      var rows = (reportsFor(scope, date).rows) || [];
-      if (!rows.length) return "";
-      var cols = Object.keys(rows[0]);
-      var lines = [cols.join(",")];
-      rows.forEach(function (r) {
-        lines.push(cols.map(function (c) {
-          var v = r[c];
-          return csvCell(v && typeof v === "object" ? JSON.stringify(v) : v);
-        }).join(","));
-      });
-      return lines.join("\n") + "\n";
-    }
-    function findStudent(id) {
-      return D.students.find(function (s) { return s.student_id === id; });
-    }
-    function escHtml(v) {
-      return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
-        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-      });
-    }
-    function p2(x) { return String(x).padStart(2, "0"); }
-    function printTime(ms) {
-      if (!ms) return "--";
-      var d = new Date(ms);
-      return p2(d.getHours()) + ":" + p2(d.getMinutes()) + " " + p2(d.getDate()) + "/" +
-        p2(d.getMonth() + 1) + "/" + d.getFullYear();
-    }
-    function printMin(ms) { return ((ms || 0) / 60000).toFixed(1); }
-    function printNum(v) { return v == null ? "--" : Number(v).toFixed(1); }
-    function printQuality(r) {
-      var q = (r.notes || {}).quality_mean;
-      return q == null ? "--" : Number(q).toFixed(0) + "%";
-    }
-    // Same columns as report_print_html() in dashboard/server.py, so the printed page looks identical
-    // whether the numbers came from the local server or from this in-browser demo.
-    var PRINT_COLS = {
-      session: [
-        ["Học sinh", function (r) { return r.student_name || r.student_id || "--"; }],
-        ["Bắt đầu", function (r) { return printTime(r.started_at_wall_ms); }],
-        ["Kết thúc", function (r) { return printTime(r.ended_at_wall_ms); }],
-        ["Phút hợp lệ", function (r) { return printMin(r.valid_ms); }],
-        ["SEI trung bình", function (r) { return printNum(r.sei_mean); }],
-        ["Cảnh báo", function (r) { return r.alerts == null ? 0 : r.alerts; }],
-        ["Nguồn", function (r) { return r.source || "--"; }],
-        ["Chất lượng đo", printQuality]],
-      day: [
-        ["Mã học sinh", function (r) { return r.student_id || "--"; }],
-        ["Học sinh", function (r) { return r.name || "--"; }],
-        ["Số phiên", function (r) { return r.sessions || 0; }],
-        ["Phút hợp lệ", function (r) { return printMin(r.valid_ms); }],
-        ["SEI trung bình", function (r) { return printNum(r.sei_mean); }],
-        ["Cảnh báo", function (r) { return r.alerts == null ? 0 : r.alerts; }]],
-      week: [
-        ["Ngày", function (r) { return r.date || "--"; }],
-        ["Số phiên", function (r) { return r.sessions || 0; }],
-        ["Phút hợp lệ", function (r) { return printMin(r.valid_ms); }],
-        ["SEI trung bình", function (r) { return printNum(r.sei_mean); }],
-        ["Cảnh báo", function (r) { return r.alerts == null ? 0 : r.alerts; }]]
-    };
+    // Print columns, CSV quoting and HTML escaping live in report-shared.js so the demo, the
+    // real-data bridge and the Python server cannot drift apart.
+    var R = window.FC_REPORT;
+    function studentsCsv() { return R.studentsCsv(D.students); }
+    function reportsCsv(scope, date) { return R.reportsCsv(reportsFor(scope, date).rows || []); }
     function printHtml(scope, date) {
-      var data = reportsFor(scope, date);
-      var labels = { session: "Báo cáo phiên đo", day: "Báo cáo ngày", week: "Báo cáo tuần" };
-      var cols = PRINT_COLS[scope] || PRINT_COLS.session;
-      var rows = data.rows || [];
-      var s = data.summary || {};
-      var html = "<!doctype html><html lang='vi'><head><meta charset='utf-8'><title>" +
-        escHtml(labels[scope] || scope) + "</title>" +
-        "<style>body{font-family:'Segoe UI',sans-serif;margin:32px;color:#16324f}h1{font-size:22px}" +
-        "table{border-collapse:collapse;width:100%;margin-top:14px;font-size:13px}" +
-        "th,td{border:1px solid #dbe7f4;padding:6px 9px;text-align:left}th{background:#eef4fb}" +
-        ".muted{color:#5b7691;font-size:12px}button{margin:12px 0;padding:8px 16px}" +
-        "@media print{button{display:none}}</style></head><body>" +
-        "<h1>FocusChangeAI — " + escHtml(labels[scope] || scope) + " · " + escHtml(date || todayStr()) + "</h1>" +
-        "<p class='muted'>BẢN XEM TRƯỚC WEB (DEMO) — số liệu mẫu, không phải số đo thật.</p>" +
-        "<div class='muted'>" + (s.sessions || 0) + " phiên · " + (s.students || 0) + " học sinh · " +
-        (s.valid_min == null ? "--" : Number(s.valid_min).toFixed(1)) + " phút hợp lệ · SEI trung bình " + printNum(s.sei_mean) +
-        " · " + (s.alerts || 0) + " cảnh báo</div>" +
-        "<button onclick='window.print()'>In / lưu PDF</button>";
-      html += "<table><thead><tr>" + cols.map(function (c) { return "<th>" + escHtml(c[0]) + "</th>"; }).join("") +
-        "</tr></thead><tbody>";
-      if (rows.length) {
-        html += rows.map(function (r) {
-          return "<tr>" + cols.map(function (c) { return "<td>" + escHtml(c[1](r)) + "</td>"; }).join("") + "</tr>";
-        }).join("");
-      } else {
-        html += "<tr><td colspan='" + cols.length + "' style='text-align:center;color:#5b7691'>" +
-          "Chưa có phiên đo nào trong khoảng thời gian này.</td></tr>";
-      }
-      return html + "</tbody></table>" +
-        "<p class='muted'>Số liệu chỉ để hỗ trợ giáo viên, không dùng làm căn cứ kỷ luật duy nhất.</p></body></html>";
+      return R.printHtml(scope, date, reportsFor(scope, date),
+        "BẢN XEM TRƯỚC WEB (DEMO) — số liệu mẫu, không phải số đo thật.");
     }
 
-    function route(method, path, q, body) {
+    async function route(method, path, q, body) {
       if (method === "GET") {
         switch (path) {
           case "/api/classes": return jsonRes(D.classes);
@@ -508,6 +435,17 @@
           case "/api/alerts": return jsonRes(filterAlerts(q));
           case "/api/settings": return jsonRes(D.settings);
           case "/api/camera/options": return jsonRes(DISP);
+          case "/api/camera/snapshot": {
+            // Same single-JPEG contract as the server endpoint, so the watchStream() fallback in
+            // app.js also works when the page is running the in-browser simulation.
+            if (!SIM.running) return jsonRes({ ok: false, error: "DEMO: camera chưa bật" }, 503);
+            drawFrame();
+            var b64 = cv.toDataURL("image/jpeg", 0.8).split(",")[1];
+            var bin = atob(b64), arr = new Uint8Array(bin.length);
+            for (var bi = 0; bi < bin.length; bi++) arr[bi] = bin.charCodeAt(bi);
+            return new Response(arr, { status: 200,
+              headers: { "Content-Type": "image/jpeg", "Cache-Control": "no-store" } });
+          }
           case "/api/students": return jsonRes(D.students);
           case "/api/student": return jsonRes(D.student[q.get("id")] || D.student_empty);
           case "/api/analysis": {
@@ -529,6 +467,22 @@
           audit("settings_save", Object.keys(body || {}).join(","));
           return jsonRes({ ok: true });
         case "/api/camera/start":
+          // Người dùng bấm Bắt đầu vì muốn thấy MẶT MÌNH, không phải xem diễn.
+          // Nếu dashboard cục bộ đang chạy (và không ép mode=demo), chuyển thẳng
+          // sang LIVE + autostart: một lần bấm là camera thật bật, mặt hiện ngay.
+          if (forced !== "demo") {
+            try {
+              var ctl2 = new AbortController();
+              var t2 = setTimeout(function () { ctl2.abort(); }, 2000);
+              var pr = await fetch(LOCAL + "/api/system", { signal: ctl2.signal, headers: PROBE_HEADERS });
+              clearTimeout(t2);
+              var pj = await pr.json();
+              if (pj && pj.app) {
+                setTimeout(function () { location.href = location.pathname + "?mode=live&autostart=1"; }, 600);
+                return jsonRes({ ok: false, error: "Đã thấy dashboard cục bộ — đang chuyển sang LIVE để bật camera thật…" });
+              }
+            } catch (e) { /* không với tới máy cục bộ: chạy mô phỏng có nhãn */ }
+          }
           simStart();
           return jsonRes({ ok: true });
         case "/api/camera/stop":

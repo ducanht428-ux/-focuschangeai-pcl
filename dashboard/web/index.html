@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FocusChange AI - Giám sát và phân tích hành vi học sinh</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 44 44'%3E%3Crect width='44' height='44' rx='12' fill='%231f6feb'/%3E%3Cpath d='M8 22s5.5-9 14-9 14 9 14 9-5.5 9-14 9-14-9-14-9z' fill='none' stroke='%23fff' stroke-width='2.4'/%3E%3Ccircle cx='22' cy='22' r='4.4' fill='%23fff'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -28,6 +29,7 @@
     <!-- Thanh trên cùng: lớp / offline / SQLite / mạng lớp (đặc tả 5.2) -->
     <header id="topbar">
       <div class="top-left">
+        <button id="nav-toggle" type="button" title="Mở menu" aria-label="Mở menu điều hướng"></button>
         <span class="top-icon" id="top-class-icon"></span>
         <label class="class-picker">
           <select id="class-select" title="Chọn lớp"></select>
@@ -50,6 +52,7 @@
 
 <div id="modal-root" hidden></div>
 <div id="toast-root"></div>
+<div id="nav-scrim" hidden></div>
 <script src="/app.js"></script>
 </body>
 </html>

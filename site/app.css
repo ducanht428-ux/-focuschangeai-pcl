@@ -131,6 +131,10 @@ body {
   font-size: 13px; display: flex; gap: 8px; align-items: center;
 }
 html[data-theme="dark"] #demo-banner { color: #ffd489; }
+/* Real-data web build: same banner frame, green info tone instead of the DEMO warning amber. */
+#demo-banner.banner-real { background: var(--green-soft); color: #14532d; border-color: #bfe8cd; }
+html[data-theme="dark"] #demo-banner.banner-real { color: #86efac; border-color: #1f4a30; }
+#demo-banner a { color: inherit; font-weight: 600; }
 /* ico() trả về <svg viewBox> không có width/height; trong flex container trình duyệt dùng
    kích thước mặc định 300x150 -> tam giác cảnh báo khổng lồ. Các nơi khác đã có luật svg
    riêng (.btn, .card h3...); banner này bị bỏ sót, nên đặt cỡ cố định tại đây. */
@@ -291,6 +295,9 @@ html[data-theme="dark"] .status-ok { color: #4ade80; }
 .switch input:checked + i { background: var(--green); }
 .switch input:checked + i::after { left: 21px; }
 .lock-note { font-size: 12px; color: var(--ink-soft); background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+/* Same ico() sizing trap as #demo-banner: an inline <svg viewBox> with no width/height falls back
+   to the 300x150 replaced-element default, so the lock/info glyph must be pinned here. */
+.lock-note svg { width: 14px; height: 14px; vertical-align: -2px; margin-right: 4px; }
 .level-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .level-3 { background: var(--red); }
 .level-2 { background: var(--orange); }
@@ -301,3 +308,34 @@ html[data-theme="dark"] .status-ok { color: #4ade80; }
 .muted { color: var(--ink-soft); }
 .small { font-size: 12px; }
 .mt { margin-top: 14px; }
+
+/* ---------------- mobile: sidebar becomes a drawer ---------------- */
+#nav-toggle {
+  display: none; align-items: center; justify-content: center;
+  width: 38px; height: 38px; flex: none;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card); color: var(--ink); cursor: pointer;
+}
+#nav-toggle svg { width: 20px; height: 20px; }
+#nav-scrim { position: fixed; inset: 0; z-index: 40; background: rgba(10, 21, 38, .45); }
+@media (max-width: 900px) {
+  #nav-toggle { display: inline-flex; }
+  #sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0; z-index: 50;
+    transform: translateX(-100%); transition: transform .18s ease;
+    box-shadow: 0 0 32px rgba(10, 30, 60, .35);
+  }
+  #sidebar.open { transform: translateX(0); }
+  #topbar { padding: 8px 12px; flex-wrap: wrap; gap: 8px; }
+  .top-right { flex-wrap: wrap; gap: 8px; font-size: 12px; }
+  .top-sep { display: none; }
+  #view { padding: 12px 12px 24px; }
+  #demo-banner { margin: 10px 12px 0; flex-wrap: wrap; }
+  .card { overflow-x: auto; }
+  .lan-pop { width: min(370px, calc(100vw - 16px)); }
+}
+@media (max-width: 640px) {
+  .grid-stats { grid-template-columns: 1fr; }
+  .page-head { flex-direction: column; }
+  .stat-num { font-size: 22px; }
+}

@@ -17,6 +17,7 @@ Bảo mật đợt này: chỉ binds 127.0.0.1 (máy giáo viên), chưa đăng 
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import os
@@ -399,16 +400,71 @@ def report_csv(conn, cfg, scope, date_str) -> str:
     return buf.getvalue()
 
 
+def _print_time(ms) -> str:
+    if not ms:
+        return "--"
+    return time.strftime("%H:%M %d/%m/%Y", time.localtime(ms / 1000.0))
+
+
+def _print_min(ms) -> str:
+    return "%.1f" % ((ms or 0) / 60000.0)
+
+
+def _print_num(v) -> str:
+    return "--" if v is None else "%.1f" % v
+
+
+def _print_quality(row) -> str:
+    q = (row.get("notes") or {}).get("quality_mean")
+    return "--" if q is None else "%.0f%%" % q
+
+
+# Same columns and formatting as printHtml() in dashboard/web-hosted/hosted-bridge.js, so the printed
+# page reads identically whether the rows came from SQLite or from the in-browser demo.
+PRINT_COLS = {
+    "session": [
+        ("Học sinh", lambda r: r.get("student_name") or r.get("student_id") or "--"),
+        ("Bắt đầu", lambda r: _print_time(r.get("started_at_wall_ms"))),
+        ("Kết thúc", lambda r: _print_time(r.get("ended_at_wall_ms"))),
+        ("Phút hợp lệ", lambda r: _print_min(r.get("valid_ms"))),
+        ("SEI trung bình", lambda r: _print_num(r.get("sei_mean"))),
+        ("Cảnh báo", lambda r: r.get("alerts") or 0),
+        ("Nguồn", lambda r: r.get("source") or "--"),
+        ("Chất lượng đo", _print_quality),
+    ],
+    "day": [
+        ("Mã học sinh", lambda r: r.get("student_id") or "--"),
+        ("Học sinh", lambda r: r.get("name") or "--"),
+        ("Số phiên", lambda r: r.get("sessions") or 0),
+        ("Phút hợp lệ", lambda r: _print_min(r.get("valid_ms"))),
+        ("SEI trung bình", lambda r: _print_num(r.get("sei_mean"))),
+        ("Cảnh báo", lambda r: r.get("alerts") or 0),
+    ],
+    "week": [
+        ("Ngày", lambda r: r.get("date") or "--"),
+        ("Số phiên", lambda r: r.get("sessions") or 0),
+        ("Phút hợp lệ", lambda r: _print_min(r.get("valid_ms"))),
+        ("SEI trung bình", lambda r: _print_num(r.get("sei_mean"))),
+        ("Cảnh báo", lambda r: r.get("alerts") or 0),
+    ],
+}
+
+
 def report_print_html(conn, cfg, scope, date_str) -> str:
     data = report_rows(conn, cfg, scope, date_str)
     titles = {"session": "Báo cáo phiên đo", "day": "Báo cáo ngày", "week": "Báo cáo tuần"}
-    head = "".join("<th>%s</th>" % k for k in (data["rows"][0].keys() if data["rows"] else ["(trống)"]))
-    body = ""
-    for r in data["rows"]:
-        body += "<tr>" + "".join(
-            "<td>%s</td>" % (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list))
-                             else ("--" if v is None else v)) for v in r.values()) + "</tr>"
+    title = titles.get(scope, titles["session"])
+    cols = PRINT_COLS.get(scope, PRINT_COLS["session"])
+    head = "".join("<th>%s</th>" % html.escape(c[0]) for c in cols)
+    if data["rows"]:
+        body = "".join(
+            "<tr>" + "".join("<td>%s</td>" % html.escape(str(c[1](r))) for c in cols) + "</tr>"
+            for r in data["rows"])
+    else:
+        body = ("<tr><td colspan='%d' style='text-align:center;color:#567'>"
+                "Chưa có phiên đo nào trong khoảng thời gian này.</td></tr>" % len(cols))
     s = data["summary"]
+    esc = html.escape
     return ("<!doctype html><html lang='vi'><head><meta charset='utf-8'>"
             "<title>%s %s</title><style>body{font-family:'Segoe UI',sans-serif;margin:24px;color:#123}"
             "table{border-collapse:collapse;width:100%%;font-size:12px}td,th{border:1px solid #9ab;padding:4px 6px;text-align:left}"
@@ -418,11 +474,11 @@ def report_print_html(conn, cfg, scope, date_str) -> str:
             "<button onclick='window.print()'>In / lưu PDF</button>"
             "<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>"
             "<p style='font-size:11px;color:#567'>Số liệu chỉ để hỗ trợ giáo viên, không dùng làm căn cứ kỷ luật duy nhất.</p>"
-            "</body></html>") % (titles[scope], date_str, titles[scope], date_str,
-                               cfg.get("class_label") or cfg.get("class_id", ""),
-                               cfg.get("storage", {}).get("school_year", ""),
+            "</body></html>") % (esc(title), esc(date_str or ""), esc(title), esc(date_str or ""),
+                               esc(str(cfg.get("class_label") or cfg.get("class_id", ""))),
+                               esc(str(cfg.get("storage", {}).get("school_year", ""))),
                                s["sessions"], s["valid_min"],
-                               s["sei_mean"] if s["sei_mean"] is not None else "--", s["alerts"],
+                               _print_num(s["sei_mean"]), s["alerts"],
                                head, body)
 
 

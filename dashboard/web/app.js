@@ -152,6 +152,20 @@ function ico(name) {
     'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ICON_PATHS[name] || "") + "</svg>";
 }
 
+/* In the app and on the hosted site this page lives at /dashboard/, one level under the measurement
+   screen. A dashboard-only build (tools/build_site.py) is served at the root, where ../index.html
+   resolves back to this same page: there is no measurement screen beside it, so the link must not
+   pretend there is one. */
+const MEASURE_HREF = (() => {
+  const self = location.href.split("#")[0].split("?")[0];
+  return new URL("../index.html", location.href).href === self ? "" : "../index.html";
+})();
+function measureHint(tail) {
+  return MEASURE_HREF
+    ? 'Mở <a href="' + MEASURE_HREF + '"><b>màn đo</b></a> để đo thật' + (tail || "")
+    : "Bản dashboard-only không có màn đo đi kèm — muốn đo thì chạy app PC hoặc bản web đầy đủ.";
+}
+
 /* ============================== trạng thái ============================== */
 const S = {
   view: "overview",
@@ -271,7 +285,10 @@ function trendChart(rows) {
     labels.push(m % 5 === 0 ? fmtTime(bucket) : "");
   }
   if (vals.every((v) => v == null)) {
-    return '<div class="chart-empty">Chưa có dữ liệu 30 phút gần nhất.<br>Bật camera để đo, hoặc nạp dữ liệu mẫu ở màn Sao lưu.</div>';
+    return '<div class="chart-empty">Chưa có dữ liệu 30 phút gần nhất.<br>' +
+      (window.FC_MODE === "web"
+        ? measureHint(" — phiên đóng lại sẽ hiện ở đây.") + " Trang này không nạp số liệu mẫu."
+        : "Bật camera để đo, hoặc nạp dữ liệu mẫu ở màn Sao lưu.") + "</div>";
   }
   return lineChart(vals, labels, {yMin: 0, yMax: 100, color: "var(--blue)"});
 }
@@ -296,7 +313,7 @@ function buildNav() {
     (id === "alerts" ? '<span class="nav-badge" id="nav-alert-badge"' + (unseen ? "" : " hidden") + ">" + unseen + "</span>" : "") +
     "</button>").join("");
   for (const btn of $("nav").querySelectorAll(".nav-item")) {
-    btn.onclick = () => { location.hash = "#" + btn.dataset.view; };
+    btn.onclick = () => { location.hash = "#" + btn.dataset.view; closeNav(); };
   }
 }
 
@@ -312,6 +329,9 @@ function buildShell() {
     '<path d="M50 18h14M50 25h14M50 32h9" stroke="#3b5f96" stroke-width="2" stroke-linecap="round"/>' +
     '<path d="M8 50h68l-5 8H13z" fill="#123f7b"/></svg>';
   $("top-class-icon").innerHTML = ico("users");
+  $("nav-toggle").innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
+  $("nav-toggle").onclick = toggleNav;
+  $("nav-scrim").onclick = closeNav;
   // Mạng lớp là tính năng GIAI ĐOẠN 3 chưa xây: trước đây chip đỏ "Chưa kết nối"
   // trông như một lỗi thật. Nay trung tính + bấm mở popover giải thích đúng bản chất.
   $("chip-lan").innerHTML = ico("wifi") + "<span>Mạng lớp: Giai đoạn 3</span>" + ico("info");
@@ -361,7 +381,7 @@ document.addEventListener("click", (e) => {
   const el = document.getElementById("lan-pop");
   if (el && !el.hidden && !el.contains(e.target) && !$("chip-lan").contains(e.target)) closeLanPop();
 });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLanPop(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeLanPop(); closeNav(); } });
 // Thẻ người vẽ lại mỗi nhịp nên uỷ quyền click ở document: nút Gắn tên / Đổi tên / Bỏ tên.
 document.addEventListener("click", (e) => {
   const b = e.target.closest && e.target.closest("[data-bind]");
@@ -369,6 +389,17 @@ document.addEventListener("click", (e) => {
   const u = e.target.closest && e.target.closest("[data-unbind]");
   if (u) unbindPerson(parseInt(u.getAttribute("data-unbind"), 10));
 });
+
+/* ============================== menu mobile (drawer) ============================== */
+function toggleNav() {
+  const open = !$("sidebar").classList.contains("open");
+  $("sidebar").classList.toggle("open", open);
+  $("nav-scrim").hidden = !open;
+}
+function closeNav() {
+  $("sidebar").classList.remove("open");
+  $("nav-scrim").hidden = true;
+}
 
 async function loadClasses() {
   try { S.classes = await api("/api/classes"); } catch (e) { S.classes = []; }
@@ -395,19 +426,60 @@ function updateChips() {
     '<span><i class="dot ' + (ready ? "dot-green" : "dot-red") + '"></i>SQLite: ' +
     (ready ? "Sẵn sàng" : "Lỗi") + "</span>";
   const banner = $("demo-banner");
-  const demo = S.overview && S.overview.demo;
-  banner.hidden = !demo;
+  const ov = S.overview || {};
+  const demo = !!ov.demo;
+  // Bản web đọc SQLite thật của máy này: băng thông tin màu xanh, không phải băng cảnh báo DEMO.
+  const web = !demo && window.FC_MODE === "web";
+  banner.hidden = !demo && !web;
+  banner.classList.toggle("banner-real", web);
   if (demo) {
     banner.innerHTML = ico("warn") +
       "<span><b>DỮ LIỆU MẪU (DEMO)</b> đang được hiển thị để nghiệm thu giao diện — không phải số đo thật.</span>" +
       '<span class="spacer" style="flex:1"></span><button class="btn btn-sm" id="demo-banner-purge">Xóa dữ liệu mẫu</button>';
     $("demo-banner-purge").onclick = purgeDemo;
+  } else if (web) {
+    const wi = ov.web_info || {};
+    const has = (wi.sessions || 0) > 0;
+    banner.innerHTML = ico(has ? "database" : "info") +
+      "<span>" + (has
+        ? "<b>SỐ ĐO THẬT</b> — " + wi.sessions + " phiên · " + wi.students + " em, đọc từ " +
+          esc(wi.where || "SQLite của máy này") + ". Trang này chỉ đọc kết quả; muốn đo tiếp thì mở màn đo."
+        : "<b>CHƯA CÓ DỮ LIỆU ĐO</b> — máy này chưa ghi phiên nào. Mở màn đo, đo một phiên rồi bấm Dừng, số sẽ hiện ở đây. Trang không hiển thị số liệu mẫu.") +
+      "</span>" +
+      '<span class="spacer" style="flex:1"></span>' +
+      (MEASURE_HREF ? '<a class="btn btn-sm" id="web-banner-measure" href="' + MEASURE_HREF + '">Mở màn đo</a>' : "") +
+      '<button class="btn btn-sm" id="web-banner-live" title="Dò dashboard Python đang chạy trên máy này (127.0.0.1:8730)">Kết nối LIVE</button>';
+    $("web-banner-live").onclick = connectLive;
   }
   const badge = $("nav-alert-badge");
   if (badge && S.overview) {
     badge.textContent = S.overview.alerts_unseen;
     badge.hidden = !S.overview.alerts_unseen;
   }
+}
+
+/* Dò dashboard Python cục bộ rồi chuyển sang LIVE. Header không "simple" để buộc preflight:
+   Chrome khi đó hiện hộp quyền mạng nội bộ một lần thay vì chặn thầm lặng GET https -> loopback. */
+async function connectLive() {
+  const btn = $("web-banner-live");
+  if (btn) btn.disabled = true;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 2500);
+    const r = await fetch("http://127.0.0.1:8730/api/system",
+      { signal: ctl.signal, headers: { "Content-Type": "application/json" } });
+    clearTimeout(t);
+    const j = await r.json();
+    if (j && j.app) {
+      toast("Đã thấy máy cục bộ — chuyển sang LIVE…", "ok");
+      setTimeout(() => { location.href = location.pathname + "?mode=live"; }, 600);
+      return;
+    }
+    throw new Error("no server");
+  } catch (e) {
+    toast("Chưa nối được dashboard cục bộ. Nếu trình duyệt hỏi quyền truy cập mạng cục bộ, bấm Cho phép rồi thử lại; hoặc mở bản cục bộ đầy đủ.", "err");
+  }
+  if (btn) btn.disabled = false;
 }
 
 /* ============================== polling ============================== */
@@ -460,6 +532,21 @@ function systemRows() {
     (bad ? "status-bad" : ok ? "status-ok" : "status-off") + '"><i class="dot ' +
     (bad ? "dot-red" : ok ? "dot-green" : "dot-grey") + '"></i>' + text + "</span></div>";
   const d = st.deps || {};
+  // Bản web đọc SQLite thật của máy này: engine đo nằm ở màn đo chứ không nằm trong trang đọc
+  // kết quả, nên các hàng Python/model phải nói "không ở đây" thay vì "chưa cài" như máy hỏng.
+  if (window.FC_MODE === "web") {
+    const db = st.database || {};
+    return row("Ứng dụng", true, st.app) +
+      row("Nơi đọc số liệu", db.ready, db.ready ? (db.path || "SQLite của máy này") : "Chưa có db", !db.ready) +
+      row("Đã ghi trong db", true, (db.sessions || 0) + " phiên · " + (db.students || 0) + " em") +
+      row("MediaPipe / YOLO / OpenCV", false, "Chạy ở màn đo, không ở trang này") +
+      row("Model khuôn mặt", false, "Không cần ở trang đọc kết quả") +
+      row("Camera", false, "Mở màn đo để đo bằng webcam") +
+      row("Bảng cảnh báo", false, "Bản web/app không ghi alerts") +
+      row("Mạng nội bộ lớp", false, "Giai đoạn 3") +
+      row("Đám mây (Firebase)", false, "Không dùng") +
+      row("Bậc sản phẩm", true, "Không áp dụng cho bản web");
+  }
   // Bản web DEMO không cài Python/MediaPipe trong trình duyệt: engine mô phỏng của
   // hosted-bridge.js mới là thứ chạy, nên nhãn phải nói đúng "mô phỏng", không đổ lỗi
   // "chưa cài" như máy thật (trông như hỏng app trong khi demo vẫn chạy đủ chức năng).
@@ -547,17 +634,25 @@ function syncStream(imgId, emptyId, fpsId) {
     let msg = window.FC_MODE === "demo"
       ? "Camera demo chưa bật. Bấm <b>Bắt đầu</b> để chạy mô phỏng lớp học ngay trong trình duyệt."
       : "Camera chưa bật. Bấm <b>Bắt đầu</b> để đo bằng webcam máy này.";
-    if (cam && cam.error) msg = "<b>Camera gặp lỗi:</b> " + esc(cam.error);
-    if (window.FC_MODE !== "demo") {
-      const miss = [];
-      if (S.system && S.system.deps) {
-        if (!S.system.deps.mediapipe) miss.push("mediapipe");
-        if (!S.system.deps.ultralytics) miss.push("ultralytics");
-      }
-      if (miss.length) msg += "<br><br>Thiếu thư viện: <b>" + miss.join(", ") +
-        "</b><br>Cài: <code>python -m pip install " + miss.join(" ") + "</code>";
-      if (S.system && S.system.model && !S.system.model.present) {
-        msg += "<br><br>Thiếu model <b>face_landmarker.task</b> (chép từ app Android sang thư mục dự án).";
+    if (window.FC_MODE === "web") {
+      // Không có camera ở trang đọc kết quả, và cũng không có "lỗi" nào để báo: nói đúng chỗ đo thật.
+      msg = 'Trang này chỉ <b>ĐỌC</b> kết quả đã đo, không mở camera. ' +
+        (MEASURE_HREF
+          ? '<a href="' + MEASURE_HREF + '"><b>Mở màn đo</b></a> để đo thật bằng webcam máy này — đo xong bấm Dừng rồi quay lại đây xem báo cáo.'
+          : "Bản dashboard-only không có màn đo đi kèm; muốn đo thì chạy app PC hoặc bản web đầy đủ.");
+    } else {
+      if (cam && cam.error) msg = "<b>Camera gặp lỗi:</b> " + esc(cam.error);
+      if (window.FC_MODE !== "demo") {
+        const miss = [];
+        if (S.system && S.system.deps) {
+          if (!S.system.deps.mediapipe) miss.push("mediapipe");
+          if (!S.system.deps.ultralytics) miss.push("ultralytics");
+        }
+        if (miss.length) msg += "<br><br>Thiếu thư viện: <b>" + miss.join(", ") +
+          "</b><br>Cài: <code>python -m pip install " + miss.join(" ") + "</code>";
+        if (S.system && S.system.model && !S.system.model.present) {
+          msg += "<br><br>Thiếu model <b>face_landmarker.task</b> (chép từ app Android sang thư mục dự án).";
+        }
       }
     }
     empty.innerHTML = "<div>" + ico("camera") + "<div>" + msg + "</div></div>";
@@ -609,6 +704,14 @@ function wireCameraButtons(prefix, wrapId) {
   $(prefix + "-full").onclick = () => fullscreen($(wrapId));
 }
 
+// Web/app has no camera on this page: a "Bắt đầu" button that can only ever refuse is a fake affordance,
+// so the control row becomes the link to the screen that actually measures.
+function measureLinkRow() {
+  return MEASURE_HREF
+    ? '<div class="cam-buttons mt"><a class="btn btn-primary" href="' + MEASURE_HREF + '">' + ico("camera") + " Mở màn đo</a></div>"
+    : '<div class="lock-note mt">' + ico("info") + " Bản dashboard-only không có màn đo đi kèm — chạy app PC hoặc bản web đầy đủ để đo.</div>";
+}
+
 /* ============================== màn 1: Tổng quan ============================== */
 function renderOverview() {
   $("view").innerHTML =
@@ -625,7 +728,7 @@ function renderOverview() {
     '<div class="card"><h3>' + ico("camera") + 'Camera thời gian thực</h3>' +
     '<div class="cam-wrap" id="ov-wrap"><img id="ov-stream" alt="Luồng camera" hidden>' +
     '<div class="cam-empty" id="ov-empty"></div><span class="fps-chip" id="ov-fps" hidden></span></div>' +
-    cameraButtons("ov") + '<div class="avg-note" id="ov-cam-note"></div></div>' +
+    (window.FC_MODE === "web" ? measureLinkRow() : cameraButtons("ov")) + '<div class="avg-note" id="ov-cam-note"></div></div>' +
     '<div class="card"><h3>' + ico("target") + 'Chỉ số trung bình lớp</h3><div id="ov-avgs"></div>' +
     '<div class="avg-note" id="ov-avg-note"></div></div>' +
     '<div class="card"><h3>' + ico("chart") + 'Xu hướng chú ý 30 phút</h3><div id="ov-trend"></div>' +
@@ -636,7 +739,7 @@ function renderOverview() {
     '<div class="card"><h3>' + ico("info") + 'Trạng thái hệ thống</h3><div id="ov-system"></div></div>' +
     "</div>";
   $("ov-date").onchange = (e) => { S.date = e.target.value || todayStr(); tickFast(); };
-  wireCameraButtons("ov", "ov-wrap");
+  if (window.FC_MODE !== "web") wireCameraButtons("ov", "ov-wrap");
   updateOverviewParts();
   $("ov-trend").innerHTML = trendChart(S.trend);
   $("ov-system").innerHTML = systemRows();
@@ -679,6 +782,7 @@ function updateOverviewParts() {
 
 /* ============================== màn 2: Camera ============================== */
 function renderCamera() {
+  if (window.FC_MODE === "web") { renderWebCamera(); return; }
   const cc = (S.system && S.system.camera_cfg) || {sensitivity: 1, max_active_faces: 10, process_width: 640, detect_fps: 8};
   const opt = (S.live && S.live.camera && S.live.camera.options) || {boxes: true, overlay: false, brighten: false};
   const sel = (id, opts, cur) => '<select id="' + id + '">' + opts.map(([v, l]) =>
@@ -732,13 +836,48 @@ function switchRow(id, label, checked) {
     '<input type="checkbox" id="' + id + '"' + (checked ? " checked" : "") + "><i></i></label></div>";
 }
 
+/* Web/app: the camera and every measurement knob live on the measurement screen. This page has no
+   config.yaml to read, so editable selects here would show invented defaults as if they were measured. */
+function renderWebCamera() {
+  const db = (S.system && S.system.database) || {};
+  const knob = (label, where) => '<div class="sys-row"><span>' + label + '</span><span class="muted">' + where + "</span></div>";
+  $("view").innerHTML =
+    '<div class="page-head"><div><h2>' + ico("camera") + 'Camera</h2>' +
+    "<p>Trang này chỉ đọc kết quả đã đo. Camera và thông số đo nằm ở màn đo.</p></div></div>" +
+    '<div class="grid grid-camera">' +
+    '<div class="card"><h3>' + ico("camera") + 'Hình camera trực tiếp</h3>' +
+    '<div class="cam-wrap" id="cam-wrap"><img id="cam-stream" alt="Luồng camera" hidden>' +
+    '<div class="cam-empty" id="cam-empty"></div><span class="fps-chip" id="cam-fps" hidden></span></div>' +
+    measureLinkRow() +
+    '<div class="avg-note" id="cam-status-note"></div></div>' +
+    '<div><div class="card"><h3>' + ico("settings") + 'Thông số đo — đặt ở màn đo</h3>' +
+    knob("Mở / dừng camera", 'Nút "Mở camera" ở màn đo') +
+    knob("Số mặt đo cùng lúc", 'Ô "Số mặt" — có hiệu lực từ lần mở camera kế tiếp') +
+    knob("Ghi phiên cho nhiều em", 'Công tắc "Ghi cùng lúc"') +
+    knob("Độ nhạy cảnh báo", 'Nút "Độ nhạy"') +
+    knob("Danh sách em / gắn tên", 'Nút "Nhập danh sách" và enrol ở màn đo') +
+    '<div class="lock-note mt">' + ico("lock") + " Trang này không ghi config.yaml và không giữ camera: " +
+    "nó mở tệp db đã đo xong, nên đổi thông số ở đây không có tác dụng.</div></div>" +
+    '<div class="card mt"><h3>' + ico("database") + 'Số đo đang đọc</h3>' +
+    '<div class="sys-row"><span>Nơi đọc</span><span>' + esc(db.path || "SQLite của máy này") + "</span></div>" +
+    '<div class="sys-row"><span>Đã ghi</span><span>' + (db.sessions || 0) + " phiên · " + (db.students || 0) + " em</span></div>" +
+    '<div class="sys-row"><span>Cảnh báo</span><span class="muted">Bản web/app không ghi bảng alerts</span></div>' +
+    "</div></div></div>";
+  updateCameraParts();
+}
+
 function updateCameraParts() {
-  if (!$("cam-people")) return;
+  if (!$("cam-stream")) return;
   syncStream("cam-stream", "cam-empty", "cam-fps");
   const cam = (S.live && S.live.camera) || {};
-  $("cam-status-note").textContent = cam.running
-    ? "Đang chạy · " + cam.frames + " khung đã xử lý · " + num(cam.processing_ms, 0) + " ms/khung · " + cam.people + " người trong khung."
-    : (cam.error ? "Lỗi: " + cam.error : "Camera chưa bật.");
+  if ($("cam-status-note")) {
+    $("cam-status-note").textContent = window.FC_MODE === "web"
+      ? "Không có luồng camera ở trang này — số bên dưới lấy từ db đã đo xong."
+      : cam.running
+        ? "Đang chạy · " + cam.frames + " khung đã xử lý · " + num(cam.processing_ms, 0) + " ms/khung · " + cam.people + " người trong khung."
+        : (cam.error ? "Lỗi: " + cam.error : "Camera chưa bật.");
+  }
+  if (!$("cam-people")) return;
   const people = (S.live && S.live.people) || [];
   if (S.hidePeople) { $("cam-people").innerHTML = ""; return; }
   if (!cam.running || !people.length) {
@@ -749,9 +888,9 @@ function updateCameraParts() {
   $("cam-people").innerHTML = people.map((p) => {
     const sit = SIT_LABEL[p.situation] || ["--", "warn"];
     const seiColor = p.sei == null ? "var(--ink-soft)" : p.sei >= 70 ? "var(--green)" : p.sei >= 45 ? "var(--orange)" : "var(--red)";
-    // Nút gắn tên chỉ có ở LIVE: DEMO là người mô phỏng, không có track thật để khai báo.
+    // Nút gắn tên chỉ có ở LIVE: DEMO là người mô phỏng, bản web chỉ đọc db, không có track thật để khai báo.
     let bindRow = "";
-    if (window.FC_MODE !== "demo") {
+    if (window.FC_MODE === "live") {
       if (!p.student_id) {
         bindRow = '<div class="person-bind"><button class="btn btn-sm btn-primary" data-bind="' + p.track_id + '">' +
           ico("edit") + " Gắn tên</button>" +
@@ -807,7 +946,11 @@ async function startCamera() {
 }
 async function stopCamera() {
   try {
-    await api("/api/camera/stop", {});
+    const r = await api("/api/camera/stop", {});
+    if (r && r.ok === false) {
+      toast((r.error || "Không dừng được camera") + (r.hint ? " — " + r.hint : ""), "err");
+      return;
+    }
     toast(window.FC_MODE === "demo" ? "Đã dừng camera demo" : "Đã dừng camera — các phiên đang đo được chốt vào SQLite", "ok");
     await tickFast();
   } catch (e) { toast(e.message, "err"); }
@@ -872,21 +1015,32 @@ async function screenshot() {
 /* ============================== màn 3: Học sinh ============================== */
 async function renderStudents() {
   const canCsv = allows("csv_export");
+  const web = window.FC_MODE === "web";
   $("view").innerHTML =
     '<div class="page-head"><div><h2>' + ico("users") + "Học sinh</h2>" +
-    "<p>Thêm/sửa/xóa, nhập xuất danh sách, quản lý đồng ý. Rút đồng ý là xóa vector mặt ngay.</p></div></div>" +
+    "<p>" + (web
+      ? "Danh sách em đọc từ SQLite của máy này. " + (MEASURE_HREF
+          ? "Thêm/sửa em làm ở màn đo — trang này chỉ đọc để không ghi đè phiên đang đo."
+          : "Trang này chỉ đọc; bản dashboard-only không có màn đo để thêm em.")
+      : "Thêm/sửa/xóa, nhập xuất danh sách, quản lý đồng ý. Rút đồng ý là xóa vector mặt ngay.") + "</p></div></div>" +
     '<div class="card"><div class="toolbar">' +
     '<input class="search" id="stu-search" placeholder="Tìm theo tên hoặc mã…" value="' + esc(S.studentQuery) + '">' +
     '<span class="spacer"></span>' +
-    '<button class="btn btn-primary" id="stu-add">' + ico("plus") + " Thêm học sinh</button>" +
-    '<button class="btn" id="stu-import">' + ico("upload") + " Nhập CSV</button>" +
+    (web
+      ? (MEASURE_HREF
+          ? '<a class="btn btn-primary" href="' + MEASURE_HREF + '">' + ico("camera") + " Mở màn đo để thêm em</a>"
+          : '<span class="muted small">Thêm em ở màn đo của app PC / bản web đầy đủ.</span>')
+      : '<button class="btn btn-primary" id="stu-add">' + ico("plus") + " Thêm học sinh</button>" +
+        '<button class="btn" id="stu-import">' + ico("upload") + " Nhập CSV</button>") +
     '<button class="btn" id="stu-export"' + (canCsv ? "" : ' disabled title="Cần bậc Pro trở lên — đổi trong Cài đặt"') + ">" +
     ico("download") + " Xuất CSV</button></div>" +
     (canCsv ? "" : '<div class="lock-note">' + ico("lock") + " Xuất CSV cần bậc Pro trở lên (đổi bậc trong Cài đặt).</div>") +
     '<div id="students-body" class="mt"></div></div>';
   $("stu-search").oninput = (e) => { S.studentQuery = e.target.value; fillStudentsTable(); };
-  $("stu-add").onclick = () => studentModal(null);
-  $("stu-import").onclick = importModal;
+  if (!web) {
+    $("stu-add").onclick = () => studentModal(null);
+    $("stu-import").onclick = importModal;
+  }
   $("stu-export").onclick = () => downloadCsv("/api/students/csv", "hoc_sinh_" + stamp() + ".csv");
   await loadStudents();
 }
@@ -899,11 +1053,15 @@ async function loadStudents() {
 function fillStudentsTable() {
   const body = $("students-body");
   if (!body) return;
+  const web = window.FC_MODE === "web";
   const q = S.studentQuery.trim().toLowerCase();
   const list = S.students.filter((s) => !q || s.name.toLowerCase().includes(q) || s.student_id.toLowerCase().includes(q));
   if (!list.length) {
-    body.innerHTML = '<div class="chart-empty">Chưa có học sinh nào' + (q ? " khớp tìm kiếm" : "") +
-      ". Bấm <b>Thêm học sinh</b> hoặc <b>Nhập CSV</b>.</div>";
+    body.innerHTML = '<div class="chart-empty">' + (web
+      ? (q ? "Không có em nào khớp tìm kiếm."
+           : "Chưa có em nào trong db của máy này. Mở màn đo, gắn tên cho một em rồi đo một phiên — em sẽ hiện ở đây.")
+      : 'Chưa có học sinh nào' + (q ? " khớp tìm kiếm" : "") +
+        ". Bấm <b>Thêm học sinh</b> hoặc <b>Nhập CSV</b>.") + "</div>";
     return;
   }
   body.innerHTML = '<table class="tbl"><thead><tr><th>Mã</th><th>Tên</th><th>Năm sinh</th><th>Giới tính</th>' +
@@ -912,15 +1070,20 @@ function fillStudentsTable() {
       "<tr><td><b>" + esc(s.student_id) + "</b></td>" +
       '<td><a href="#analysis" data-sid="' + esc(s.student_id) + '" class="stu-link">' + esc(s.name) + "</a></td>" +
       "<td>" + (s.birth_year || "--") + "</td><td>" + esc(s.gender || "--") + "</td>" +
-      '<td><label class="switch"><input type="checkbox" data-consent="' + esc(s.student_id) + '"' +
-      (s.consent ? " checked" : "") + '><i></i></label></td>' +
+      (web ? '<td><span class="muted small">không có bảng này</span></td>'
+           : '<td><label class="switch"><input type="checkbox" data-consent="' + esc(s.student_id) + '"' +
+             (s.consent ? " checked" : "") + '><i></i></label></td>') +
       "<td>" + s.sessions + "</td><td>" + num(s.sei_mean, 1) + "</td>" +
       "<td>" + fmtDateTime(s.last_session_ms) + "</td>" +
-      '<td style="white-space:nowrap"><button class="btn btn-sm" data-edit="' + esc(s.student_id) + '">' + ico("edit") + "</button> " +
-      '<button class="btn btn-sm btn-danger" data-del="' + esc(s.student_id) + '">' + ico("trash") + "</button></td></tr>").join("") +
+      (web ? "<td></td>"
+           : '<td style="white-space:nowrap"><button class="btn btn-sm" data-edit="' + esc(s.student_id) + '">' + ico("edit") + "</button> " +
+             '<button class="btn btn-sm btn-danger" data-del="' + esc(s.student_id) + '">' + ico("trash") + "</button></td>") +
+      "</tr>").join("") +
     "</tbody></table>" +
-    '<div class="avg-note mt">Đồng ý = phụ huynh/nhà trường cho phép nhận diện và lưu vector mặt (chỉ lưu vector, không lưu ảnh). ' +
-    "Rút đồng ý sẽ xóa vector ngay lập tức.</div>";
+    '<div class="avg-note mt">' + (web
+      ? "Số phiên và SEI TB là số đo thật trong SQLite của máy này. Cột Đồng ý chỉ có ở bản Python cục bộ (bảng student_consent); bản web/app không ghi bảng đó."
+      : "Đồng ý = phụ huynh/nhà trường cho phép nhận diện và lưu vector mặt (chỉ lưu vector, không lưu ảnh). " +
+        "Rút đồng ý sẽ xóa vector ngay lập tức.") + "</div>";
   for (const el of body.querySelectorAll("[data-consent]")) {
     el.onchange = () => consentModal(el.dataset.consent, el.checked, el);
   }
@@ -1057,14 +1220,21 @@ async function renderAnalysis() {
 async function loadAnalysis() {
   const body = $("analysis-body");
   if (!body) return;
-  if (!S.analysisSid) { body.innerHTML = '<div class="chart-empty">Chưa có học sinh. Thêm em ở màn Học sinh trước.</div>'; return; }
+  if (!S.analysisSid) {
+    body.innerHTML = '<div class="chart-empty">' + (window.FC_MODE === "web"
+      ? "Chưa có học sinh trong db của máy này. " + measureHint(", gắn tên cho một em rồi đo một phiên.")
+      : "Chưa có học sinh. Thêm em ở màn Học sinh trước.") + "</div>";
+    return;
+  }
   body.innerHTML = '<div class="muted small">Đang tải…</div>';
   try {
     const [data, detail] = await Promise.all([
       api("/api/analysis?id=" + encodeURIComponent(S.analysisSid) + "&scope=" + S.analysisScope),
       api("/api/student?id=" + encodeURIComponent(S.analysisSid))]);
     const stu = S.students.find((s) => s.student_id === S.analysisSid) || {name: S.analysisSid};
-    let band = null, baseHtml = '<div class="muted small">Chưa có baseline cá nhân (cần bậc Pro và đủ phiên đo).</div>';
+    let band = null, baseHtml = '<div class="muted small">' + (window.FC_MODE === "web"
+      ? "Chưa có baseline cá nhân trong db — cần đủ phiên đo của chính em để dựng khoảng tin cậy."
+      : "Chưa có baseline cá nhân (cần bậc Pro và đủ phiên đo).") + "</div>";
     if (detail.baseline) {
       try {
         const fj = JSON.parse(detail.baseline.features_json || "{}");
@@ -1084,7 +1254,9 @@ async function loadAnalysis() {
       const pts = data.points || [];
       chart = pts.length
         ? lineChart(pts.map((p) => p.sei), pts.map((p) => fmtTime(p.at_ms)), {yMin: 0, yMax: 100, band})
-        : '<div class="chart-empty">Phiên gần nhất chưa có chuỗi phút (bảng metrics). Lõi camera sẽ ghi chuỗi này ở bước nối tiếp theo; dữ liệu mẫu có sẵn để xem hình dạng biểu đồ.</div>';
+        : '<div class="chart-empty">' + (window.FC_MODE === "web"
+            ? "Bản web/app không ghi chuỗi phút (bảng metrics) — db chỉ có SEI trung bình của mỗi phiên. Chọn tab <b>Theo buổi</b> để xem số đã đo."
+            : "Phiên gần nhất chưa có chuỗi phút (bảng metrics). Lõi camera sẽ ghi chuỗi này ở bước nối tiếp theo; dữ liệu mẫu có sẵn để xem hình dạng biểu đồ.") + "</div>";
     } else {
       const pts = data.points || [];
       chart = pts.length
@@ -1124,9 +1296,13 @@ async function renderAlerts() {
   if (!S.students.length) { try { S.students = await api("/api/students"); } catch (e) { S.students = []; } }
   const f = S.alertFilter;
   const kinds = Object.keys(KIND_LABEL);
+  const web = window.FC_MODE === "web";
   $("view").innerHTML =
     '<div class="page-head"><div><h2>' + ico("bell") + "Cảnh báo</h2>" +
     "<p>Mức 1 (nhắc nhẹ) · Mức 2 (cần để ý) · Mức 3 (buồn ngủ / nguy hiểm). Lọc và đánh dấu đã xem.</p></div></div>" +
+    (web ? '<div class="lock-note">' + ico("info") +
+      " Bản web/app đọc bảng <b>alerts</b> trong db nhưng không tự ghi cảnh báo: màn đo chỉ ghi phiên và chỉ số. " +
+      'Danh sách trống nghĩa là chưa có cảnh báo nào được ghi, không phải lỗi. Muốn có cảnh báo thật thì chạy bản Python cục bộ rồi bấm <b>Kết nối LIVE</b>.</div>' : "") +
     '<div class="card"><div class="toolbar">' +
     '<select id="al-student"><option value="">Tất cả học sinh</option>' + S.students.map((s) =>
       '<option value="' + esc(s.student_id) + '"' + (f.student === s.student_id ? " selected" : "") + ">" + esc(s.name) + "</option>").join("") + "</select>" +
@@ -1140,7 +1316,7 @@ async function renderAlerts() {
     '<span class="spacer"></span>' +
     '<label class="small" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="al-sound"' +
     (S.soundOn ? " checked" : "") + "> Âm báo</label>" +
-    '<button class="btn" id="al-seen-all">' + ico("check") + " Tất cả đã xem</button></div>" +
+    '<button class="btn" id="al-seen-all"' + (web ? ' disabled title="Bản web chỉ đọc db, không ghi đè lên phiên đang đo ở màn đo"' : "") + '>' + ico("check") + " Tất cả đã xem</button></div>" +
     '<div id="alerts-list"></div></div>';
   const reload = () => {
     S.alertFilter = {student: $("al-student").value, kind: $("al-kind").value, level: $("al-level").value,
@@ -1167,7 +1343,9 @@ async function loadAlerts() {
   try {
     const alerts = await api("/api/alerts" + (qs ? "?" + qs : ""));
     if (!alerts.length) {
-      list.innerHTML = '<div class="chart-empty">Không có cảnh báo nào khớp bộ lọc.</div>';
+      list.innerHTML = '<div class="chart-empty">' + (window.FC_MODE === "web"
+        ? "Db của máy này chưa có cảnh báo nào (bản web/app không ghi bảng alerts). Không có số liệu mẫu để thay vào."
+        : "Không có cảnh báo nào khớp bộ lọc.") + "</div>";
       return;
     }
     list.innerHTML = alerts.map((a) => {
@@ -1283,55 +1461,74 @@ async function loadReport() {
 
 /* ============================== màn 7: Sao lưu ============================== */
 async function renderBackup() {
+  const web = window.FC_MODE === "web";
   const canAuto = allows("auto_backup");
   const st = S.settings;
+  const wi = (S.overview && S.overview.web_info) || {};
+  const sysDb = (S.system && S.system.database) || {};
   $("view").innerHTML =
     '<div class="page-head"><div><h2>' + ico("database") + "Sao lưu & lưu trữ</h2>" +
-    "<p>Sao lưu/khôi phục bằng API backup của SQLite (an toàn cả khi đang đo). Có thể chép thư mục backups/ ra USB.</p></div></div>" +
+    "<p>" + (web
+      ? "Bản web/app: nút bên phải xuất CHÍNH tệp SQLite đang chứa số đo của máy này và tải xuống trình duyệt. Trang tĩnh nên không có thư mục backups/ trên máy chủ."
+      : window.FC_MODE === "demo"
+      ? "Bản DEMO trong trình duyệt: “sao lưu” là ảnh chụp bộ số mẫu đang nằm trong tab này, không có file .db trên đĩa và tải lại trang là mất."
+      : "Sao lưu/khôi phục bằng API backup của SQLite (an toàn cả khi đang đo). Có thể chép thư mục backups/ ra USB.") + "</p></div></div>" +
     '<div class="grid grid-2">' +
     '<div class="card"><h3>' + ico("save") + "Sao lưu thủ công</h3>" +
-    '<button class="btn btn-primary" id="bk-now">' + ico("save") + " Sao lưu ngay</button>" +
+    '<button class="btn btn-primary" id="bk-now">' + ico("save") + (web ? " Tải tệp .db ngay" : " Sao lưu ngay") + "</button>" +
     '<div id="backup-list" class="mt"></div></div>' +
-    '<div class="card"><h3>' + ico("settings") + "Tự động & thời gian lưu</h3>" +
-    switchRow("bk-auto", "Sao lưu tự động theo lịch (Pro)", st.auto_backup === "1") +
-    (canAuto ? "" : '<div class="lock-note mt">' + ico("lock") + " Sao lưu tự động cần bậc Pro trở lên. Bản standard sao lưu thủ công ở nút bên.</div>") +
-    '<div class="field mt"><label>Thời gian lưu dữ liệu (ngày) — tự xóa phiên quá hạn</label>' +
-    '<input type="number" id="bk-retention" min="1" value="' + esc(st.retention_days || "180") + '"></div>' +
-    '<button class="btn" id="bk-retention-save">' + ico("check") + " Lưu thời gian lưu</button>" +
-    '<div class="lock-note mt">Dữ liệu quá hạn bị dọn khi lưu cài đặt và mỗi lần mở app. Xóa học sinh (chuyển trường) xóa dây chuyền ngay ở màn Học sinh.</div></div>' +
+    (web
+      ? '<div class="card"><h3>' + ico("info") + "Nguồn dữ liệu thật</h3>" +
+        '<div class="sys-row"><span>Nơi đọc</span><span>' + esc(wi.where || sysDb.path || "SQLite của máy này") + "</span></div>" +
+        '<div class="sys-row"><span>Dung lượng db</span><span>' + fmtBytes(wi.bytes || sysDb.bytes || 0) + "</span></div>" +
+        '<div class="sys-row"><span>Đã ghi</span><span>' + (wi.sessions || 0) + " phiên · " + (wi.students || 0) + " em</span></div>" +
+        '<div class="lock-note mt">' + ico("lock") + " Trang này chỉ ĐỌC. Thêm/sửa em và ngưỡng đo làm ở màn đo; cảnh báo, đồng ý, khôi phục làm ở bản Python cục bộ. Ghi từ đây sẽ đè mất phiên đang đo.</div>" +
+        (MEASURE_HREF ? '<div class="cam-buttons mt"><a class="btn" href="' + MEASURE_HREF + '">' + ico("camera") + " Mở màn đo</a></div>" : "") + "</div>"
+      : '<div class="card"><h3>' + ico("settings") + "Tự động & thời gian lưu</h3>" +
+        switchRow("bk-auto", "Sao lưu tự động theo lịch (Pro)", st.auto_backup === "1") +
+        (canAuto ? "" : '<div class="lock-note mt">' + ico("lock") + " Sao lưu tự động cần bậc Pro trở lên. Bản standard sao lưu thủ công ở nút bên.</div>") +
+        '<div class="field mt"><label>Thời gian lưu dữ liệu (ngày) — tự xóa phiên quá hạn</label>' +
+        '<input type="number" id="bk-retention" min="1" value="' + esc(st.retention_days || "180") + '"></div>' +
+        '<button class="btn" id="bk-retention-save">' + ico("check") + " Lưu thời gian lưu</button>" +
+        '<div class="lock-note mt">Dữ liệu quá hạn bị dọn khi lưu cài đặt và mỗi lần mở app. Xóa học sinh (chuyển trường) xóa dây chuyền ngay ở màn Học sinh.</div></div>') +
     "</div>" +
-    '<div class="card mt"><h3>' + ico("info") + "Dữ liệu mẫu (DEMO)</h3>" +
-    "<p class=\"muted small\">Bộ số mẫu có gắn nhãn để nghiệm thu giao diện khi chưa đo thật: 5 em \"HS Mẫu\", 6 buổi/em, cảnh báo và biểu đồ 30 phút. " +
-    "Mọi dòng mẫu đều đánh dấu DEMO; nút xóa chỉ đụng dấu vết đó, không xóa dữ liệu thật.</p>" +
-    '<div class="cam-buttons"><button class="btn" id="bk-seed">' + ico("upload") + " Nạp dữ liệu mẫu</button>" +
-    '<button class="btn btn-danger" id="bk-purge">' + ico("trash") + " Xóa dữ liệu mẫu</button></div></div>";
+    (web ? "" :
+      '<div class="card mt"><h3>' + ico("info") + "Dữ liệu mẫu (DEMO)</h3>" +
+      "<p class=\"muted small\">Bộ số mẫu có gắn nhãn để nghiệm thu giao diện khi chưa đo thật: 5 em \"HS Mẫu\", 6 buổi/em, cảnh báo và biểu đồ 30 phút. " +
+      "Mọi dòng mẫu đều đánh dấu DEMO; nút xóa chỉ đụng dấu vết đó, không xóa dữ liệu thật.</p>" +
+      '<div class="cam-buttons"><button class="btn" id="bk-seed">' + ico("upload") + " Nạp dữ liệu mẫu</button>" +
+      '<button class="btn btn-danger" id="bk-purge">' + ico("trash") + " Xóa dữ liệu mẫu</button></div></div>");
   $("bk-now").onclick = async () => {
     try {
       const r = await api("/api/backup", {});
-      if (r.ok) { toast("Đã sao lưu: " + r.file + " (" + fmtBytes(r.bytes) + ")", "ok"); loadBackups(); }
-      else toast(r.error || "Lỗi sao lưu", "err");
+      if (r.ok) {
+        toast((r.downloaded ? "Đã tải tệp .db: " : "Đã sao lưu: ") + r.file + " (" + fmtBytes(r.bytes) + ")", "ok");
+        loadBackups();
+      } else toast((r.error || "Lỗi sao lưu") + (r.hint ? " — " + r.hint : ""), "err");
     } catch (e) { toast(e.message, "err"); }
   };
-  const auto = $("bk-auto");
-  if (!canAuto) auto.disabled = true;
-  auto.onchange = async (e) => {
-    try {
-      const r = await api("/api/settings", {auto_backup: e.target.checked ? "1" : "0"});
-      if (r.ok) { S.settings.auto_backup = e.target.checked ? "1" : "0"; toast("Đã lưu", "ok"); }
-      else { e.target.checked = !e.target.checked; toast(r.error || "Lỗi", "err"); }
-    } catch (err) { e.target.checked = !e.target.checked; toast(err.message, "err"); }
-  };
-  $("bk-retention-save").onclick = async () => {
-    const days = parseInt($("bk-retention").value, 10);
-    if (!days || days < 1) { toast("Số ngày phải >= 1", "err"); return; }
-    try {
-      const r = await api("/api/settings", {retention_days: String(days)});
-      if (r.ok) { S.settings.retention_days = String(days); toast("Đã lưu. Phiên quá hạn đã được dọn.", "ok"); tickFast(); }
-      else toast(r.error || "Lỗi", "err");
-    } catch (e) { toast(e.message, "err"); }
-  };
-  $("bk-seed").onclick = seedDemo;
-  $("bk-purge").onclick = purgeDemo;
+  if (!web) {
+    const auto = $("bk-auto");
+    if (!canAuto) auto.disabled = true;
+    auto.onchange = async (e) => {
+      try {
+        const r = await api("/api/settings", {auto_backup: e.target.checked ? "1" : "0"});
+        if (r.ok) { S.settings.auto_backup = e.target.checked ? "1" : "0"; toast("Đã lưu", "ok"); }
+        else { e.target.checked = !e.target.checked; toast(r.error || "Lỗi", "err"); }
+      } catch (err) { e.target.checked = !e.target.checked; toast(err.message, "err"); }
+    };
+    $("bk-retention-save").onclick = async () => {
+      const days = parseInt($("bk-retention").value, 10);
+      if (!days || days < 1) { toast("Số ngày phải >= 1", "err"); return; }
+      try {
+        const r = await api("/api/settings", {retention_days: String(days)});
+        if (r.ok) { S.settings.retention_days = String(days); toast("Đã lưu. Phiên quá hạn đã được dọn.", "ok"); tickFast(); }
+        else toast(r.error || "Lỗi", "err");
+      } catch (e) { toast(e.message, "err"); }
+    };
+    $("bk-seed").onclick = seedDemo;
+    $("bk-purge").onclick = purgeDemo;
+  }
   loadBackups();
 }
 
@@ -1340,11 +1537,19 @@ async function loadBackups() {
   if (!list) return;
   try {
     const files = await api("/api/backups");
-    if (!files.length) { list.innerHTML = '<div class="muted small">Chưa có bản sao lưu nào trong thư mục backups/.</div>'; return; }
+    const web = window.FC_MODE === "web";
+    if (!files.length) {
+      list.innerHTML = '<div class="muted small">' + (web
+        ? "Chưa tải tệp .db nào trong tab này. Bấm nút bên trên để tải bản sao số đo thật."
+        : "Chưa có bản sao lưu nào trong thư mục backups/.") + "</div>";
+      return;
+    }
     list.innerHTML = '<table class="tbl"><thead><tr><th>File</th><th>Dung lượng</th><th>Lúc tạo</th><th></th></tr></thead><tbody>' +
       files.map((f) => "<tr><td>" + esc(f.file) + "</td><td>" + fmtBytes(f.bytes) + "</td>" +
         "<td>" + fmtDateTime(f.mtime_ms) + "</td>" +
-        '<td><button class="btn btn-sm" data-restore="' + esc(f.file) + '">' + ico("refresh") + " Khôi phục</button></td></tr>").join("") +
+        "<td>" + (web ? '<span class="muted small">đã tải xuống</span>'
+          : '<button class="btn btn-sm" data-restore="' + esc(f.file) + '">' + ico("refresh") + " Khôi phục</button>") +
+        "</td></tr>").join("") +
       "</tbody></table>";
     for (const btn of list.querySelectorAll("[data-restore]")) {
       btn.onclick = () => confirmModal("Khôi phục dữ liệu",
@@ -1381,7 +1586,37 @@ async function purgeDemo() {
 }
 
 /* ============================== màn 8: Cài đặt ============================== */
+/* Bản web/app không có config.yaml, không có bậc sản phẩm và không đếm cảnh báo: hiện đúng những
+   gì trang này làm được thay vì vẽ một biểu mẫu cài đặt rồi từ chối từng nút khi bấm. */
+function renderWebSettings() {
+  const wi = (S.overview && S.overview.web_info) || {};
+  $("view").innerHTML =
+    '<div class="page-head"><div><h2>' + ico("settings") + "Cài đặt</h2>" +
+    "<p>Trang này đọc số đo thật từ SQLite của máy này. Các cài đặt dưới đây chỉ tồn tại ở bản Python cục bộ.</p></div></div>" +
+    '<div class="grid grid-2">' +
+    '<div class="card"><h3>' + ico("info") + "Bản web chỉnh được gì</h3>" +
+    '<div class="sys-row"><span>Ngưỡng đo (EAR, MAR, SEI, khoảng cách…)</span><span>Chỉnh ở màn đo</span></div>' +
+    '<div class="sys-row"><span>Danh sách em / nhập CSV</span><span>Chỉnh ở màn đo</span></div>' +
+    '<div class="sys-row"><span>Cảnh báo, đồng ý, khôi phục</span><span>Bản Python cục bộ</span></div>' +
+    '<div class="sys-row"><span>Bậc sản phẩm (Standard/Pro/…)</span><span>Không áp dụng</span></div>' +
+    '<div class="sys-row"><span>Xuất CSV / in báo cáo / tải .db</span><span class="status-ok">Mở, không cần bậc</span></div>' +
+    '<div class="cam-buttons mt">' +
+    (MEASURE_HREF ? '<a class="btn btn-primary" href="' + MEASURE_HREF + '">' + ico("camera") + " Mở màn đo</a>" : "") +
+    '<button class="btn" id="set-live">' + ico("refresh") + " Kết nối LIVE</button></div></div>" +
+    '<div class="card"><h3>' + ico("database") + "Dữ liệu đang đọc</h3>" +
+    '<div class="sys-row"><span>Nơi đọc</span><span>' + esc(wi.where || "SQLite của máy này") + "</span></div>" +
+    '<div class="sys-row"><span>Số phiên</span><span>' + (wi.sessions || 0) + "</span></div>" +
+    '<div class="sys-row"><span>Số em</span><span>' + (wi.students || 0) + "</span></div>" +
+    '<div class="lock-note mt">' + ico("lock") + " Trang chỉ đọc để không ghi đè phiên đo đang mở. Muốn sửa danh sách em, dùng nút Nhập danh sách ở màn đo.</div></div>" +
+    "</div>" +
+    '<div class="card mt"><h3>' + ico("info") + "Nhật ký thao tác trong tab này</h3>" +
+    '<div id="audit-body"></div></div>';
+  $("set-live").onclick = connectLive;
+  $("audit-body").innerHTML = auditRows();
+}
+
 async function renderSettings() {
+  if (window.FC_MODE === "web") { renderWebSettings(); return; }
   const st = S.settings;
   const tiers = (S.system && S.system.tiers) || ["standard", "pro", "promax", "ultra"];
   const gates = (S.system && S.system.gates) || {};

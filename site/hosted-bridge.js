@@ -1,32 +1,46 @@
 /* FocusChangeAI - cau noi cho ban web hosted (Qoder Sites).
-   Hai che do, quyet dinh TRUOC khi app.js khoi dong (app.js cho FC_READY):
+   Ba che do, quyet dinh TRUOC khi app.js khoi dong (app.js cho FC_READY):
    - LIVE: may nguoi xem dang chay dashboard cuc bo (127.0.0.1:8730). Moi loi goi API
      chuyen thang ve do; server cuc bo da mo CORS cho Origin *.qoder.website.
-   - DEMO: khong thay server cuc bo -> mock toan bo API trong bo nho tu fixture co nhan
-     DEMO (chup tu server that), de mo link la thay ngay giao dien 8 man voi so lieu mau.
+   - WEB (mac dinh khi khong thay server cuc bo): webdb-bridge.js doc chinh tep SQLite 10 bang
+     ma man do / app da ghi tren may nay (IndexedDB hoac userData/focuschange.db). So that,
+     hoac trang thai trong trung thuc - khong bom so mau.
+   - DEMO: chi khi goi tuong minh ?mode=demo. Mock toan bo API tu fixture co nhan DEMO.
    Ban cuc bo khong co file nay: FC_API_BASE / FC_READY undefined => hanh vi nhu cu.
-   ?mode=demo / ?mode=live ep che do de nghiem thu. */
+   ?mode=live ep LIVE, ?mode=demo ep DEMO, ?mode=web ep doc SQLite bo qua do server cuc bo. */
 (function () {
   "use strict";
   var LOCAL = "http://127.0.0.1:8730";
   var forced = new URLSearchParams(location.search).get("mode");
+  // A simple GET from https to loopback is denied without prompting; a non-simple header forces
+  // a preflight so Chrome shows its one-time local-network Allow prompt instead of a silent block.
+  var PROBE_HEADERS = { "Content-Type": "application/json" };
 
   window.FC_READY = (async function () {
     var live = false;
     if (forced === "live") live = true;
-    else if (forced !== "demo") {
+    else if (forced !== "demo" && forced !== "web") {
       try {
         var ctl = new AbortController();
         var t = setTimeout(function () { ctl.abort(); }, 1500);
-        var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal });
+        var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal, headers: PROBE_HEADERS });
         clearTimeout(t);
         var j = await r.json();
         live = !!(j && j.app);
       } catch (e) { live = false; }
     }
-    window.FC_MODE = live ? "live" : "demo";
-    if (live) window.FC_API_BASE = LOCAL;
-    else installDemo();
+    if (live) {
+      window.FC_MODE = "live";
+      window.FC_API_BASE = LOCAL;
+    } else if (forced === "demo") {
+      window.FC_MODE = "demo";
+      installDemo();
+    } else {
+      // No Python dashboard on this machine: read the SQLite file the measurement screen / installed
+      // app already wrote here. Real rows or an honest empty state - never the fixture.
+      window.FC_MODE = "web";
+      await window.FC_WEBDB.install();
+    }
     // app.js init() chay ngay sau khi FC_READY resolve (microtask), nen setTimeout 0
     // dam bao buildShell() da dung thanh tren xong roi moi chen chip che do.
     setTimeout(paintHostedChip, 0);
@@ -35,26 +49,36 @@
   function paintHostedChip() {
     var top = document.querySelector(".top-right");
     if (!top || document.getElementById("hosted-chip")) return;
-    var live = window.FC_MODE === "live";
+    var mode = window.FC_MODE;
+    var live = mode === "live";
+    var wi = window.FC_WEBDB_INFO || {};
+    var sessions = (wi.counts && wi.counts.observation_sessions) || 0;
+    var real = mode === "web" && !!wi.ok && sessions > 0;
+    var dot = live || real ? "dot-green" : "dot-grey";
+    var label = live ? "Bản web · LIVE máy này"
+      : mode === "web" ? (real ? "Bản web · SỐ ĐO THẬT" : "Bản web · CHƯA CÓ DỮ LIỆU")
+      : "Bản web · DEMO";
+    var title = live ? "Trang web đang đọc số liệu thật từ dashboard chạy trên máy này."
+      : mode === "web" ? (sessions ? "Đọc " + sessions + " phiên đo thật từ " + (wi.where || "SQLite máy này") + "."
+        : "Chưa có phiên đo nào trên máy này. Mở màn đo để đo thật; trang không hiển thị số mẫu.")
+      : "Không thấy dashboard cục bộ: đang hiển thị dữ liệu mẫu trong trình duyệt.";
     var chip = document.createElement("span");
     chip.id = "hosted-chip";
     chip.className = "chip-db";
-    chip.title = live ? "Trang web dang doc so lieu that tu dashboard chay tren may nay."
-      : "Khong thay dashboard cuc bo: dang hien thi du lieu mau trong trinh duyet.";
-    chip.innerHTML = '<i class="dot ' + (live ? "dot-green" : "dot-grey") + '"></i>' +
-      (live ? "Bản web · LIVE máy này" : "Bản web · DEMO");
+    chip.title = title;
+    chip.innerHTML = '<i class="dot ' + dot + '"></i>' + label;
     top.insertBefore(chip, top.firstChild);
-    var mode = document.querySelector(".chip-mode");
-    if (mode) mode.innerHTML = '<i class="dot ' + (live ? "dot-green" : "dot-grey") + '"></i> Chế độ: <b>' +
-      (live ? "LIVE (máy cục bộ)" : "Xem trước trên web") + "</b>";
+    var modeChip = document.querySelector(".chip-mode");
+    if (modeChip) modeChip.innerHTML = '<i class="dot ' + dot + '"></i> Chế độ: <b>' +
+      (live ? "LIVE (máy cục bộ)" : mode === "web" ? "Web · SQLite máy này" : "Xem trước trên web") + "</b>";
     var banner = document.getElementById("demo-banner");
-    if (banner && !live) {
+    if (banner && mode === "demo") {
       // updateChips() vẽ lại banner mỗi nhịp; observer đổi lời dẫn sang bản web và
       // gắn lại nút kết nối / mở bản cục bộ (giữ nút "Xóa dữ liệu mẫu" của app.js).
       var decorate = function () {
         var b = banner.querySelector("span b");
         if (b && b.textContent.indexOf("DỮ LIỆU MẪU") === 0) {
-          b.parentNode.innerHTML = "<b>BẢN XEM TRƯỚC WEB (DEMO)</b> — lớp học mô phỏng trong trình duyệt, không phải số đo thật. Bấm <b>Bắt đầu</b> để chạy thử camera và mọi chức năng.";
+          b.parentNode.innerHTML = "<b>BẢN XEM TRƯỚC WEB (DEMO)</b> — lớp học mô phỏng trong trình duyệt, không phải số đo thật. Bấm <b>Bắt đầu</b> để chạy thử camera và mọi chức năng. Mọi thay đổi (thêm em, sửa cài đặt, sao lưu) chỉ sống trong tab này: <b>tải lại trang là về bộ số mẫu</b>.";
         }
         if (document.getElementById("demo-banner-connect")) return;
         var purge = document.getElementById("demo-banner-purge");
@@ -67,7 +91,7 @@
           try {
             var ctl = new AbortController();
             var t = setTimeout(function () { ctl.abort(); }, 2500);
-            var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal });
+            var r = await fetch(LOCAL + "/api/system", { signal: ctl.signal, headers: PROBE_HEADERS });
             clearTimeout(t);
             var j = await r.json();
             if (j && j.app) {
@@ -124,6 +148,7 @@
       return d;
     }
     var D = fresh();
+    var SNAPSHOTS = {};   // demo "backup files": in-memory snapshots keyed by file name
 
     /* ================= engine MÔ PHỎNG lớp học (chỉ ở chế độ DEMO) =================
        Bản web không chạy được Python/MediaPipe trong trình duyệt, nên DEMO dựng một
@@ -176,12 +201,12 @@
       SIM.people.forEach(function (p) {
         if (now > p.blink_at) { p.blink_until = now + 260; p.blink_at = now + rnd(2500, 6500); }
         if (now > p.yawn_at) { p.yawn_until = now + 1600; p.yawn_at = now + rnd(45000, 110000);
-          pushAlert(p, "YAWN", 1, "Ngáp dài — có thể đang mệt."); }
+          pushAlert(p, "YAWN", 2, "Ngáp dài — có thể đang mệt."); }
         if (now > p.away_at) { p.away_until = now + rnd(2500, 5000); p.away_at = now + rnd(25000, 70000);
           p.away_dir = Math.random() < 0.5 ? -1 : 1;
-          pushAlert(p, "LOOK_AWAY", 1, "Đầu đang quay lệch khỏi màn hình."); }
+          pushAlert(p, "LOOK_AWAY", 2, "Đầu đang quay lệch khỏi màn hình."); }
         if (now > p.doze_at) { p.doze_until = now + rnd(3000, 6000); p.doze_at = now + rnd(60000, 140000);
-          pushAlert(p, "DROWSY", 2, "Mắt nhắm quá lâu — có thể đang buồn ngủ!"); }
+          pushAlert(p, "DROWSY", 3, "Mắt nhắm quá lâu — có thể đang buồn ngủ!"); }
         var blinking = now < p.blink_until, dozing = now < p.doze_until,
           away = now < p.away_until, yawing = now < p.yawn_until;
         var earT = blinking || dozing ? 0.06 : 0.26 + 0.06 * Math.sin(now / 4000 + p.track_id);
@@ -341,7 +366,8 @@
         status: code || 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
     }
     function csvRes(text) {
-      return new Response(text, { status: 200, headers: { "Content-Type": "text/csv; charset=utf-8" } });
+      // BOM, like the server's utf-8-sig: without it Excel reads the Vietnamese columns as mojibake.
+      return new Response("\uFEFF" + text, { status: 200, headers: { "Content-Type": "text/csv; charset=utf-8" } });
     }
     function audit(action, detail) {
       D.audit.unshift({ at_ms: Date.now(), actor: "teacher (web)", action: action, detail: detail || "" });
@@ -387,44 +413,14 @@
       var src = (!date || date === todayStr()) ? D.reports : D.reports_empty;
       return src[scope] || src.day;
     }
-    function csvCell(v) {
-      var s = v == null ? "" : String(v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-    }
-    function studentsCsv() {
-      var header = (D.csv_students || "student_id,name,birth_year,gender,consent,sessions,sei_mean\n").split("\n")[0];
-      var cols = header.split(",");
-      var lines = [header];
-      D.students.forEach(function (s) {
-        lines.push(cols.map(function (c) { return csvCell(s[c]); }).join(","));
-      });
-      return lines.join("\n") + "\n";
-    }
-    function findStudent(id) {
-      return D.students.find(function (s) { return s.student_id === id; });
-    }
+    // Print columns, CSV quoting and HTML escaping live in report-shared.js so the demo, the
+    // real-data bridge and the Python server cannot drift apart.
+    var R = window.FC_REPORT;
+    function studentsCsv() { return R.studentsCsv(D.students); }
+    function reportsCsv(scope, date) { return R.reportsCsv(reportsFor(scope, date).rows || []); }
     function printHtml(scope, date) {
-      var data = reportsFor(scope, date);
-      var labels = { session: "Phiên đo", day: "Theo ngày", week: "Theo tuần" };
-      var rows = data.rows || data.sessions || data.items || [];
-      var keys = rows.length ? Object.keys(rows[0]) : [];
-      var html = "<!doctype html><html lang='vi'><head><meta charset='utf-8'><title>Báo cáo FocusChangeAI</title>" +
-        "<style>body{font-family:'Segoe UI',sans-serif;margin:32px;color:#16324f}h1{font-size:22px}" +
-        "table{border-collapse:collapse;width:100%;margin-top:14px;font-size:13px}" +
-        "th,td{border:1px solid #dbe7f4;padding:6px 9px;text-align:left}th{background:#eef4fb}" +
-        ".muted{color:#5b7691;font-size:12px}</style></head><body>" +
-        "<h1>FocusChangeAI — Báo cáo " + (labels[scope] || scope) + "</h1>" +
-        "<p class='muted'>Ngày " + (date || todayStr()) + " · BẢN XEM TRƯỚC WEB (DEMO) — số liệu mẫu, không phải số đo thật.</p>";
-      var s = data.summary || {};
-      html += "<table><tr>" + Object.keys(s).map(function (k) { return "<th>" + k + "</th>"; }).join("") + "</tr><tr>" +
-        Object.keys(s).map(function (k) { return "<td>" + (s[k] == null ? "--" : s[k]) + "</td>"; }).join("") + "</tr></table>";
-      if (rows.length) {
-        html += "<table><tr>" + keys.map(function (k) { return "<th>" + k + "</th>"; }).join("") + "</tr>" +
-          rows.map(function (r) {
-            return "<tr>" + keys.map(function (k) { return "<td>" + (r[k] == null ? "--" : r[k]) + "</td>"; }).join("") + "</tr>";
-          }).join("") + "</table>";
-      } else html += "<p class='muted'>Không có dòng dữ liệu nào cho phạm vi này.</p>";
-      return html + "</body></html>";
+      return R.printHtml(scope, date, reportsFor(scope, date),
+        "BẢN XEM TRƯỚC WEB (DEMO) — số liệu mẫu, không phải số đo thật.");
     }
 
     async function route(method, path, q, body) {
@@ -439,6 +435,17 @@
           case "/api/alerts": return jsonRes(filterAlerts(q));
           case "/api/settings": return jsonRes(D.settings);
           case "/api/camera/options": return jsonRes(DISP);
+          case "/api/camera/snapshot": {
+            // Same single-JPEG contract as the server endpoint, so the watchStream() fallback in
+            // app.js also works when the page is running the in-browser simulation.
+            if (!SIM.running) return jsonRes({ ok: false, error: "DEMO: camera chưa bật" }, 503);
+            drawFrame();
+            var b64 = cv.toDataURL("image/jpeg", 0.8).split(",")[1];
+            var bin = atob(b64), arr = new Uint8Array(bin.length);
+            for (var bi = 0; bi < bin.length; bi++) arr[bi] = bin.charCodeAt(bi);
+            return new Response(arr, { status: 200,
+              headers: { "Content-Type": "image/jpeg", "Cache-Control": "no-store" } });
+          }
           case "/api/students": return jsonRes(D.students);
           case "/api/student": return jsonRes(D.student[q.get("id")] || D.student_empty);
           case "/api/analysis": {
@@ -448,11 +455,8 @@
           case "/api/reports": return jsonRes(reportsFor(q.get("scope"), q.get("date")));
           case "/api/backups": return jsonRes(D.backups);
           case "/api/students/csv": return csvRes(studentsCsv());
-          case "/api/reports/csv": {
-            var full = D.csv_reports[q.get("scope")] || "";
-            if (!q.get("date") || q.get("date") === todayStr()) return csvRes(full);
-            return csvRes(full.split("\n")[0] + "\n");
-          }
+          case "/api/reports/csv":
+            return csvRes(reportsCsv(q.get("scope"), q.get("date")));
         }
         return jsonRes({ ok: false, error: "DEMO: không có tuyến " + path }, 404);
       }
@@ -470,7 +474,7 @@
             try {
               var ctl2 = new AbortController();
               var t2 = setTimeout(function () { ctl2.abort(); }, 2000);
-              var pr = await fetch(LOCAL + "/api/system", { signal: ctl2.signal });
+              var pr = await fetch(LOCAL + "/api/system", { signal: ctl2.signal, headers: PROBE_HEADERS });
               clearTimeout(t2);
               var pj = await pr.json();
               if (pj && pj.app) {
@@ -547,25 +551,38 @@
           syncOverview(); audit("alerts_seen_all");
           return jsonRes({ ok: true });
         case "/api/backup": {
+          // A browser tab has no filesystem, so the demo snapshot lives in memory. Same field names as
+          // backups_list()/do_backup() on the server, and the byte count is measured, not invented.
           var name = "focuschange_web_" + Date.now() + ".db";
-          var entry = Object.assign({}, D.backups[0] || {}, { name: name, size_bytes: 90112, created_at_ms: Date.now() });
-          D.backups.unshift(entry);
+          var snap = JSON.stringify(D);
+          SNAPSHOTS[name] = snap;
+          var bytes = new Blob([snap]).size;
+          D.backups.unshift({ file: name, bytes: bytes, mtime_ms: Date.now() });
           audit("backup", name);
-          return jsonRes({ ok: true, name: name });
+          return jsonRes({ ok: true, file: name, bytes: bytes });
         }
-        case "/api/restore":
-          simStop(); D = fresh(); syncOverview(); audit("restore", body.name || "");
+        case "/api/restore": {
+          var file = (body && body.file) || "";
+          var snap = SNAPSHOTS[file];
+          var keep = D.backups;   // backup files sit outside the database, so a restore keeps them
+          simStop();
+          D = snap ? JSON.parse(snap) : fresh();
+          D.backups = keep;
+          syncOverview(); audit("restore", file);
           return jsonRes({ ok: true });
+        }
         case "/api/demo/seed":
           simStop(); D = fresh(); syncOverview(); audit("demo_seed", "students=" + D.students.length);
           return jsonRes({ ok: true, students: D.students.length, sessions: (D.reports.session.summary || {}).sessions || 0, alerts: D.alerts.length });
-        case "/api/demo/purge":
+        case "/api/demo/purge": {
           simStop();
+          var purgedStudents = D.students.length, purgedBuckets = D.trend.length;
           D.students = []; D.alerts = []; D.trend = []; D.student = {}; D.analysis = {};
           D.reports = JSON.parse(JSON.stringify(D.reports_empty));
           D.demoOn = false; D.overview = emptyOverview();
-          audit("demo_purge", "students=0");
-          return jsonRes({ ok: true, students: 0 });
+          audit("demo_purge", "students=" + purgedStudents);
+          return jsonRes({ ok: true, students: purgedStudents, trend_buckets: purgedBuckets });
+        }
       }
       return jsonRes({ ok: false, error: "DEMO: không có tuyến " + path }, 404);
     }

@@ -44,6 +44,10 @@ def main():
     # bridge sẽ dời bucket cuối về "bây giờ" để biểu đồ 30 phút luôn có đường.
     d["trend"] = get("/api/trend?minutes=1440")
     d["system"] = get("/api/system")
+    # This fixture is published on a public demo link, so the teacher's absolute disk path must not ride
+    # along; the repo-relative default says the same thing without naming anybody's machine.
+    if isinstance(d["system"].get("database"), dict):
+        d["system"]["database"]["path"] = "../data/focuschange.db"
     d["audit"] = get("/api/audit")
     d["alerts"] = get("/api/alerts")
     d["settings"] = get("/api/settings")
