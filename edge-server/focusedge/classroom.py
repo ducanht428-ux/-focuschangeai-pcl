@@ -445,6 +445,34 @@ class ClassroomPipeline:
             persons=len(persons),
             room=room_objects(persons, scene_objects),
         ), now_ms)
+
+        # Khẩu lệnh giọng nói của Giáo viên (nếu có) đóng vai trò công tắc ngữ cảnh
+        try:
+            from .teacher_voice import get_teacher_voice, TeacherContextAI
+            tv = get_teacher_voice()
+            tv_status = tv.get_status()
+            tv_ctx = tv_status["context"]
+            if tv_ctx == TeacherContextAI.CONTEXT_GROUP_WORK:
+                snap = snap._replace(
+                    context=int(ClassContext.GROUP_DISCUSSION),
+                    label="thảo luận nhóm (giọng nói GV)",
+                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
+                )
+            elif tv_ctx == TeacherContextAI.CONTEXT_STUDY_NOTE:
+                snap = snap._replace(
+                    context=int(ClassContext.READING),
+                    label="đọc hoặc viết / tự học (giọng nói GV)",
+                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
+                )
+            elif tv_ctx == TeacherContextAI.CONTEXT_LECTURE and tv_status.get("elapsed_s", 999) < 180:
+                snap = snap._replace(
+                    context=int(ClassContext.PRESENTATION),
+                    label="nghe giảng (giọng nói GV)",
+                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
+                )
+        except Exception:
+            pass
+
         if self.last_activity is None or snap.context != self.last_activity.context:
             # One line per switch, never per frame: the label is the slow quantity here, and a stdout
             # that prints it 8 times a second would bury the alerts the operator is watching for.

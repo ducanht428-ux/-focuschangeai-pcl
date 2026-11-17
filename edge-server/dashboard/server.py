@@ -832,6 +832,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.runner.status())
             if path == "/api/classes":
                 return self._json(rows(conn.execute("SELECT * FROM classes ORDER BY class_id")))
+            if path == "/api/teacher-voice":
+                from focusedge.teacher_voice import get_teacher_voice
+                return self._json(get_teacher_voice().get_status())
             return self._json({"error": "not found"}, 404)
         finally:
             conn.close()
@@ -930,6 +933,20 @@ class Handler(BaseHTTPRequestHandler):
                 res = demo_data.purge(conn)
                 app.audit(conn, "teacher", "demo_purge", json.dumps(res))
                 return self._json(res)
+            if path == "/api/teacher-voice/context":
+                from focusedge.teacher_voice import get_teacher_voice
+                new_ctx = body.get("context", "")
+                get_teacher_voice().set_context(new_ctx, reason="dashboard_api")
+                return self._json({"ok": True, "status": get_teacher_voice().get_status()})
+            if path == "/api/teacher-voice/listen":
+                from focusedge.teacher_voice import get_teacher_voice
+                action = body.get("action", "start")
+                tv = get_teacher_voice()
+                if action == "start":
+                    tv.start()
+                elif action == "stop":
+                    tv.stop()
+                return self._json({"ok": True, "status": tv.get_status()})
             return self._json({"error": "not found"}, 404)
         finally:
             conn.close()
