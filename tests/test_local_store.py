@@ -125,6 +125,8 @@ def main():
     check("band outcome carried per feature",
           meta["band_sei"], {"min": 60.0, "max": 85.0, "typical": 70.0, "frames": 13,
                              "below": 1, "above": 2})
+    check("no context summary invented when none was measured", "context_eval" not in meta)
+    check("no tic summary invented when none was measured", "tic_watch" not in meta)
 
     feats = conn.execute("SELECT * FROM feature_records ORDER BY feature").fetchall()
     check("only the measured features are stored", [f["feature"] for f in feats],
@@ -253,6 +255,13 @@ def main():
           (live["class_id"], live["class_label"], live["school_year"]),
           ("lop12a", "Lop 12A", "2026-2027"))
     check("class board lists the student", list(live["students"].keys()), ["hs1"])
+    adv = [{"kind": "CONTEXT_OFF_TASK", "student_id": "hs1", "wall_ms": END_MS,
+            "reason": "Khong nhin len bang"}]
+    store.write_class_live("lop12a", {"hs1": {"name": "Le Van A", "sei": 71}},
+                           [{"code": "DROWSY"}], END_MS, advisories=adv)
+    live = json.load(open(os.path.join(out, "class_live_lop12a.json"), encoding="utf-8"))
+    check("advisories ride beside parity alerts, not inside them", live["advisories"], adv)
+    check("parity alerts unchanged by advisories", live["alerts"], [{"code": "DROWSY"}])
     before = conn.execute("SELECT COUNT(*) c FROM observation_sessions").fetchone()["c"]
     store.write_presence("hs1", "Le Van A", summary(), START_MS, END_MS, 250_000, 2,
                          "test-cam", "looking_away")
@@ -260,6 +269,19 @@ def main():
           conn.execute("SELECT COUNT(*) c FROM observation_sessions").fetchone()["c"], before)
     check("heartbeat replaced rather than appended",
           len([f for f in os.listdir(out) if f.startswith("presence_")]), 1)
+
+    # Tổng kết ngữ cảnh / Tic (đợt tài liệu mới): đi vào notes JSON, không đụng cột parity.
+    # Đặt SAU các đếm toàn cục ở trên: thêm một em nữa sẽ đổi các con số "một phiên / một em".
+    ctx_summ = {"off_task_s": 123.4, "episodes": 2, "severity": "trung_binh",
+                "contexts_used": ["LECTURE"], "episode_list": []}
+    tic_summ = {"level": 1, "eye_bursts": 5, "mouth_jerks": 0, "dense": False, "observed_s": 300.0}
+    write_session(store, student_id="hs_ctx", name="Ctx Em", s=summary(sid=START_MS + 1),
+                  context_summary=ctx_summ, tic_summary=tic_summ)
+    m_ctx = json.loads(conn.execute(
+        "SELECT notes FROM observation_sessions WHERE student_id='hs_ctx'").fetchone()["notes"])
+    check("context summary kept in notes", m_ctx["context_eval"], ctx_summ)
+    check("tic summary kept in notes", m_ctx["tic_watch"], tic_summ)
+    check("advisory summaries do not touch the parity alert count", m_ctx["alerts_total"], 2)
 
     # ------------------------------------------------------------------ failure paths
     # A closed store writes nothing and raises nothing: the run is over, there is no measurement

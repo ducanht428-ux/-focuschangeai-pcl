@@ -11,6 +11,7 @@ and the heavy objects are only built when ``ClassroomPipeline`` is constructed.
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections import deque
@@ -21,10 +22,25 @@ from .activity import (
     CONTEXT_T, ClassContext, ClassContextEngine, ClassSnapshot, Signals, head_signals, room_objects,
 )
 from .constants import HabitFeature, Situation
+from .context_eval import ContextEvaluator
 from .habit import HabitProfile
 from .landmarks import focal_px
 from .person_pipeline import PersonPipeline, PersonResult
 from .quality import face_light, to_gray
+from .teacher_voice import TeacherContextAI, get_teacher_voice
+from .tic_watch import TicWatch
+
+# Khẩu lệnh giáo viên -> nhãn của activity.py. Chỉ dùng khi CÓ khẩu lệnh thật (xem _update_activity).
+# Nhãn giữ đúng chữ của CLASS_CONTEXT_VI rồi thêm nguồn trong ngoặc, để người đọc biết đây là lời
+# giáo viên chứ không phải luật viết tay đọc được từ hình ảnh. SEATWORK/Q_AND_A (tài liệu 3) dùng
+# nhãn riêng cho lời người đọc; enum vẫn là hạng mục thị giác gần nhất (READING/PRESENTATION).
+_VOICE_CONTEXT = {
+    TeacherContextAI.CONTEXT_GROUP_WORK: (ClassContext.GROUP_DISCUSSION, "thảo luận nhóm"),
+    TeacherContextAI.CONTEXT_STUDY_NOTE: (ClassContext.READING, "đọc hoặc viết / tự học"),
+    TeacherContextAI.CONTEXT_LECTURE: (ClassContext.PRESENTATION, "nghe giảng"),
+    TeacherContextAI.CONTEXT_SEATWORK: (ClassContext.READING, "làm bài tập / tự học"),
+    TeacherContextAI.CONTEXT_Q_AND_A: (ClassContext.PRESENTATION, "hỏi – đáp"),
+}
 
 # edge-server/, whichever folder the process was started from.
 _PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +140,11 @@ class TrackRuntime:
     # which IS the start timestamp; here the id is a per-student counter, so the start time is
     # remembered separately rather than recomputed from the measured time.
     session_started_wall_ms: int = 0
+    # Lớp khuyến nghị sư phạm chạy SONG SONG với chuỗi parity (không đụng SEI/alerts_total):
+    # đánh giá tập trung theo khẩu lệnh GV (context_eval.py, tài liệu 2+3) và theo dõi dấu
+    # hiệu giật lặp lại kiểu Tic (tic_watch.py, tài liệu 1). Mỗi track một bộ, sống theo phiên.
+    context_eval: ContextEvaluator = field(default_factory=ContextEvaluator)
+    tic: TicWatch = field(default_factory=TicWatch)
 
 
 class ClassroomPipeline:
@@ -178,6 +199,9 @@ class ClassroomPipeline:
 
         self._tracks: Dict[int, TrackRuntime] = {}
         self._alerts: Deque[Dict] = deque(maxlen=200)
+        # Khuyến nghị (off-task theo ngữ cảnh, dấu hiệu Tic) - tách khỏi _alerts của parity:
+        # không đếm vào alerts_total, không ghi vào bảng alerts, đi vào notes JSON + class_live.
+        self._advisories: Deque[Dict] = deque(maxlen=200)
         # Preview-only: the last frame's raw layer-1 output. Overwritten every step().
         self.last_boxes = DetectionView()
 
@@ -394,6 +418,62 @@ class ClassroomPipeline:
             if res.alert:
                 self._register_alert(rt, res.alert, wall_ms)
 
+        # -- Lớp khuyến nghị sư phạm: đánh giá từng em THEO NGỮ CẢNH khẩu lệnh GV -----
+        # (context_eval.py - tài liệu 2+3) và theo dõi dấu hiệu giật lặp lại kiểu Tic
+        # (tic_watch.py - tài liệu 1). Chạy sau khi đo, đọc lại chính số liệu khung này;
+        # không sửa SEI, không đụng chuỗi cảnh báo parity. Không có khẩu lệnh hoặc mặt
+        # không đo được -> NEUTRAL, đồng hồ dừng (hai nguyên tắc của teacher_voice).
+        tv_ctx = get_teacher_voice().get_status().get("context", "UNKNOWN")
+        centers = {}
+        for res in results:
+            if res.measurable and res.face_bbox:
+                x0, y0, x1, y1 = res.face_bbox
+                centers[res.track_id] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        measured_ids = set()
+        for res in results:
+            rt = self._tracks.get(res.track_id)
+            if rt is None:
+                continue
+            measured_ids.add(res.track_id)
+            meas = res.measurable and res.yaw is not None and res.pitch is not None
+            nearest = None
+            c = centers.get(res.track_id)
+            if c is not None and len(centers) > 1:
+                # Khoảng cách PIXEL tới mặt gần nhất: tiêu chí 3 chỉ so TỈ LỆ xích lại
+                # gần baseline nên px hay cm không đổi kết luận (cùng một camera, cùng
+                # tiêu cự khung hình). Tín hiệu MỀM, không phải cổng cứng.
+                nearest = min(math.hypot(c[0] - o[0], c[1] - o[1])
+                              for tid, o in centers.items() if tid != res.track_id)
+            # Mắt chỉ kết luận mở/nhắm khi EyeEngine đọc được; góc đầu quá nghiêng cho
+            # eye gate thì None = không biết, KHÔNG được coi là nhắm mắt (context_eval).
+            eyes_open = (res.openness >= 0.5) if res.eye_valid else None
+            mar = res.hud.mar if res.hud is not None else None
+            yawn = bool(res.hud.yawn_confirmed) if res.hud is not None else False
+            eps_before = len(rt.context_eval.episodes)
+            rt.context_eval.update(now_ms, tv_ctx, meas, res.yaw, res.pitch, mar,
+                                   eyes_open=eyes_open, nearest_cm=nearest)
+            if len(rt.context_eval.episodes) > eps_before:
+                ep = rt.context_eval.episodes[-1]
+                self._register_advisory(rt, "CONTEXT_OFF_TASK", wall_ms,
+                                        context=ep["context"], reason=ep["reason"])
+            rt.tic.update(now_ms, rt.pipeline.blinks_since(rt.tic.last_blink_seen_ms),
+                          mar, yawn, tv_ctx, res.measurable)
+            if rt.tic.level_rose:
+                self._register_advisory(rt, "TIC_WATCH", wall_ms, level=rt.tic.level,
+                                        reason=rt.tic.view()["label"])
+        # Track không được đo nhịp này: chỉ dừng đồng hồ khi mặt THỰC SỰ không đo được
+        # hoặc đã lâu không đo. Scheduler bỏ qua một nhịp (đông mặt) không phải là mất
+        # mặt - reset nhầm sẽ khiến đồng hồ 7 giây không bao giờ đầy trong lớp đông.
+        for rt in self._tracks.values():
+            if rt.track_id in measured_ids:
+                continue
+            r = rt.last_result
+            absent = (r is None or not r.measurable
+                      or now_ms - rt.last_measured_ms > 2000)
+            if absent:
+                rt.context_eval.update(now_ms, tv_ctx, False, None, None, None)
+                rt.tic.update(now_ms, [], None, False, tv_ctx, False)
+
         # -- what the room as a whole is doing -----------------------------
         self._update_activity(measured, persons, scene_objects, w, h, now_ms)
 
@@ -446,32 +526,34 @@ class ClassroomPipeline:
             room=room_objects(persons, scene_objects),
         ), now_ms)
 
-        # Khẩu lệnh giọng nói của Giáo viên (nếu có) đóng vai trò công tắc ngữ cảnh
-        try:
-            from .teacher_voice import get_teacher_voice, TeacherContextAI
-            tv = get_teacher_voice()
-            tv_status = tv.get_status()
-            tv_ctx = tv_status["context"]
-            if tv_ctx == TeacherContextAI.CONTEXT_GROUP_WORK:
+        # Khẩu lệnh giáo viên là một công tắc ngữ cảnh, nhưng chỉ khi có khẩu lệnh THẬT và khung này
+        # có mặt để đọc. Bản đầu tiên của đoạn này lấy teacher_voice ở trạng thái khởi động (LECTURE,
+        # "Hệ thống sẵn sàng") làm khẩu lệnh, nên 3 phút đầu mọi phiên đều bị dán nhãn "nghe giảng
+        # (giọng nói GV)" dù micro chưa cài - đo được bằng 2 test activity hỏng. Hai cổng chặn lại:
+        #   has_command  : đã nghe được một câu khẩu lệnh, hoặc giáo viên bấm chọn trên giao diện.
+        #                  Hết thời gian thì teacher_voice tự trả về UNKNOWN, cờ này thành False.
+        #   snap.raw     : luật viết tay CÓ bỏ phiếu khung này. raw None = không có mặt nào đo được,
+        #                  và bằng chứng "chưa có mặt nào" phải giữ nguyên.
+        #   persons      : riêng phiếu UNKNOWN ("không thấy ai trước camera") chỉ được thay khi trong
+        #                  khung CÓ người. Một khẩu lệnh không được biến phòng trống thành lớp đang
+        #                  thảo luận; nhưng khi có học sinh trong khung mà không em nào hướng ống kính
+        #                  (đúng lúc nghe giảng / quay sang bạn), lời giáo viên là bằng chứng thật.
+        # Không bọc try/except pass: lỗi ở đây phải hiện ra một lần chứ không câm lặng (house style).
+        tv_status = get_teacher_voice().get_status()
+        vote = snap.raw is not None and (snap.raw != ClassContext.UNKNOWN or len(persons) > 0)
+        if tv_status.get("has_command") and vote:
+            mapped = _VOICE_CONTEXT.get(tv_status.get("context"))
+            if mapped is not None:
+                ctx, base_label = mapped
+                spoken = tv_status.get("source") == "speech"
+                suffix = "khẩu lệnh GV" if spoken else "GV chọn"
+                said = (tv_status.get("last_speech") or "").strip()
                 snap = snap._replace(
-                    context=int(ClassContext.GROUP_DISCUSSION),
-                    label="thảo luận nhóm (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
+                    context=int(ctx),
+                    label="%s (%s)" % (base_label, suffix),
+                    evidence="%s: %s" % ("GV khẩu lệnh" if spoken else "GV chọn ngữ cảnh",
+                                         said or base_label),
                 )
-            elif tv_ctx == TeacherContextAI.CONTEXT_STUDY_NOTE:
-                snap = snap._replace(
-                    context=int(ClassContext.READING),
-                    label="đọc hoặc viết / tự học (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
-            elif tv_ctx == TeacherContextAI.CONTEXT_LECTURE and tv_status.get("elapsed_s", 999) < 180:
-                snap = snap._replace(
-                    context=int(ClassContext.PRESENTATION),
-                    label="nghe giảng (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
-        except Exception:
-            pass
 
         if self.last_activity is None or snap.context != self.last_activity.context:
             # One line per switch, never per frame: the label is the slow quantity here, and a stdout
@@ -644,6 +726,21 @@ class ClassroomPipeline:
             "wall_ms": wall_ms,
         })
 
+    def _register_advisory(self, rt: TrackRuntime, kind: str, wall_ms: int, **fields) -> None:
+        """Một sự kiện KHUYẾN NGHỊ (off-task theo ngữ cảnh, mức dấu hiệu Tic tăng).
+
+        Không phải cảnh báo parity: không đếm vào alert_count, không ghi bảng alerts.
+        Đi vào luồng advisories của class_live JSON và (qua session_summary) notes JSON.
+        """
+        self._advisories.append({
+            "kind": kind,
+            "student_id": rt.student_id or ("guest-%d" % rt.track_id),
+            "student_name": rt.student_name,
+            "track_id": rt.track_id,
+            "wall_ms": wall_ms,
+            **fields,
+        })
+
     # ------------------------------------------------------------------
     def _retire(self, rt: TrackRuntime, wall_ms: int) -> None:
         """Track died: close its session and (for bound students) commit + upload."""
@@ -675,6 +772,11 @@ class ClassroomPipeline:
             # the row's notes because the two are not the same kind of measurement and a table has to
             # be able to say which names were recognised and which somebody stated.
             identity=rt.identity_conf,
+            # Tổng kết lớp khuyến nghị (không phải parity): off-task theo ngữ cảnh của phiên
+            # và mẫu hình dấu hiệu Tic. tic_summary luôn có khi đã quan sát được mặt - ngày
+            # level 0 là mẫu số của tỉ lệ "gần như mỗi ngày" khi đọc dọc 4 tuần (tic_history).
+            context_summary=rt.context_eval.session_summary(),
+            tic_summary=rt.tic.session_summary(),
         )
         if self._habit_learn:
             self._writer.write_band(rt.student_id, rt.student_name, profile, wall_ms, str(self._device))
@@ -702,8 +804,12 @@ class ClassroomPipeline:
                     entry["alert"] = r.alert
                 if r.quality is not None:
                     entry["quality"] = r.quality
+            # Lớp khuyến nghị sư phạm (tài liệu 1+2+3) đi cùng thẻ người trong class_live.
+            entry["context"] = rt.context_eval.view()
+            entry["tic"] = rt.tic.view()
             students[key] = entry
-        self._writer.write_class_live(self.class_id, students, list(self._alerts), wall_ms)
+        self._writer.write_class_live(self.class_id, students, list(self._alerts), wall_ms,
+                                      advisories=list(self._advisories))
 
     def _write_heartbeats(self, wall_ms: int) -> None:
         for rt in self._tracks.values():
@@ -831,3 +937,16 @@ class ClassroomPipeline:
     @property
     def recent_alerts(self) -> List[Dict]:
         return list(self._alerts)
+
+    # --- lớp khuyến nghị sư phạm cho dashboard (camera_runner._people đọc các view này) ---
+    def context_view(self, track_id: int) -> Optional[Dict]:
+        rt = self._tracks.get(track_id)
+        return rt.context_eval.view() if rt is not None else None
+
+    def tic_view(self, track_id: int) -> Optional[Dict]:
+        rt = self._tracks.get(track_id)
+        return rt.tic.view() if rt is not None else None
+
+    @property
+    def advisories(self) -> List[Dict]:
+        return list(self._advisories)

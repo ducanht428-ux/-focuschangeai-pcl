@@ -232,6 +232,20 @@ class CameraRunner:
             if self.options.get("overlay") and rt_result is not None and rt_result.sei is not None:
                 cv2.putText(view, "SEI %d" % rt_result.sei, (x0, min(view.shape[0] - 6, y1 + 16)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 2)
+                # Trạng thái theo ngữ cảnh GV: ASCII (cv2.putText không vẽ được dấu tiếng Việt).
+                ctx = pipeline.context_view(person.track_id) or {}
+                st = ctx.get("state", "NEUTRAL")
+                if st == "ON_TASK":
+                    cv2.putText(view, "ON-TASK", (x0, min(view.shape[0] - 6, y1 + 34)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
+                elif st == "WATCH":
+                    cv2.putText(view, "WATCH %ds" % int(ctx.get("off_s", 0)),
+                                (x0, min(view.shape[0] - 6, y1 + 34)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 220), 2)
+                elif st == "OFF_TASK":
+                    cv2.putText(view, "OFF-TASK %ds" % int(ctx.get("off_s", 0)),
+                                (x0, min(view.shape[0] - 6, y1 + 34)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         for tid, region in boxes.face_regions:
             if region is None:
                 # _face_region trả None khi cửa sổ mặt bị mép khung hình ăn quá nhiều;
@@ -263,6 +277,10 @@ class CameraRunner:
                 "pitch": round(r.pitch, 1) if r is not None and r.pitch is not None else None,
                 "yaw": round(r.yaw, 1) if r is not None and r.yaw is not None else None,
                 "quality": r.quality if r is not None else None,
+                # Lớp khuyến nghị sư phạm (tài liệu 1+2+3): đánh giá theo ngữ cảnh khẩu
+                # lệnh GV + theo dõi dấu hiệu giật lặp lại. None khi track không tồn tại.
+                "context": pipeline.context_view(v.track_id),
+                "tic": pipeline.tic_view(v.track_id),
             })
         return out
 

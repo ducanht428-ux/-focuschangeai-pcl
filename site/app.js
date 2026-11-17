@@ -147,6 +147,7 @@ const ICON_PATHS = {
   target: '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
   save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
+  mic: '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4M8 23h8"/>',
 };
 function ico(name) {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
@@ -178,6 +179,7 @@ const S = {
   analysisSid: "", analysisScope: "buoi",
   studentQuery: "",
   focusTrack: null, hidePeople: false,
+  voice: null,
   soundOn: localStorage.getItem("fc_sound") !== "0",
   lastUnseen: null,
 };
@@ -532,10 +534,15 @@ async function connectLive() {
 /* ============================== polling ============================== */
 async function tickFast() {
   try {
-    const [ov, live] = await Promise.all([
+    // Khẩu lệnh giáo viên chỉ có ở LIVE/DEMO (bản web đọc SQLite không có micro, không có Python).
+    // .catch riêng để một tuyến thiếu trên server cũ không kéo sập cả nhịp cập nhật số đo.
+    const jobs = [
       api("/api/overview?date=" + encodeURIComponent(S.date)),
-      api("/api/live")]);
+      api("/api/live")];
+    if (window.FC_MODE !== "web") jobs.push(api("/api/teacher-voice").catch(() => null));
+    const [ov, live, voice] = await Promise.all(jobs);
     S.overview = ov; S.live = live;
+    if (voice) S.voice = voice;
     // Âm báo khi có cảnh báo CHƯA XEM mới (đặc tả 5.7). Lần đầu chỉ ghi mốc, không kêu.
     if (S.lastUnseen != null && ov.alerts_unseen > S.lastUnseen) {
       beep();
@@ -654,6 +661,16 @@ function activityRows() {
   for (const a of (S.recentAlerts || []).slice(0, 30)) {
     items.push({ms: a.raised_at_wall_ms, tint: "tint-red", icon: "bell",
       text: (a.student_name || a.student_id) + ": " + a.message});
+  }
+  // Khuyến nghị sư phạm / dấu hiệu Tic (classroom.py ghi vào class_live JSON): lớp riêng,
+  // gắn chữ "khuyến nghị" để không lẫn với 15 mức cảnh báo parity của điện thoại.
+  const adv = ((S.live && S.live.board) || {}).advisories || [];
+  for (const a of adv.slice(-30)) {
+    const who = a.student_name || a.student_id || ("track " + a.track_id);
+    const text = a.kind === "TIC_WATCH"
+      ? who + ": " + (a.label || "dấu hiệu giật lặp lại") + " (khuyến nghị theo dõi)"
+      : who + ": mất tập trung theo ngữ cảnh" + (a.reason ? " — " + a.reason : "") + " (khuyến nghị)";
+    items.push({ms: a.wall_ms, tint: a.kind === "TIC_WATCH" ? "tint-orange" : "tint-red", icon: "warn", text});
   }
   items.sort((x, y) => y.ms - x.ms);
   if (!items.length) return '<div class="muted small">Chưa có hoạt động nào được ghi.</div>';
@@ -1544,6 +1561,7 @@ function renderCamera() {
     '<button class="btn btn-primary" id="cam-save">' + ico("save") + " Lưu cài đặt camera</button>" +
     '<div class="lock-note mt">Thông số lưu vào config.yaml, áp dụng từ lần bật camera kế tiếp. ' +
     "Hiệu chuẩn khoảng cách và gắn tên thủ công (phím M) hiện nằm ở cửa sổ camera lõi (main.py).</div></div>" +
+    voiceCard() +
     '<div class="card mt"><h3>' + ico("eye") + 'Tuỳ chọn hiển thị</h3>' +
     switchRow("sw-boxes", "Hộp người / hộp mặt (Y)", opt.boxes) +
     switchRow("sw-overlay", "Số liệu đè khung (O)", opt.overlay) +
@@ -1564,6 +1582,7 @@ function renderCamera() {
   $("sw-overlay").onchange = (e) => setOption("overlay", e.target.checked);
   $("sw-brighten").onchange = (e) => setOption("brighten", e.target.checked);
   $("sw-people").onchange = (e) => { S.hidePeople = !e.target.checked; updateCameraParts(); };
+  wireVoiceCard();
   updateCameraParts();
 }
 
@@ -1572,8 +1591,138 @@ function switchRow(id, label, checked) {
     '<input type="checkbox" id="' + id + '"' + (checked ? " checked" : "") + "><i></i></label></div>";
 }
 
+/* ============================== khẩu lệnh giáo viên ==============================
+   focusedge/teacher_voice.py + /api/teacher-voice*. Trước đợt này backend đã có nhưng giao diện
+   không gọi tuyến nào, nên tính năng không dùng được từ dashboard. Thẻ này nằm ở màn Camera vì đó
+   là chỗ ngữ cảnh lớp đang được đọc. Ba điều phải nói thật trên màn hình:
+     - chưa có khẩu lệnh thì nhãn là của luật viết tay đọc từ hình ảnh, không phải "nghe giảng";
+     - bấm chọn bằng tay khác với nghe được từ micro (nguồn ghi trong nhãn);
+     - bật micro là gửi ghi âm ra Google, nên hỏi trước khi bật và in câu cảnh báo ngay dưới công tắc. */
+const VOICE_LABEL = {
+  UNKNOWN: "chưa có khẩu lệnh", LECTURE: "nghe giảng",
+  STUDY_NOTE: "ghi bài / tự học", GROUP_WORK: "thảo luận nhóm",
+  SEATWORK: "làm bài tập / suy nghĩ", Q_AND_A: "hỏi – đáp",
+};
+const VOICE_CHOICES = [["LECTURE", "Nghe giảng"], ["STUDY_NOTE", "Ghi bài"], ["GROUP_WORK", "Thảo luận nhóm"],
+  ["SEATWORK", "Làm bài tập"], ["Q_AND_A", "Hỏi – đáp"]];
+
+function voiceCard() {
+  if (window.FC_MODE === "web") return "";
+  return '<div class="card mt" id="voice-card"><h3>' + ico("mic") + "Khẩu lệnh giáo viên</h3>" +
+    '<div class="avg-note" id="voice-status"></div>' +
+    '<div class="voice-btns">' + VOICE_CHOICES.map(([v, l]) =>
+      '<button class="btn btn-sm" data-voice-ctx="' + v + '">' + l + "</button>").join("") +
+    '<button class="btn btn-sm" data-voice-ctx="UNKNOWN">Bỏ chọn</button></div>' +
+    switchRow("sw-voice-listen", "Nghe khẩu lệnh bằng micro", false) +
+    '<div class="lock-note" id="voice-note"></div>' +
+    '<div class="muted small" id="voice-heard"></div></div>';
+}
+
+function updateVoiceParts() {
+  const box = $("voice-status");
+  if (!box) return;
+  const v = S.voice;
+  if (!v) { box.textContent = "Đang tải trạng thái khẩu lệnh…"; return; }
+  const demo = window.FC_MODE === "demo";
+  const src = !v.has_command ? "nhãn do luật đọc từ hình ảnh"
+    : v.source === "speech" ? "nghe được từ micro" : "giáo viên chọn";
+  box.innerHTML = "Ngữ cảnh: <b>" + esc(VOICE_LABEL[v.context] || v.context) + "</b> · " + esc(src) +
+    (v.has_command ? " · " + num(v.elapsed_s, 0) + " s trước" : "") +
+    (demo ? ' · <span class="muted">DEMO mô phỏng</span>' : "");
+  document.querySelectorAll("[data-voice-ctx]").forEach((b) => {
+    b.classList.toggle("btn-primary", b.getAttribute("data-voice-ctx") === v.context);
+  });
+  const sw = $("sw-voice-listen");
+  if (sw) { sw.checked = !!v.is_running; sw.disabled = !demo && !v.mic_available; }
+  const note = $("voice-note");
+  if (note) {
+    note.textContent = demo
+      ? "DEMO: micro mô phỏng trong trình duyệt, không thu âm thật. Bản LIVE trên máy này mới nghe micro."
+      : (v.mic_available ? (v.privacy_note || "") : (v.last_error || "Chưa cài SpeechRecognition / PyAudio."));
+  }
+  const heard = $("voice-heard");
+  if (heard) heard.textContent = v.last_speech ? "Câu gần nhất: “" + v.last_speech + "”" : "";
+}
+
+async function setVoiceContext(ctx) {
+  try {
+    const r = await api("/api/teacher-voice/context", {context: ctx});
+    S.voice = r.status || r;
+    updateVoiceParts();
+    toast(ctx === "UNKNOWN" ? "Đã bỏ chọn — nhãn ngữ cảnh trở về luật đọc từ hình ảnh"
+      : "Đã đặt ngữ cảnh: " + (VOICE_LABEL[ctx] || ctx), "ok");
+  } catch (e) { toast("Không đặt được ngữ cảnh: " + e.message, "err"); }
+}
+
+async function toggleVoiceListen(on) {
+  const sw = $("sw-voice-listen");
+  if (on && window.FC_MODE !== "demo") {
+    const note = (S.voice && S.voice.privacy_note) ||
+      "Nhận dạng khẩu lệnh gửi đoạn ghi âm từ micro ra Google (cần internet).";
+    if (!window.confirm(note + "\n\nBật nghe khẩu lệnh giáo viên?")) {
+      if (sw) sw.checked = false;
+      return;
+    }
+  }
+  try {
+    const r = await api("/api/teacher-voice/listen", {action: on ? "start" : "stop"});
+    S.voice = r.status || r;
+    updateVoiceParts();
+    if (on && !S.voice.is_running) {
+      toast("Không nghe được micro: " + (S.voice.last_error || "thiếu SpeechRecognition / PyAudio"), "err");
+    } else {
+      toast(on ? "Đang nghe khẩu lệnh giáo viên" : "Đã tắt nghe khẩu lệnh", "ok");
+    }
+  } catch (e) {
+    if (sw) sw.checked = !on;
+    toast("Không bật/tắt được micro: " + e.message, "err");
+  }
+}
+
+function wireVoiceCard() {
+  document.querySelectorAll("[data-voice-ctx]").forEach((b) => {
+    b.onclick = () => setVoiceContext(b.getAttribute("data-voice-ctx"));
+  });
+  const sw = $("sw-voice-listen");
+  if (sw) sw.onchange = (e) => toggleVoiceListen(e.target.checked);
+  updateVoiceParts();
+}
+
+/* ============================== ngữ cảnh từng em + dấu hiệu Tic ==============================
+   focusedge/context_eval.py + focusedge/tic_watch.py (3 tài liệu đợt này). Đây là lớp KHUYẾN NGHỊ
+   chạy song song với chuỗi cảnh báo parity: không đếm vào alerts_total, không thay SEI. Thẻ người
+   chỉ hiện khi CÓ khẩu lệnh và mặt đo được (state NEUTRAL thì không phán gì - đúng nguyên tắc
+   "không có bằng chứng thì không có nhãn"). Huy hiệu Tic luôn kèm disclaimer trong title. */
+const CTX_STATE_CHIP = { ON_TASK: ["Tập trung", ""], WATCH: ["Theo dõi", "warn"], OFF_TASK: ["Mất tập trung", "bad"] };
+const CTX_SEVERITY = { trung_binh: "trung bình", nang: "nặng" };
+
+function contextRows(p) {
+  const c = p.context;
+  if (!c || !c.state || c.state === "NEUTRAL") return "";
+  const chip = CTX_STATE_CHIP[c.state] || [c.state, "warn"];
+  let html = '<div class="ctx-row"><span class="sit-chip ' + chip[1] + '">' + chip[0] + "</span>" +
+    '<span class="ctx-reason">' + esc(c.reason || "") + "</span></div>";
+  if (c.state !== "ON_TASK" && c.off_s > 0) {
+    html += '<div class="person-kv"><span>Lệch ngữ cảnh</span><b>' + num(c.off_s, 0) +
+      "s / cửa sổ " + num(c.window_s, 0) + "s</b></div>";
+  }
+  if (c.off_total_s > 0) {
+    html += '<div class="person-kv"><span>Cộng dồn cả phiên</span><b>' + num(c.off_total_s, 0) + "s" +
+      (CTX_SEVERITY[c.severity] ? " · " + CTX_SEVERITY[c.severity] : "") + "</b></div>";
+  }
+  return html;
+}
+
+function ticBadge(p) {
+  const t = p.tic;
+  if (!t || !t.level) return "";
+  return '<div class="tic-badge lv' + t.level + '" title="' + esc(t.disclaimer || "") + '">' +
+    ico("warn") + " " + esc(t.label || "Dấu hiệu giật lặp lại") + "</div>";
+}
+
 function updateCameraParts() {
   if (window.FC_MODE === "web") { livePaint(); livePlaceSoon(); return; }
+  updateVoiceParts();
   if (!$("cam-stream")) return;
   syncStream("cam-stream", "cam-empty", "cam-fps");
   const cam = (S.live && S.live.camera) || {};
@@ -1619,6 +1768,7 @@ function updateCameraParts() {
       '<div class="person-kv"><span>Khoảng cách</span><b>' + num(p.distance_cm, 0) + " cm</b></div>" +
       '<div class="person-kv"><span>Nhận diện</span><b>' + esc(p.identity_conf || "--") + "</b></div>" +
       (p.alert ? '<div class="person-alert">' + ico("warn") + " " + esc(p.alert) + "</div>" : "") +
+      contextRows(p) + ticBadge(p) +
       bindRow +
       "</div>";
   }).join("");
@@ -1924,6 +2074,42 @@ async function renderAnalysis() {
   await loadAnalysis();
 }
 
+/* Thẻ lịch sử dấu hiệu Tic (focusedge/tic_watch.py::tic_history, tài liệu 1).
+   Ba điều bắt buộc trên màn hình: (1) không bao giờ là chẩn đoán - disclaimer in thẳng trong thẻ;
+   (2) mốc 4 tuần chỉ có nghĩa khi đọc từ NHIỀU NGÀY quan sát, nên thẻ hiện mẫu số (ngày quan sát)
+   cạnh tử số (ngày có mẫu hình); (3) tài liệu tham khảo y khoa đi kèm để người xem tự đối chiếu. */
+function ticHistoryCard(h) {
+  const head = '<div class="card mt"><h3>' + ico("warn") + " Theo dõi dấu hiệu Tic (tham khảo y khoa)</h3>";
+  const disc = (h && h.disclaimer)
+    ? '<div class="lock-note mt">' + ico("lock") + " " + esc(h.disclaimer) + "</div>" : "";
+  if (!h) {
+    return head + '<div class="muted small">Cần dashboard cục bộ để đọc lịch sử nhiều phiên từ SQLite — bản web-only chưa có tuyến này.</div></div>';
+  }
+  if (!h.sessions_observed) {
+    return head + '<div class="muted small">Chưa có phiên đo nào của em này. Dấu hiệu Tic chỉ đánh giá được từ nhiều ngày quan sát, không từ một phiên.</div>' + disc + "</div>";
+  }
+  const chip = h.recommend_exam ? ["Nên cân nhắc đi khám chuyên khoa", "bad"]
+    : h.level >= 1 ? ["Có mẫu hình - tiếp tục theo dõi", "warn"]
+    : ["Chưa thấy mẫu hình lặp lại", ""];
+  const refs = (h.references || []).map((r) =>
+    '<div class="list-row"><span class="list-text"><a href="' + esc(r.url) + '" target="_blank" rel="noopener">' + esc(r.title) + "</a></span></div>").join("");
+  const miles = (h.milestones || []).map((m) =>
+    '<div class="sys-row"><span>' + esc(m.range) + "</span><b style=\"font-weight:500;text-align:right\">" + esc(m.meaning) + "</b></div>").join("");
+  return head +
+    '<div class="ctx-row"><span class="sit-chip ' + chip[1] + '">' + chip[0] + "</span>" +
+    (h.demo ? '<span class="sit-chip warn">DEMO</span>' : "") + "</div>" +
+    (h.label ? '<div class="avg-note">' + esc(h.label) + "</div>" : "") +
+    '<div class="sys-row"><span>Số ngày đã quan sát</span><b>' + h.days_observed + "</b></div>" +
+    '<div class="sys-row"><span>Ngày có mẫu hình giật lặp</span><b>' + h.days_with_pattern + "</b></div>" +
+    '<div class="sys-row"><span>Kéo dài từ phiên đầu đến cuối</span><b>' + h.span_days + " ngày</b></div>" +
+    '<div class="sys-row"><span>Số phiên có theo dõi Tic</span><b>' + h.sessions_observed + "</b></div>" +
+    (h.note ? '<div class="avg-note mt">' + esc(h.note) + "</div>" : "") +
+    (miles ? '<h3 class="mt">Mốc thời gian tham khảo (DSM-5)</h3>' + miles : "") +
+    disc +
+    (refs ? '<h3 class="mt">Tài liệu tham khảo</h3>' + refs : "") +
+    "</div>";
+}
+
 async function loadAnalysis() {
   const body = $("analysis-body");
   if (!body) return;
@@ -1935,9 +2121,12 @@ async function loadAnalysis() {
   }
   body.innerHTML = '<div class="muted small">Đang tải…</div>';
   try {
-    const [data, detail] = await Promise.all([
+    const [data, detail, ticHist] = await Promise.all([
       api("/api/analysis?id=" + encodeURIComponent(S.analysisSid) + "&scope=" + S.analysisScope),
-      api("/api/student?id=" + encodeURIComponent(S.analysisSid))]);
+      api("/api/student?id=" + encodeURIComponent(S.analysisSid)),
+      // Tuyến đọc dọc nhiều phiên (tài liệu Tic, mốc 4 tuần). Bản web-only chưa có tuyến này:
+      // null -> thẻ nói thật là cần dashboard cục bộ, không bịa lịch sử.
+      api("/api/student/tic-history?id=" + encodeURIComponent(S.analysisSid)).catch(() => null)]);
     const stu = S.students.find((s) => s.student_id === S.analysisSid) || {name: S.analysisSid};
     let band = null, baseHtml = '<div class="muted small">' + (window.FC_MODE === "web"
       ? "Chưa có baseline cá nhân trong db — cần đủ phiên đo của chính em để dựng khoảng tin cậy."
@@ -1986,15 +2175,18 @@ async function loadAnalysis() {
         : '<div class="muted small">Chưa có cảnh báo.</div>') + "</div></div>" +
       '<div class="card mt"><h3>' + ico("report") + "Các phiên đo gần đây</h3>" +
       (sessions.length
-        ? '<table class="tbl"><thead><tr><th>Bắt đầu</th><th>Kết thúc</th><th>Phút hợp lệ</th><th>SEI TB</th><th>EAR</th><th>MAR</th><th>Nguồn</th></tr></thead><tbody>' +
+        ? '<table class="tbl"><thead><tr><th>Bắt đầu</th><th>Kết thúc</th><th>Phút hợp lệ</th><th>SEI TB</th><th>EAR</th><th>MAR</th><th>Lệch ngữ cảnh</th><th>Nguồn</th></tr></thead><tbody>' +
           sessions.slice(0, 15).map((s) => {
             const f = s.features || {};
+            const ce = s.notes && s.notes.context_eval;
             return "<tr><td>" + fmtDateTime(s.started_at_wall_ms) + "</td><td>" + fmtTime(s.ended_at_wall_ms) + "</td>" +
               "<td>" + Math.round(s.valid_ms / 60000) + "</td><td><b>" + num(s.sei_mean, 1) + "</b></td>" +
               "<td>" + num(f.ear && f.ear.mean, 2) + "</td><td>" + num(f.mar && f.mar.mean, 2) + "</td>" +
+              "<td>" + (ce ? num(ce.off_task_s, 0) + "s" + (CTX_SEVERITY[ce.severity] ? " · " + CTX_SEVERITY[ce.severity] : "") : "—") + "</td>" +
               "<td>" + (s.notes && s.notes.demo ? '<span class="sit-chip warn">DEMO</span>' : esc(s.device)) + "</td></tr>";
           }).join("") + "</tbody></table>"
-        : '<div class="muted small">Chưa có phiên đo.</div>') + "</div>";
+        : '<div class="muted small">Chưa có phiên đo.</div>') + "</div>" +
+      ticHistoryCard(ticHist);
   } catch (e) { body.innerHTML = '<div class="chart-empty">Lỗi tải phân tích: ' + esc(e.message) + "</div>"; }
 }
 

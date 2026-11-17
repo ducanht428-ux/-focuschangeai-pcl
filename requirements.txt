@@ -36,3 +36,13 @@ Pillow>=10.0.0
 # Python. firebase-admin used to be listed here and is gone - nothing in edge-server talks to a
 # cloud service any more, so a machine with no internet stores exactly what it measures.
 PyYAML>=6.0
+
+# --- Teacher voice commands (focusedge/teacher_voice.py) --- OPTIONAL, installed by this file
+# Khẩu lệnh giáo viên ("bắt đầu thảo luận", "cả lớp chú ý", "ghi bài") đổi ngữ cảnh lớp. Mặc định TẮT:
+# chỉ chạy khi bấm bật trên dashboard, vì recognize_google gửi đoạn ghi âm ra internet - phần đo lường
+# còn lại của dự án vẫn offline. Thiếu hai gói này thì module tự tắt luồng nghe, in một dòng ASCII và
+# vẫn cho chọn ngữ cảnh bằng tay, nên không có chúng cũng không hỏng gì.
+# Đo trên máy này (Python 3.13.5, Windows): PyAudio 0.2.14 có wheel cp313 win_amd64, cài được thẳng;
+# SpeechRecognition 3.17.0 kéo theo audioop-lts / standard-aifc / standard-chunk (audioop bị bỏ từ 3.13).
+SpeechRecognition>=3.10.0
+PyAudio>=0.2.13

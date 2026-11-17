@@ -38,15 +38,84 @@ class TestTeacherVoice(unittest.TestCase):
         self.assertEqual(self.ai.detect_context("chép bài đi"), "STUDY_NOTE")
         self.assertEqual(self.ai.detect_context("mở sách làm bài tập"), "STUDY_NOTE")
 
+    def test_keywords_seatwork(self):
+        # Tài liệu 3 tách SEATWORK khỏi STUDY_NOTE: làm bài cá nhân / suy nghĩ.
+        self.assertEqual(self.ai.detect_context("các em tự làm bài nhé"), "SEATWORK")
+        self.assertEqual(self.ai.detect_context("cả lớp tự học"), "SEATWORK")
+        self.assertEqual(self.ai.detect_context("bây giờ làm bài một mình"), "SEATWORK")
+        self.assertEqual(self.ai.detect_context("đây là bài tập cá nhân"), "SEATWORK")
+        self.assertEqual(self.ai.detect_context("các em suy nghĩ rồi viết ra"), "SEATWORK")
+
+    def test_keywords_q_and_a(self):
+        self.assertEqual(self.ai.detect_context("ai trả lời câu hỏi này"), "Q_AND_A")
+        self.assertEqual(self.ai.detect_context("em nào giơ tay"), "Q_AND_A")
+        self.assertEqual(self.ai.detect_context("mời em phát biểu"), "Q_AND_A")
+        self.assertEqual(self.ai.detect_context("cô mời một bạn đọc bài"), "Q_AND_A")
+        self.assertEqual(self.ai.detect_context("bây giờ hỏi đáp"), "Q_AND_A")
+
+    def test_five_contexts_and_manual_accepts_new_ones(self):
+        self.assertEqual(len(TeacherContextAI.CONTEXTS), 5)
+        for ctx in ("SEATWORK", "Q_AND_A"):
+            self.ai.set_context(ctx, reason="dashboard_api")
+            self.assertEqual(self.ai.get_status()["context"], ctx)
+            self.assertTrue(self.ai.get_status()["has_command"])
+
+    def test_keyword_overlap_resolved_longest_first(self):
+        # "làm bài tập" (STUDY_NOTE, tài liệu 2 + test khoá) dài hơn "tự làm" (SEATWORK):
+        # câu chứa cả hai phải về STUDY_NOTE, không nhập nhằng.
+        self.assertEqual(self.ai.detect_context("các em tự làm bài tập"), "STUDY_NOTE")
+        # "hết giờ thảo luận" là lệnh VỀ nghe giảng, không phải lệnh thảo luận.
+        self.assertEqual(self.ai.detect_context("hết giờ thảo luận"), "LECTURE")
+
     def test_auto_reset_timeout(self):
         self.ai.set_context(TeacherContextAI.CONTEXT_GROUP_WORK)
         status = self.ai.get_status()
         self.assertEqual(status["context"], "GROUP_WORK")
 
-        # Sau 2.2 giây (lớn hơn auto_reset_seconds=2), phải tự về LECTURE
+        # Sau 2.2 giây (lớn hơn auto_reset_seconds=2) phải tự về UNKNOWN, KHÔNG phải LECTURE.
+        # Bản đầu tiên quay về LECTURE, tức là tự tuyên bố "đang nghe giảng" khi giáo viên đã im lặng
+        # 3 phút - và classroom.py đọc trạng thái khởi động đó thành khẩu lệnh thật, dán nhãn sai lên
+        # mọi phiên (2 test activity hỏng). Im lặng không phải là một hoạt động.
         time.sleep(2.2)
         status = self.ai.get_status()
+        self.assertEqual(status["context"], "UNKNOWN")
+        self.assertFalse(status["has_command"])
+
+    def test_starts_unknown_and_claims_no_command(self):
+        fresh = TeacherContextAI()
+        status = fresh.get_status()
+        self.assertEqual(status["context"], "UNKNOWN")
+        self.assertFalse(status["has_command"])
+        self.assertIsNone(status["source"])
+        self.assertEqual(status["last_speech"], "")
+        self.assertFalse(status["is_running"])
+
+    def test_feed_text_marks_speech_and_keeps_the_heard_sentence(self):
+        self.assertEqual(self.ai.feed_text("các em ghi bài vào vở"), "STUDY_NOTE")
+        status = self.ai.get_status()
+        self.assertEqual(status["context"], "STUDY_NOTE")
+        self.assertEqual(status["source"], "speech")
+        self.assertTrue(status["has_command"])
+        self.assertEqual(status["last_speech"], "các em ghi bài vào vở")
+        # Một câu không phải khẩu lệnh: ghi lại câu nghe được nhưng không đổi ngữ cảnh.
+        self.assertIsNone(self.ai.feed_text("trời hôm nay đẹp"))
+        self.assertEqual(self.ai.get_status()["context"], "STUDY_NOTE")
+
+    def test_manual_choice_is_not_labelled_as_speech(self):
+        self.ai.set_context(TeacherContextAI.CONTEXT_LECTURE, reason="dashboard_api")
+        status = self.ai.get_status()
+        self.assertEqual(status["source"], "manual")
         self.assertEqual(status["context"], "LECTURE")
+        # Trả quyền quyết định về cho luật viết tay.
+        self.ai.set_context(TeacherContextAI.CONTEXT_UNKNOWN)
+        self.assertFalse(self.ai.get_status()["has_command"])
+
+    def test_status_carries_the_privacy_warning(self):
+        status = self.ai.get_status()
+        # Nhận dạng dùng Google nên audio rời máy: giao diện phải nói điều đó trước khi bật micro.
+        self.assertTrue(status["sends_audio_offsite"])
+        self.assertIn("Google", status["privacy_note"])
+        self.assertIn("mic_available", status)
 
     def test_evaluator_lecture_context(self):
         # Trong LECTURE: nhìn bảng (yaw=0, pitch=0) là TẬP TRUNG
