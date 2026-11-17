@@ -1,7 +1,7 @@
-/* FocusChangeAI - cau noi cho ban web hosted (Qoder Sites).
+/* FocusChangeAI - cau noi cho ban web hosted.
    Ba che do, quyet dinh TRUOC khi app.js khoi dong (app.js cho FC_READY):
    - LIVE: may nguoi xem dang chay dashboard cuc bo (127.0.0.1:8730). Moi loi goi API
-     chuyen thang ve do; server cuc bo da mo CORS cho Origin *.qoder.website.
+     chuyen thang ve do; server cuc bo da mo CORS cho cac web host.
    - WEB (mac dinh khi khong thay server cuc bo): webdb-bridge.js doc chinh tep SQLite 10 bang
      ma man do / app da ghi tren may nay (IndexedDB hoac userData/focuschange.db). So that,
      hoac trang thai trong trung thuc - khong bom so mau.
