@@ -339,3 +339,114 @@ html[data-theme="dark"] .status-ok { color: #4ade80; }
   .page-head { flex-direction: column; }
   .stat-num { font-size: 22px; }
 }
+/* ---------------- đo trực tiếp trong dashboard ---------------- */
+/* Khung đo là một iframe cố định ở body, căn theo ô [data-live-slot] của màn đang mở.
+   z-index 20 nằm DƯỚI thanh trên (30), băng thông tin (30), menu mobile (40/50), modal (50)
+   và toast (60): khi cuộn, phần khung trôi lên trên vẫn bị thanh trên che chứ không đè lên nó. */
+#topbar { position: relative; z-index: 30; }
+#demo-banner { position: relative; z-index: 30; }
+/* Wide screens only: below 901px the sidebar is the fixed drawer (z-index 50) declared EARLIER in this
+   file, and an unconditional position:relative here would override it and break the drawer. */
+@media (min-width: 901px) { #sidebar { position: relative; z-index: 30; } }
+#live-layer {
+  position: fixed; z-index: 20; background: #0b1524;
+  border-radius: 10px; overflow: hidden;
+  box-shadow: 0 2px 14px rgba(8, 22, 44, .28), 0 0 0 1px rgba(77, 148, 255, .22);
+}
+/* Đỗ ngoài màn hình chứ KHÔNG display:none: khung bị ẩn hẳn sẽ không được vẽ, và vòng đo
+   mất nhịp. Khung vẫn sống khi giáo viên sang màn Báo cáo hay Học sinh. */
+#live-layer.parked { left: -20000px !important; top: 0 !important; width: 1280px !important; height: 720px !important; }
+#live-layer.fs { left: 0 !important; top: 0 !important; width: 100vw !important; height: 100vh !important; border-radius: 0; }
+#live-frame { width: 100%; height: 100%; border: 0; display: block; background: #0b1524; }
+.live-stage { position: relative; box-shadow: inset 0 0 0 1px rgba(77, 148, 255, .18); }
+.live-veil {
+  position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+  padding: 18px; color: #cfe0f5;
+  background: radial-gradient(120% 120% at 50% 0%, #16304f 0%, #0b1524 62%, #070f1c 100%);
+}
+.live-veil-in { max-width: 540px; }
+.live-veil-in > svg { width: 40px; height: 40px; color: #4d94ff; margin-bottom: 8px; }
+.live-veil h4 { margin: 0 0 6px; font-size: 16px; color: #fff; }
+.live-veil p { margin: 0 0 12px; font-size: 13px; line-height: 1.6; color: #9fb3ca; }
+.live-veil p b { color: #dbe7fa; }
+.live-veil .cam-buttons { justify-content: center; margin-top: 0; }
+
+/* thanh trên: pill đang đo + một nút tắt tiếng duy nhất */
+.dot-orange { background: var(--orange); }
+.chip-live, .chip-sound {
+  display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 12px; font-weight: 600;
+  border-radius: 999px; padding: 5px 11px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--card); color: var(--ink-soft);
+}
+.chip-live svg, .chip-sound svg { width: 15px; height: 15px; }
+.chip-live .dot { margin-right: 0; }
+.chip-live b { font-weight: 700; }
+.chip-live:hover, .chip-sound:hover { border-color: var(--blue); color: var(--blue); }
+.chip-live.on { background: var(--red-soft); border-color: var(--red); color: var(--red); }
+.chip-live.on .dot { animation: livePulse 1.4s ease-in-out infinite; }
+.chip-live.busy { background: var(--orange-soft); border-color: var(--orange); color: #b45309; }
+.chip-sound.off { opacity: .7; }
+@keyframes livePulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.8); } }
+
+/* số đo trực tiếp */
+.lv-state { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; }
+.lv-sei-row { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+.lv-sei { font-size: 52px; font-weight: 800; line-height: 1; letter-spacing: -1px; font-variant-numeric: tabular-nums; }
+.lv-sei-label { font-weight: 700; font-size: 13px; }
+.lv-kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(195px, 1fr)); gap: 0 16px; }
+.lv-kv { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.lv-kv > span { color: var(--ink-soft); }
+.lv-kv b { font-variant-numeric: tabular-nums; text-align: right; }
+.live-alert {
+  display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 9px 12px;
+  border-radius: 10px; background: var(--red-soft); color: var(--red);
+  font-size: 13px; font-weight: 600; border-left: 4px solid var(--red);
+}
+.live-alert svg { width: 17px; height: 17px; flex: none; }
+.live-alert.held { background: var(--orange-soft); color: #b45309; border-left-color: var(--orange); }
+
+/* nhật ký khung đo + thanh cuộn cùng tông màu của trang */
+.live-log {
+  max-height: 230px; overflow: auto; background: var(--blue-deep); color: #cfe0f5;
+  border-radius: 10px; padding: 10px 12px;
+  font-family: Consolas, "Courier New", monospace; font-size: 11.5px; line-height: 1.6;
+}
+.log-line { display: flex; gap: 8px; }
+.log-line > span { color: #6f92c4; flex: none; }
+#view, .live-log, .card, .tbl-wrap { scrollbar-width: thin; scrollbar-color: #b9cde4 var(--bg); }
+#view::-webkit-scrollbar, .live-log::-webkit-scrollbar, .card::-webkit-scrollbar { width: 10px; height: 10px; }
+#view::-webkit-scrollbar-track, .card::-webkit-scrollbar-track { background: var(--bg); border-radius: 999px; }
+.live-log::-webkit-scrollbar-track { background: #0a1526; border-radius: 999px; }
+#view::-webkit-scrollbar-thumb, .card::-webkit-scrollbar-thumb { background: #b9cde4; border-radius: 999px; border: 2px solid var(--bg); }
+.live-log::-webkit-scrollbar-thumb { background: #2f5688; border-radius: 999px; border: 2px solid #0a1526; }
+#view::-webkit-scrollbar-thumb:hover, .card::-webkit-scrollbar-thumb:hover { background: var(--blue); }
+.live-log::-webkit-scrollbar-thumb:hover { background: #4d94ff; }
+html[data-theme="dark"] #view, html[data-theme="dark"] .card { scrollbar-color: #2f4a6b var(--bg); }
+html[data-theme="dark"] #view::-webkit-scrollbar-thumb, html[data-theme="dark"] .card::-webkit-scrollbar-thumb { background: #2f4a6b; border-color: var(--bg); }
+
+/* danh sách em */
+.roster-row { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
+.roster-row:last-child { border-bottom: 0; }
+.roster-pick {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  background: none; border: 0; font: inherit; color: var(--ink);
+  padding: 8px 6px; cursor: pointer; border-radius: 8px; text-align: left;
+}
+.roster-pick:hover { background: var(--bg); }
+.roster-name { font-weight: 600; font-size: 13px; }
+.roster-meta { font-size: 11.5px; color: var(--ink-soft); }
+.roster-row.on { background: var(--green-soft); border-radius: 8px; }
+.roster-row.on .roster-name { color: #16a34a; }
+.roster-now { font-size: 11px; font-weight: 700; color: #16a34a; padding-right: 8px; flex: none; }
+a.btn { text-decoration: none; }
+
+@media (max-width: 1100px) {
+  .lv-state { align-items: flex-start; text-align: left; }
+}
+@media (max-width: 640px) {
+  .lv-sei { font-size: 40px; }
+  .lv-kv-grid { grid-template-columns: 1fr; }
+  .chip-sound span { display: none; }
+  .chip-live, .chip-sound { padding: 6px 9px; }
+  .live-veil p { font-size: 12px; }
+}

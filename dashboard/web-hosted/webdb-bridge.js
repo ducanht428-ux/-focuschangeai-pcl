@@ -74,22 +74,28 @@
     return { ok: false, error: what, hint: where };
   }
 
-  var WRITE_NOTE = "Trang này chỉ ĐỌC. Thêm/sửa em làm ở màn đo (nút Nhập danh sách) — màn đo giữ cả " +
-    "tệp db trong bộ nhớ và ghi lại sau mỗi phiên, nên ghi từ đây sẽ bị đè hoặc đè mất phiên đang đo.";
-  var NO_CAM = "Bản web không mở camera ở trang này. Mở màn đo để đo thật bằng webcam máy này.";
+  var WRITE_NOTE = "API của trang báo cáo chỉ ĐỌC. Thêm/sửa em làm trong khung đo ở màn Camera " +
+    "(nút Nhập danh sách) — khung đo giữ cả tệp db trong bộ nhớ và ghi lại sau mỗi phiên, nên ghi " +
+    "qua API này sẽ bị đè hoặc đè mất phiên đang đo.";
+  var NO_CAM = "Camera không chạy qua API của trang báo cáo. Bấm Bắt đầu ở màn Camera: khung đo " +
+    "nhúng mở webcam máy này ngay trong dashboard.";
   // ../index.html is the measurement screen only when this dashboard is embedded one level below it.
   // A dashboard-only build (tools/build_site.py) sits at the root, where that path is this same page.
-  var MEASURE_HINT = (function () {
-    var self = location.href.split("#")[0].split("?")[0];
-    return new URL("../index.html", location.href).href === self
-      ? "Bản dashboard-only không có màn đo đi kèm — chạy app PC hoặc bản web đầy đủ để đo."
-      : MEASURE_HINT;
-  })();
+  var HAS_MEASURE = new URL("../index.html", location.href).href !==
+    location.href.split("#")[0].split("?")[0];
+  var MEASURE_HINT = HAS_MEASURE
+    ? "Vào màn Camera của dashboard rồi bấm Bắt đầu để đo ngay tại đây."
+    : "Bản dashboard-only không có màn đo đi kèm — chạy app PC hoặc bản web đầy đủ để đo.";
+
+  var activeReload = null;
+  function reload() {
+    return activeReload ? activeReload() : Promise.resolve(window.FC_WEBDB_INFO || null);
+  }
 
   function install() {
     var base = new URL("../sqljs/", location.href).href;
     var info = {
-      ok: false, where: "", bytes: 0, tables: [], counts: {}, error: "",
+      ok: false, where: "", bytes: 0, tables: [], counts: {}, error: "", empty: false,
       hasConsent: false, hasMetrics: false, hasTrend: false, hasSeenAt: false, app: !!window.fcDb
     };
     var db = null;
@@ -320,7 +326,7 @@
         deps: { mediapipe: false, ultralytics: false, cv2: false, yaml: false, PIL: false },
         model: { path: "", present: false },
         camera_running: false, camera_error: "", camera_cfg: {},
-        database: { ready: !!db, path: info.where, bytes: info.bytes,
+        database: { ready: !!db, empty: !!info.empty, path: info.where, bytes: info.bytes,
                     sessions: count("observation_sessions"), students: count("students") },
         network: "Offline theo đặc tả - chưa bật mạng lớp (giai đoạn 3)",
         firebase: "Không dùng (đã bỏ đám mây theo đặc tả)",
@@ -420,7 +426,7 @@
         case "/api/backup": {
           if (!db || !info.bytes) {
             return jsonRes(refuse("Chưa có database để sao lưu — chưa có phiên đo nào được ghi trên máy này.",
-              "Mở màn đo, đo một phiên rồi bấm Dừng."));
+              "Đo một phiên ở màn Camera rồi bấm Dừng."));
           }
           var bytes = db.export();
           var name = "focuschange_web_" + Date.now() + ".db";
@@ -458,6 +464,75 @@
       return jsonRes({ ok: false, error: "Bản web không có tuyến " + path }, 404);
     }
 
+    // sql.js is loaded once for the life of the page. The embedded measurement frame saves the whole
+    // db after every closed session, so the reader has to be able to reopen the file without
+    // re-wrapping fetch/window.open a second time (that would nest the interceptors).
+    var SQLMod = null;
+
+    function refreshInfo() {
+      info.tables = q("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .map(function (r) { return r.name; });
+      info.hasConsent = has("student_consent");
+      info.hasMetrics = has("metrics");
+      info.hasTrend = has("class_trend");
+      info.hasSeenAt = has("alerts") &&
+        q("PRAGMA table_info(alerts)").some(function (c) { return c.name === "seen_at_ms"; });
+      info.counts = {};
+      info.tables.forEach(function (t) { info.counts[t] = count(t); });
+    }
+
+    function emptyInfo() {
+      if (db) { try { db.close(); } catch (e) { /* already closed */ } db = null; }
+      info.ok = false; info.bytes = 0; info.tables = []; info.counts = {};
+      // An empty store is not a broken one: the chip must say "Trống", not "Lỗi", or a teacher whose
+      // first session has not been closed yet reads a red error on a perfectly healthy machine.
+      info.empty = true;
+      info.hasConsent = info.hasMetrics = info.hasTrend = info.hasSeenAt = false;
+      info.where = window.fcDb ? "userData/focuschange.db (chưa có tệp)" : "IndexedDB của trình duyệt này (chưa có db)";
+      info.error = "Chưa có phiên đo nào được ghi trên máy này.";
+    }
+
+    async function adopt(bytes) {
+      if (!bytes || !bytes.length) { emptyInfo(); return info; }
+      if (!SQLMod) {
+        // Only fetched when there is actually a file to open: a visitor with no measured session
+        // gets the honest empty state without downloading the 688 KB wasm first.
+        await loadScript(base + "sql-wasm.js");
+        SQLMod = await window.initSqlJs({ locateFile: function (f) { return base + f; } });
+      }
+      var next = new SQLMod.Database(bytes);
+      if (db) { try { db.close(); } catch (e) { /* already closed */ } }
+      db = next;
+      info.bytes = bytes.length;
+      info.error = "";
+      info.empty = false;
+      info.ok = true;
+      refreshInfo();
+      return info;
+    }
+
+    // Re-read the file the measurement frame just wrote. Deliberately NOT install(): the fetch and
+    // window.open interceptors must stay wrapped exactly once.
+    async function reload() {
+      try {
+        var bytes = null;
+        if (window.fcDb) {
+          bytes = await window.fcDb.load();
+          info.where = await window.fcDb.path();
+        } else {
+          bytes = await idbLoad();
+          info.where = "IndexedDB của trình duyệt này (focuschangeai-sql)";
+        }
+        await adopt(bytes);
+      } catch (e) {
+        info.error = String((e && e.message) || e);
+        info.empty = false;
+      }
+      window.FC_WEBDB_INFO = info;
+      return info;
+    }
+    activeReload = reload;
+
     var origFetch = window.fetch.bind(window);
     window.fetch = function (input, opt) {
       var url = typeof input === "string" ? input : (input && input.url) || "";
@@ -483,44 +558,8 @@
       return origOpen.apply(null, arguments);
     };
 
-    return (async function () {
-      try {
-        var bytes = null;
-        if (window.fcDb) {
-          bytes = await window.fcDb.load();
-          info.where = await window.fcDb.path();
-        } else {
-          bytes = await idbLoad();
-          info.where = "IndexedDB của trình duyệt này (focuschangeai-sql)";
-        }
-        if (bytes && bytes.length) {
-          // sql.js is only fetched when there is actually a file to open: a visitor with no measured
-          // session gets the honest empty state without downloading the 688 KB wasm first.
-          await loadScript(base + "sql-wasm.js");
-          var SQL = await window.initSqlJs({ locateFile: function (f) { return base + f; } });
-          db = new SQL.Database(bytes);
-          info.bytes = bytes.length;
-          info.tables = q("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-            .map(function (r) { return r.name; });
-          info.hasConsent = has("student_consent");
-          info.hasMetrics = has("metrics");
-          info.hasTrend = has("class_trend");
-          info.hasSeenAt = has("alerts") &&
-            q("PRAGMA table_info(alerts)").some(function (c) { return c.name === "seen_at_ms"; });
-          info.tables.forEach(function (t) { info.counts[t] = count(t); });
-          info.ok = true;
-        } else {
-          info.where = window.fcDb ? "userData/focuschange.db (chưa có tệp)" : "IndexedDB của trình duyệt này (chưa có db)";
-          info.error = "Chưa có phiên đo nào được ghi trên máy này.";
-        }
-      } catch (e) {
-        info.error = String((e && e.message) || e);
-        info.where = window.fcDb ? "userData/focuschange.db" : "IndexedDB của trình duyệt này";
-      }
-      window.FC_WEBDB_INFO = info;
-      return info;
-    })();
+    return reload();
   }
 
-  window.FC_WEBDB = { install: install };
+  window.FC_WEBDB = { install: install, reload: reload };
 })();
