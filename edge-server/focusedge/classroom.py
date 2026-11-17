@@ -522,6 +522,50 @@ class ClassroomPipeline:
         self._sync_binding(rt)
         return rt.student_id
 
+    def bind_manual_name(self, track_id: int, name: str) -> Optional[str]:
+        """The dashboard's "Gắn tên" button: the m key's authority, with a readable name.
+
+        The cv2 window can only walk hs1/hs2 slots because it has no text field; the web
+        person card does, so the operator types who this is in one step. Same rule as the
+        first m press: take the first roster slot no other head has claimed, create hsN
+        when the roster is empty. An already-bound track keeps its slot - sessions stored
+        under that id stay that child's sessions - and only takes the new name.
+        identity_conf stays "manual": a stated name, never a machine match.
+        """
+        rt = self._tracks.get(track_id)
+        if rt is None:
+            return None
+        sid = rt.manual_student_id
+        if sid is None:
+            ids = [e.student_id for e in self._roster.entries()]
+            taken = set(t.manual_student_id for tid, t in self._tracks.items() if tid != track_id)
+            free = [s for s in ids if s not in taken]
+            sid = free[0] if free else self._add_manual_slot(len(ids) + 1)
+            rt.manual_student_id = sid
+        name = (name or "").strip()
+        if name:
+            entry = self._roster.get(sid)
+            if entry is None:
+                self._roster.add(sid, name)
+            else:
+                entry.name = name
+            self._save_roster()
+        self._sync_binding(rt)
+        return rt.student_id
+
+    def unbind_manual(self, track_id: int) -> bool:
+        """Release a stated name back to the machine's verdict (the m key's step past the last).
+
+        The track becomes a guest again: still measurable on screen, but no new session is
+        keyed to it, exactly like a head the machine never recognised.
+        """
+        rt = self._tracks.get(track_id)
+        if rt is None:
+            return False
+        rt.manual_student_id = None
+        self._sync_binding(rt)
+        return True
+
     def name_of(self, student_id: str) -> str:
         return self._roster.name_of(student_id)
 
