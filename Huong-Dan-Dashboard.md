@@ -27,7 +27,7 @@ không đám mây, không gửi ảnh/video ra ngoài. Mở bằng trình duyệ
 
 | Màn | Chức năng chính |
 |---|---|
-| Tổng quan | 4 thẻ số, camera trực tiếp + FPS, chỉ số trung bình lớp (EAR/MAR/góc/chú ý), biểu đồ 30 phút, hoạt động gần đây, trạng thái hệ thống |
+| Tổng quan | 5 thẻ số — thêm thẻ **"Đang mất tập trung"**: đếm số em lệch ngữ cảnh (OFF_TASK) ngay lúc đó, **bấm vào thẻ** mở danh sách cụ thể từng em (tên, ngữ cảnh, lý do, giây lệch/cửa sổ, cộng dồn cả phiên, SEI); danh sách tự cập nhật khi còn mở, kèm nhóm "đang theo dõi" chưa vượt cửa sổ. Camera chưa bật thì thẻ hiện "--" chứ không hiện 0 giả. Camera trực tiếp + FPS, chỉ số trung bình lớp (EAR/MAR/góc/chú ý), biểu đồ 30 phút, hoạt động gần đây, trạng thái hệ thống |
 | Camera | Bắt đầu/Dừng, chụp ảnh màn hình, toàn màn hình; độ phân giải, số mặt, tần suất quét, độ nhạy; bật/tắt hộp, số liệu đè, tăng sáng; thẻ từng em (Gắn tên/Đổi tên/Bỏ tên); **khẩu lệnh giáo viên** (xem mục 5.1); phím F Y O G H N |
 | Học sinh | Thêm/sửa/xoá, nhập/xuất CSV, công tắc đồng ý (rút đồng ý = xoá vector mặt ngay), xoá dây chuyền khi chuyển trường |
 | Phân tích AI | Biểu đồ theo buổi / theo tiết của từng em, so với baseline cá nhân; cột **Lệch ngữ cảnh** trong bảng phiên; thẻ **Theo dõi dấu hiệu Tic** đọc dọc nhiều tuần (mục 5.3); dự báo & gợi ý nghỉ là tính năng Ultra (khoá) |

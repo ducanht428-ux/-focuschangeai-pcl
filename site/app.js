@@ -779,11 +779,14 @@ function renderOverview() {
     '<div class="page-head"><div><h2>' + ico("home") + 'Tổng quan</h2>' +
     '<p id="ov-sub">Lớp học · năm học 2026–2027</p></div>' +
     '<div class="field" style="margin:0"><label>Ngày xem</label><input type="date" id="ov-date" value="' + S.date + '"></div></div>' +
-    '<div class="grid grid-stats">' +
+    '<div class="grid grid-stats five">' +
     statCard("blue", "users", "ov-students", "--", "Học sinh", "ov-students-sub", "trong lớp") +
     statCard("green", "camera", "ov-camera", "--", "Camera", "ov-camera-sub", "") +
     statCard("orange", "activity", "ov-ai", "--", "Trạng thái hoạt động", "ov-ai-sub", "MediaPipe + AI") +
     statCard("red", "bell", "ov-alerts", "--", "Cảnh báo hôm nay", "ov-alerts-sub", "") +
+    // Biến đếm "đang mất tập trung" (OFF_TASK theo ngữ cảnh khẩu lệnh GV) — bấm vào mở
+    // danh sách cụ thể từng em. Không đếm WATCH (chưa vượt cửa sổ) và không lẫn cảnh báo parity.
+    statCard("red", "warn", "ov-offtask", "--", "Đang mất tập trung", "ov-offtask-sub", "bấm để xem em nào") +
     "</div>" +
     '<div class="grid grid-overview">' +
     (window.FC_MODE === "web"
@@ -808,6 +811,13 @@ function renderOverview() {
     '<div class="card"><h3>' + ico("info") + 'Trạng thái hệ thống</h3><div id="ov-system"></div></div>' +
     "</div>";
   $("ov-date").onchange = (e) => { S.date = e.target.value || todayStr(); tickFast(); };
+  const offCard = $("ov-offtask").closest(".stat");
+  offCard.classList.add("stat-click");
+  offCard.title = "Bấm để xem em nào đang mất tập trung";
+  offCard.setAttribute("role", "button");
+  offCard.tabIndex = 0;
+  offCard.onclick = showOffTaskList;
+  offCard.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showOffTaskList(); } };
   if (window.FC_MODE !== "web") wireCameraButtons("ov", "ov-wrap");
   else {
     $("ov-start").onclick = liveStart;
@@ -846,6 +856,7 @@ function updateOverviewParts() {
   $("ov-alerts").textContent = ov.alerts_today;
   $("ov-alerts-sub").textContent = ov.alerts_unseen + " chưa xem";
   $("ov-alerts").closest(".stat").classList.toggle("danger", ov.alerts_unseen > 0);
+  updateOffTaskCard();
   const a = ov.averages || {};
   $("ov-avgs").innerHTML =
     avgRow("eye", "EAR (mở mắt)", a.ear, 2, 0.5, "var(--blue)") +
@@ -1718,6 +1729,86 @@ function ticBadge(p) {
   if (!t || !t.level) return "";
   return '<div class="tic-badge lv' + t.level + '" title="' + esc(t.disclaimer || "") + '">' +
     ico("warn") + " " + esc(t.label || "Dấu hiệu giật lặp lại") + "</div>";
+}
+
+/* ============================== đếm "đang mất tập trung" + danh sách bấm xem ==============================
+   Nguồn duy nhất: S.live.people[].context (context_eval.py ở LIVE, ctxView ở DEMO — cùng dạng).
+   OFF_TASK = đã lệch quá cửa sổ ngữ cảnh; WATCH chỉ "đang theo dõi", KHÔNG đếm vào biến này.
+   Camera chưa chạy thì hiện "--" chứ không hiện 0 giả vờ "cả lớp ngoan". Danh sách trong modal
+   tự cập nhật mỗi nhịp tickFast khi còn mở, nên giáo viên để đó nhìn số nhảy theo thời gian thực. */
+function offTaskPeople() {
+  const people = (S.live && S.live.people) || [];
+  return {
+    running: !!(S.live && S.live.camera && S.live.camera.running),
+    off: people.filter((p) => p.context && p.context.state === "OFF_TASK"),
+    watch: people.filter((p) => p.context && p.context.state === "WATCH"),
+    judged: people.some((p) => p.context && p.context.state && p.context.state !== "NEUTRAL"),
+  };
+}
+
+function updateOffTaskCard() {
+  const el = $("ov-offtask");
+  if (!el) return;
+  const t = offTaskPeople();
+  el.textContent = t.running ? String(t.off.length) : "--";
+  $("ov-offtask-sub").textContent = !t.running ? "chưa bật camera"
+    : t.off.length ? "bấm để xem em nào"
+    : !t.judged ? "chưa có khẩu lệnh ngữ cảnh"
+    : t.watch.length ? t.watch.length + " em đang theo dõi" : "cả lớp trong ngữ cảnh";
+  el.closest(".stat").classList.toggle("danger", t.off.length > 0);
+  const body = $("offtask-body");
+  if (body && modalOpen()) body.innerHTML = offTaskBody();
+}
+
+function offTaskRow(p) {
+  const c = p.context;
+  const chip = CTX_STATE_CHIP[c.state] || [c.state, "warn"];
+  const sev = CTX_SEVERITY[c.severity];
+  return '<div class="offtask-row ' + (c.state === "OFF_TASK" ? "bad" : "warn") + '">' +
+    '<div class="offtask-head"><b>' + esc(p.name) + "</b>" +
+    '<span class="sit-chip ' + chip[1] + '">' + chip[0] + "</span>" +
+    (p.student_id ? "" : '<span class="muted small">chưa gắn tên — không lưu phiên</span>') + "</div>" +
+    (c.context_vi ? '<div class="offtask-kv">Ngữ cảnh: <b>' + esc(c.context_vi) + "</b></div>" : "") +
+    '<div class="ctx-reason">' + esc(c.reason || "") + "</div>" +
+    '<div class="offtask-kv">Lệch <b>' + num(c.off_s, 0) + "s</b> / cửa sổ " + num(c.window_s, 0) + "s" +
+    " · Cộng dồn cả phiên <b>" + num(c.off_total_s, 0) + "s</b>" + (sev ? " · mức " + sev : "") +
+    (p.sei != null ? " · SEI " + num(p.sei, 0) + "%" : "") + "</div></div>";
+}
+
+function offTaskBody() {
+  const t = offTaskPeople();
+  if (!t.running) {
+    return '<div class="muted small">Camera chưa bật nên chưa đánh giá được em nào. ' +
+      "Bật camera ở màn Camera (hoặc bấm Bắt đầu đo) và chọn khẩu lệnh ngữ cảnh trước.</div>";
+  }
+  if (!t.off.length && !t.watch.length) {
+    return '<div class="muted small">' + (t.judged
+      ? "Không có em nào đang lệch ngữ cảnh — cả lớp đang trong tiêu chí của ngữ cảnh hiện tại."
+      : "Chưa đánh giá được: chưa có khẩu lệnh ngữ cảnh của giáo viên, hoặc chưa có mặt nào đo được. " +
+        "Chọn ngữ cảnh ở thẻ Khẩu lệnh giáo viên (màn Camera) để bắt đầu đánh giá.") + "</div>";
+  }
+  let html = "";
+  if (t.off.length) {
+    html += '<div class="offtask-sec">Đang mất tập trung (' + t.off.length + " em)</div>" +
+      t.off.map(offTaskRow).join("");
+  }
+  if (t.watch.length) {
+    html += '<div class="offtask-sec">Đang theo dõi — chưa vượt cửa sổ (' + t.watch.length + " em)</div>" +
+      t.watch.map(offTaskRow).join("");
+  }
+  return html;
+}
+
+function showOffTaskList() {
+  openModal("<h3>" + ico("warn") + ' Học sinh đang mất tập trung</h3>' +
+    '<div id="offtask-body">' + offTaskBody() + "</div>" +
+    '<div class="avg-note mt">Khuyến nghị sư phạm theo ngữ cảnh khẩu lệnh GV — không phải cảnh báo kỷ luật. ' +
+    "Danh sách tự cập nhật khi còn mở.</div>" +
+    '<div class="modal-actions">' +
+    '<button class="btn" id="offtask-close">Đóng</button>' +
+    '<button class="btn btn-primary" id="offtask-camera">' + ico("camera") + " Mở màn Camera</button></div>");
+  $("offtask-close").onclick = closeModal;
+  $("offtask-camera").onclick = () => { closeModal(); location.hash = "#camera"; };
 }
 
 function updateCameraParts() {

@@ -176,6 +176,18 @@ html[data-theme="dark"] #demo-banner.banner-real { color: #86efac; border-color:
 .stat-sub { color: var(--ink-soft); font-size: 12px; }
 .stat.warn .stat-num, .stat.warn .stat-label { color: var(--orange); }
 .stat.danger .stat-num, .stat.danger .stat-label { color: var(--red); }
+/* Thẻ thứ 5 "Đang mất tập trung": 5 cột khi rộng, tự xuống hàng khi hẹp (không phá màn Báo cáo 4 thẻ). */
+.grid-stats.five { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.stat-click { cursor: pointer; transition: box-shadow .15s, transform .15s; }
+.stat-click:hover, .stat-click:focus-visible { box-shadow: 0 4px 14px rgba(31, 111, 235, .18); transform: translateY(-1px); outline: none; }
+/* Danh sách em mất tập trung trong modal (bấm thẻ đếm ở Tổng quan). */
+.offtask-sec { font-weight: 700; margin: 10px 0 6px; }
+.offtask-row { border: 1px solid var(--line); border-left-width: 4px; border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; }
+.offtask-row.bad { border-left-color: var(--red); background: var(--red-soft, rgba(239, 68, 68, .06)); }
+.offtask-row.warn { border-left-color: var(--orange); background: var(--orange-soft, rgba(245, 158, 11, .07)); }
+.offtask-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.offtask-kv { font-size: 12.5px; color: var(--ink-soft); margin-top: 3px; }
+.offtask-kv b { color: var(--ink); }
 
 /* ---------------- camera ---------------- */
 .cam-wrap { position: relative; background: #0b1524; border-radius: 10px; overflow: hidden; aspect-ratio: 16 / 9; }

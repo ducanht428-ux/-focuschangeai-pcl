@@ -327,7 +327,9 @@
         if (now > p.blink_at) { p.blink_until = now + 260; p.blink_at = now + rnd(2500, 6500); }
         if (now > p.yawn_at) { p.yawn_until = now + 1600; p.yawn_at = now + rnd(45000, 110000);
           pushAlert(p, "YAWN", 2, "Ngáp dài — có thể đang mệt."); }
-        if (now > p.away_at) { p.away_until = now + rnd(2500, 5000); p.away_at = now + rnd(25000, 70000);
+        // Cơn quay đầu 3–12s: phải có cơn DÀI HƠN cửa sổ 7s của LECTURE thì thẻ đếm
+        // "Đang mất tập trung" ở Tổng quan mới có ca OFF_TASK thật để trình diễn (bản DEMO).
+        if (now > p.away_at) { p.away_until = now + rnd(3000, 12000); p.away_at = now + rnd(25000, 70000);
           p.away_dir = Math.random() < 0.5 ? -1 : 1;
           pushAlert(p, "LOOK_AWAY", 2, "Đầu đang quay lệch khỏi màn hình."); }
         if (now > p.doze_at) { p.doze_until = now + rnd(3000, 6000); p.doze_at = now + rnd(60000, 140000);
