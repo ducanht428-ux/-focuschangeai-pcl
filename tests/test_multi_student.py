@@ -284,6 +284,15 @@ def test_a_person_the_scheduler_skipped_keeps_their_own_last_numbers():
     assert cp.person_result(4) is None
 
 
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    for k, v in sorted(globals().items()):
+        if k.startswith("test_") and callable(v):
+            suite.addTest(unittest.FunctionTestCase(v))
+    return suite
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

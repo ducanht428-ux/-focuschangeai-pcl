@@ -116,7 +116,7 @@ TIERS = ("standard", "pro", "promax", "ultra")
 # API đều hỏi hàm tier_allows chứ không tự rẽ nhánh theo bậc ở nhiều nơi.
 TIER_GATES = {
     "csv_export": "pro",
-    "auto_backup": "pro",
+    "auto_backup": "standard",
     "personal_baseline": "pro",
     "multi_class": "promax",
     "parent_report": "promax",

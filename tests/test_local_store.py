@@ -443,5 +443,16 @@ def _wired_pipeline(store):
     return ClassroomPipeline(cfg, None, None, _Roster(), None, None, store)
 
 
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    def _run_store():
+        main()
+        if FAILS:
+            raise AssertionError(f"test_local_store had failures: {FAILS}")
+    suite.addTest(unittest.FunctionTestCase(_run_store))
+    return suite
+
+
 if __name__ == "__main__":
     main()

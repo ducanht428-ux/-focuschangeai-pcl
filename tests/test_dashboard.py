@@ -287,5 +287,16 @@ def main():
     return 1 if FAIL else 0
 
 
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    def _run_dash():
+        res = main()
+        if res != 0:
+            raise AssertionError("test_dashboard had failures")
+    suite.addTest(unittest.FunctionTestCase(_run_dash))
+    return suite
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -142,5 +142,14 @@ def main() -> int:
     return 1 if failed else 0
 
 
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    for k, v in sorted(globals().items()):
+        if k.startswith("test_") and callable(v):
+            suite.addTest(unittest.FunctionTestCase(v))
+    return suite
+
+
 if __name__ == "__main__":
     sys.exit(main())

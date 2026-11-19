@@ -212,7 +212,7 @@ const ACTION_LABEL = {
 
 function allows(feature) {
   const gates = (S.system && S.system.gates) || {
-    csv_export: "pro", auto_backup: "pro", personal_baseline: "pro", multi_class: "promax",
+    csv_export: "pro", auto_backup: "standard", personal_baseline: "pro", multi_class: "promax",
     parent_report: "promax", yolo_context: "promax", predict: "ultra", assistant: "ultra", parent_portal: "ultra"};
   const tiers = ["standard", "pro", "promax", "ultra"];
   const need = gates[feature];
@@ -2477,8 +2477,8 @@ async function renderBackup() {
         (MEASURE_HREF ? '<div class="cam-buttons mt"><a class="btn" href="#camera">' + ico("camera") + " Về màn Camera</a>" +
           '<a class="btn" href="' + MEASURE_HREF + '">' + ico("settings") + " Màn đo gốc (test)</a></div>" : "") + "</div>"
       : '<div class="card"><h3>' + ico("settings") + "Tự động & thời gian lưu</h3>" +
-        switchRow("bk-auto", "Sao lưu tự động theo lịch (Pro)", st.auto_backup === "1") +
-        (canAuto ? "" : '<div class="lock-note mt">' + ico("lock") + " Sao lưu tự động cần bậc Pro trở lên. Bản standard sao lưu thủ công ở nút bên.</div>") +
+        switchRow("bk-auto", "Sao lưu tự động theo lịch", st.auto_backup === "1") +
+        (canAuto ? "" : '<div class="lock-note mt">' + ico("lock") + " Bản standard sao lưu thủ công ở nút bên.</div>") +
         '<div class="field mt"><label>Thời gian lưu dữ liệu (ngày) — tự xóa phiên quá hạn</label>' +
         '<input type="number" id="bk-retention" min="1" value="' + esc(st.retention_days || "180") + '"></div>' +
         '<button class="btn" id="bk-retention-save">' + ico("check") + " Lưu thời gian lưu</button>" +

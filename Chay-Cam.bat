@@ -4,23 +4,20 @@ rem Double-click this file, then sit 60-80 cm in front of the webcam, facing the
 rem ESC closes the picture window; Ctrl+C in this black window stops the program.
 cd /d "%~dp0"
 
-rem This machine's known-good interpreter is tried first. On another PC that line fails,
-rem so the launcher falls back to the Windows Python launcher and then to PATH, instead of
-rem asking anyone to edit this file. py.exe comes from python.org's installer; a Microsoft
-rem Store Python does not ship it, which is why the plain "python.exe" name is tried last.
-set "PY=C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe"
+rem Try python in PATH first, then Python launcher, then common installation paths.
+set "PY="
+for /f "delims=" %%i in ('where python.exe 2^>nul') do if not defined PY set "PY=%%i"
 if exist "%PY%" goto found
 
-set "PY="
 for /f "delims=" %%i in ('py -3.12 -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%i"
 if exist "%PY%" goto found
 
-set "PY="
 for /f "delims=" %%i in ('py -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%i"
 if exist "%PY%" goto found
 
-set "PY="
-for /f "delims=" %%i in ('where python.exe 2^>nul') do if not defined PY set "PY=%%i"
+set "PY=C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python313\python.exe"
+if exist "%PY%" goto found
+set "PY=C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python312\python.exe"
 if exist "%PY%" goto found
 
 echo Python was not found on this PC.
@@ -66,7 +63,7 @@ rem for a face match. The live view is written in every case.
 echo If the log above says "identity off" and no head was named with M, this run stored NO sessions:
 echo every face stayed a guest and only its live view was written (out\class_live_*.json).
 echo Sessions that were stored - recognised or named with M - land on this machine in:
-echo   ..\data\focuschange.db          (the measurements: sessions, features, bands, alerts)
+echo   data\focuschange.db          (the measurements: sessions, features, bands, alerts)
 echo   out\class_live_*.json, out\presence_*.json   (the last few seconds, as they were)
-echo To see what is in the database:  %PY% ..\database\focuschange_db.py
+echo To see what is in the database:  %PY% database\focuschange_db.py
 pause

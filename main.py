@@ -1023,6 +1023,44 @@ def main(argv=None) -> int:
              # separate debug window. Y turns them off, and that is the view that matches the phone.
              "yolo": True, "boxes": None}
 
+    trend_acc: list = []
+    trend_bucket = 0
+    trend_last_flush = time.monotonic() * 1000
+    writer_store = getattr(pipeline, "_writer", None)
+    if writer_store and getattr(writer_store, "enabled", False):
+        try:
+            from database import app_tables
+            with writer_store._lock:
+                app_tables.init_app_tables(writer_store._conn)
+        except Exception:
+            pass
+
+    def _flush_trend(b_ms, rows):
+        if not writer_store or not getattr(writer_store, "enabled", False) or not rows or not b_ms:
+            return
+        vals = {"sei": [], "ear": [], "mar": [], "angle": []}
+        stu = []
+        for r in rows:
+            stu.append(r.get("n", 0))
+            for k in ("sei", "ear", "mar", "angle"):
+                if r.get(k) is not None:
+                    vals[k].append(r[k])
+        means = {k: (round(sum(v) / len(v), 2) if v else None) for k, v in vals.items()}
+        n_st = max(stu) if stu else 0
+        try:
+            with writer_store._lock:
+                writer_store._conn.execute(
+                    "INSERT INTO class_trend (bucket_ms, mean_sei, mean_ear, mean_mar, mean_angle,"
+                    " n_students, source) VALUES (?, ?, ?, ?, ?, ?, 'live')"
+                    " ON CONFLICT(bucket_ms) DO UPDATE SET mean_sei=excluded.mean_sei,"
+                    " mean_ear=excluded.mean_ear, mean_mar=excluded.mean_mar,"
+                    " mean_angle=excluded.mean_angle, n_students=excluded.n_students, source='live'",
+                    (b_ms, means.get("sei"), means.get("ear"), means.get("mar"),
+                     means.get("angle"), n_st))
+                writer_store._conn.commit()
+        except Exception:
+            pass
+
     if args.show:
         # WINDOW_AUTOSIZE, not WINDOW_NORMAL. The canvas is already built to the screen, so there is
         # nothing to gain from resizing - and a maximised cv2 window resamples the whole canvas,
@@ -1075,6 +1113,38 @@ def main(argv=None) -> int:
                 det_count, det_window_ms = 0, 0.0
                 state["det_rate"] = det_rate
 
+            if results:
+                from focusedge.constants import HabitFeature
+                r_vals = {"sei": [], "ear": [], "mar": [], "angle": []}
+                for r in results:
+                    if r.sei is not None:
+                        r_vals["sei"].append(float(r.sei))
+                    ear = r.features.get(HabitFeature.EAR)
+                    mar = r.features.get(HabitFeature.MAR)
+                    if ear is not None:
+                        r_vals["ear"].append(float(ear))
+                    if mar is not None:
+                        r_vals["mar"].append(float(mar))
+                    angle = r.pitch if r.pitch is not None else r.yaw
+                    if angle is not None:
+                        r_vals["angle"].append(abs(float(angle)))
+                m_row = {k: (sum(v) / len(v) if v else None) for k, v in r_vals.items()}
+                m_row["n"] = len(results)
+                trend_acc.append(m_row)
+
+            now_bucket = int(time.time() * 1000) // 60000 * 60000
+            if trend_bucket == 0:
+                trend_bucket = now_bucket
+            now_wall_m = time.monotonic() * 1000
+            if now_bucket != trend_bucket:
+                _flush_trend(trend_bucket, trend_acc)
+                trend_bucket = now_bucket
+                trend_acc = []
+                trend_last_flush = now_wall_m
+            elif trend_acc and (now_wall_m - trend_last_flush >= 10000.0):
+                _flush_trend(trend_bucket, trend_acc)
+                trend_last_flush = now_wall_m
+
             if session_reset_ms and int(time.time() * 1000) - started_wall >= session_reset_ms:
                 pipeline.shutdown()
                 started_wall = int(time.time() * 1000)
@@ -1122,6 +1192,8 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\nstopping...")
     finally:
+        if trend_bucket and trend_acc:
+            _flush_trend(trend_bucket, trend_acc)
         # Asked before shutdown(), because shutdown() closes the database and LocalStore.enabled is
         # "_conn is not None" - read afterwards it is false for every run on earth, and a healthy run
         # that stored six sessions would end by telling the operator "database NOT open".

@@ -154,6 +154,7 @@ class CameraRunner:
             started = int(time.time() * 1000)
             bucket = 0
             acc: List[Dict] = []
+            last_flush = time.monotonic() * 1000
             with self._lock:
                 self._info["started_ms"] = started
             while not self._stop.is_set():
@@ -185,19 +186,38 @@ class CameraRunner:
                     self._jpeg = buf.tobytes() if ok2 else None
                     self._info = {"people": people, "fps": fps, "processing_ms": proc,
                                   "activity": activity, "started_ms": started, "frames": frames}
-                # Trung bình lớp mỗi phút một lần -> bảng class_trend, để biểu đồ 30 phút
-                # còn dữ liệu sau khi mở lại app. Chỉ số, không phải ảnh.
+                # Trung bình lớp ghi định kỳ vào class_trend:
+                # - Ghi cập nhật mỗi 10s trong phút hiện tại để giáo viên thấy số ngay.
+                # - Khi chuyển sang phút mới, chốt bucket cũ và bắt đầu bucket mới.
                 if results:
                     acc.append(self._means(results))
                 now_bucket = int(time.time() * 1000) // 60000 * 60000
+                if bucket == 0:
+                    bucket = now_bucket
+                now_wall = time.monotonic() * 1000
                 if now_bucket != bucket:
-                    if bucket and acc and self._on_minute:
-                        self._on_minute(bucket, self._average(acc))
+                    if acc and self._on_minute:
+                        try:
+                            self._on_minute(bucket, self._average(acc))
+                        except Exception:
+                            pass
                     bucket = now_bucket
                     acc = []
+                    last_flush = now_wall
+                elif acc and self._on_minute and (now_wall - last_flush >= 10000.0):
+                    try:
+                        self._on_minute(bucket, self._average(acc))
+                    except Exception:
+                        pass
+                    last_flush = now_wall
         except Exception as e:  # ranh giới với camera và lõi đo: lỗi phải hiện lên màn hình
             self.error = "%s: %s" % (type(e).__name__, e)
         finally:
+            if bucket and acc and self._on_minute:
+                try:
+                    self._on_minute(bucket, self._average(acc))
+                except Exception:
+                    pass
             self._pipeline = None
             if pipeline is not None:
                 try:
@@ -300,13 +320,16 @@ class CameraRunner:
             angle = r.pitch if r.pitch is not None else r.yaw
             if angle is not None:
                 vals["angle"].append(abs(float(angle)))
-        return {k: (sum(v) / len(v) if v else None) for k, v in vals.items()}
+        m = {k: (sum(v) / len(v) if v else None) for k, v in vals.items()}
+        m["n_students"] = len(results)
+        return m
 
     @staticmethod
     def _average(rows: List[Dict]) -> Dict:
         out = {}
         for key in ("sei", "ear", "mar", "angle"):
             vals = [r[key] for r in rows if r.get(key) is not None]
-            out[key] = sum(vals) / len(vals) if vals else None
-        out["n"] = len(rows)
+            out[key] = round(sum(vals) / len(vals), 2) if vals else None
+        stu = [r.get("n_students", 0) for r in rows if r.get("n_students") is not None]
+        out["n"] = max(stu) if stu else 0
         return out
