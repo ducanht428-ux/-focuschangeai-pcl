@@ -17,12 +17,14 @@ face_landmarker_task: "../app/src/main/assets/face_landmarker.task"
 # it just means nobody is bound automatically: every track stays a guest and no session row is
 # written for it until somebody names it (see the M key below, or enroll templates for ArcFace).
 roster: "roster.json"
-# Model weights are NOT in git; ultralytics downloads them on first use (yolo11n.pt = 5.6 MB,
-# yolo11m.pt = 40 MB, both measured here), and the insightface buffalo_l pack is about 280 MB.
-# The first run on a new machine therefore needs internet. insightface is deliberately absent on the
-# laptop used for this project: its onnxruntime backend crashes that process outright (measured again
-# here: import onnxruntime -> SIGSEGV, exit 139, three runs out of three, onnxruntime 1.31.1), and
-# identity is optional (see classroom.py "identity off").
+# Model weights ARE in git (yolo11n.pt = 5.6 MB, yolo11m.pt = 40 MB, both measured here);
+# the insightface buffalo_l pack (~280 MB) is not, and ultralytics would download a missing
+# checkpoint on first use.
+# Only the optional insightface pack needs internet on a new machine. insightface is deliberately absent on the
+# laptop used for this project: it has no cp312 Windows wheel and the source build needs MSVC, which this
+# box does not have. onnxruntime itself is fixed at 1.20.1 (requirements.txt): 1.31.1 segfaulted on import
+# here (exit 139, three runs out of three), 1.20.1 imports and runs inference. Identity is optional
+# (see classroom.py "identity off").
 # A guest can still be named without any of that: in the preview, 1-9 picks a head and M declares
 # which student it is. That is enough for _retire to store the session, and the row carries
 # identity "manual" in its notes, so a table of declared names never reads as a table of matches.
@@ -56,6 +58,14 @@ input:
   # i5-5200U (2 cores, no GPU) = 6.9 steps/s, and at imgsz 480 it takes 100 ms = 10 steps/s.
   # 8 sits between the two so a slower frame does not stall the loop.
   detect_fps: 8
+  # How often pipeline.step() runs (eye measurement cadence). With detection.yolo_every = 2
+  # only every second step pays a YOLO pass; the steps between measure eyes on the cached
+  # boxes, which is what lets a 100-400 ms blink land inside a measured frame more often.
+  # Component costs measured on this box: YOLO 150 ms, FaceLandmarker 8 ms, so a stride-2
+  # step averages ~83 ms = 12 steps/s against ~6.3 with one YOLO per step. End-to-end fps
+  # with a real class still has to be read off the HUD line, not assumed from this arithmetic.
+  # 0 or absent = step at detect_fps, the old one-YOLO-per-step behavior.
+  measure_fps: 12
 
 # --- Layer 1: detection + tracking (YOLO + ByteTrack) ---
 detection:
@@ -69,6 +79,11 @@ detection:
   person_class: 0            # COCO class id for "person"
   conf: 0.35                 # minimum detection confidence
   tracker: "bytetrack.yaml"  # built into ultralytics
+  # Run YOLO on every Nth step; the steps between reuse the last person boxes and only run
+  # FaceLandmarker. 1 = detect every step (old behavior). 2 halves the YOLO cost so the eye
+  # cadence set by input.measure_fps fits this CPU; boxes are then at most one frame stale.
+  # An empty room always re-detects, so a child walking in is found on the next frame.
+  yolo_every: 2
   # A track whose last sighting is older than this is dropped (its PersonPipeline parks).
   track_ttl_ms: 15000
 
@@ -112,6 +127,23 @@ person:
   sensitivity: 1
   # Session is committed to the habit profile only when it clears HabitConfig bars.
   habit_learn: true
+
+# --- Teacher voice commands (OFFLINE, focusedge/teacher_voice.py) ---
+# Speech is decoded on this machine by Vosk with a Vietnamese model; no audio is uploaded
+# anywhere. The old recognize_google path was a cloud API, not a downloadable library, and is gone.
+# The model is NOT in git (32 MB zip, Apache 2.0). Fetch it once:
+#   https://alphacephei.com/vosk/models/vosk-model-small-vn-0.4.zip
+# and unzip into models/ so models/vosk-model-small-vn-0.4/ exists. Without it the listen
+# button reports "manual" and the context can still be picked by hand in the dashboard.
+# Measured on the project laptop (i5-5200U): model load 0.95 s, decode real-time factor ~1.18,
+# so a command lands a few seconds after it is spoken and speech during decode is missed.
+teacher_voice:
+  model_path: "models/vosk-model-small-vn-0.4"
+  # Silence this long after a command returns the context to LECTURE (vision label in charge).
+  auto_reset_seconds: 180
+  # The teacher's rule: a head looking elsewhere for 10 minutes counts as off-task. The verdict
+  # is display only (person card "Chu y"), never an alert and never a stored number.
+  off_task_seconds: 600
 
 # --- Layer 5: local storage (SQLite + out/) ---
 # Nothing leaves this machine any more. Measured sessions, their per-feature statistics, the

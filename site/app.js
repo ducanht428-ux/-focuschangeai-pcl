@@ -179,12 +179,13 @@ const S = {
   studentQuery: "",
   focusTrack: null, hidePeople: false,
   soundOn: localStorage.getItem("fc_sound") !== "0",
+  alertSummary: localStorage.getItem("fc_alert_summary") === "1",
   lastUnseen: null,
 };
 
 const TIER_LABEL = {standard: "Standard", pro: "Pro", promax: "Pro Max", ultra: "Ultra"};
 const GATE_LABEL = {
-  csv_export: "Xuất CSV/Excel", auto_backup: "Sao lưu tự động", personal_baseline: "Baseline cá nhân",
+  csv_export: "Xuất CSV/Excel", personal_baseline: "Baseline cá nhân",
   multi_class: "Nhiều lớp / nhiều giáo viên", parent_report: "Báo cáo gửi phụ huynh",
   yolo_context: "Nhận diện bối cảnh (YOLO)", predict: "Dự báo xu hướng AI",
   assistant: "Trợ lý hỏi đáp", parent_portal: "Cổng phụ huynh",
@@ -210,7 +211,7 @@ const ACTION_LABEL = {
 
 function allows(feature) {
   const gates = (S.system && S.system.gates) || {
-    csv_export: "pro", auto_backup: "pro", personal_baseline: "pro", multi_class: "promax",
+    csv_export: "pro", personal_baseline: "pro", multi_class: "promax",
     parent_report: "promax", yolo_context: "promax", predict: "ultra", assistant: "ultra", parent_portal: "ultra"};
   const tiers = ["standard", "pro", "promax", "ultra"];
   const need = gates[feature];
@@ -1550,6 +1551,20 @@ function renderCamera() {
     switchRow("sw-brighten", "Tăng sáng (G)", opt.brighten) +
     switchRow("sw-people", "Hiện thẻ từng em (H)", !S.hidePeople) +
     "</div>" +
+    (window.FC_MODE === "live" ?
+      '<div class="card mt"><h3>' + ico("info") + 'Khẩu lệnh giáo viên (offline)</h3>' +
+      '<div class="sys-row"><span>Ngữ cảnh</span><b id="tv-ctx">--</b></div>' +
+      '<div class="sys-row"><span>Câu nghe được</span><span class="muted small" id="tv-utt">chưa có</span></div>' +
+      '<div class="sys-row"><span>Bộ nghe</span><span class="muted small" id="tv-engine">chưa bật</span></div>' +
+      '<div class="cam-buttons mt">' +
+      '<button class="btn btn-sm btn-primary" id="tv-listen">Bật nghe</button>' +
+      '<button class="btn btn-sm" data-tvctx="LECTURE">Nghe giảng</button>' +
+      '<button class="btn btn-sm" data-tvctx="STUDY_NOTE">Ghi bài</button>' +
+      '<button class="btn btn-sm" data-tvctx="GROUP_WORK">Nhóm</button></div>' +
+      '<div class="avg-note">Nhận dạng tiếng Việt chạy trên máy này (Vosk), không gửi âm thanh đi đâu. ' +
+      'Khẩu lệnh: "hoạt động nhóm", "bắt đầu vào bài học", "các em ghi bài"… ' +
+      "Câu nói lúc đang giải mã câu trước có thể bị bỏ lỡ — nhắc lại khẩu lệnh nếu chưa thấy đổi ngữ cảnh. " +
+      "Luật chú ý theo ngữ cảnh là luật viết tay, chưa kiểm định.</div></div>" : "") +
     '<div class="card mt"><h3>' + ico("info") + "Phím tắt</h3>" +
     '<div class="sys-row"><span>F</span><span class="muted">Toàn màn hình camera</span></div>' +
     '<div class="sys-row"><span>Y</span><span class="muted">Bật/tắt hộp người và mặt</span></div>' +
@@ -1564,6 +1579,13 @@ function renderCamera() {
   $("sw-overlay").onchange = (e) => setOption("overlay", e.target.checked);
   $("sw-brighten").onchange = (e) => setOption("brighten", e.target.checked);
   $("sw-people").onchange = (e) => { S.hidePeople = !e.target.checked; updateCameraParts(); };
+  if ($("tv-listen")) {
+    $("tv-listen").onclick = toggleVoiceListen;
+    document.querySelectorAll("[data-tvctx]").forEach((b) => {
+      b.onclick = () => setVoiceContext(b.getAttribute("data-tvctx"));
+    });
+    refreshVoicePanel();
+  }
   updateCameraParts();
 }
 
@@ -1574,6 +1596,7 @@ function switchRow(id, label, checked) {
 
 function updateCameraParts() {
   if (window.FC_MODE === "web") { livePaint(); livePlaceSoon(); return; }
+  if ($("tv-ctx")) refreshVoicePanel();
   if (!$("cam-stream")) return;
   syncStream("cam-stream", "cam-empty", "cam-fps");
   const cam = (S.live && S.live.camera) || {};
@@ -1599,9 +1622,12 @@ function updateCameraParts() {
     let bindRow = "";
     if (window.FC_MODE === "live") {
       if (!p.student_id) {
+        const seatNote = p.seat_hint
+          ? "Chỗ này trước đó là em " + esc(p.seat_hint) + " — bấm Gắn tên để gắn lại"
+          : "Chưa gắn tên nên không lưu phiên";
         bindRow = '<div class="person-bind"><button class="btn btn-sm btn-primary" data-bind="' + p.track_id + '">' +
           ico("edit") + " Gắn tên</button>" +
-          '<span class="muted small">Chưa gắn tên nên không lưu phiên</span></div>';
+          '<span class="muted small">' + seatNote + "</span></div>";
       } else if (p.identity_conf === "manual") {
         bindRow = '<div class="person-bind"><button class="btn btn-sm" data-bind="' + p.track_id + '">Đổi tên</button>' +
           '<button class="btn btn-sm" data-unbind="' + p.track_id + '">Bỏ tên</button></div>';
@@ -1618,10 +1644,57 @@ function updateCameraParts() {
       '<div class="person-kv"><span>PERCLOS</span><b>' + num(p.perclos, 0) + "%</b></div>" +
       '<div class="person-kv"><span>Khoảng cách</span><b>' + num(p.distance_cm, 0) + " cm</b></div>" +
       '<div class="person-kv"><span>Nhận diện</span><b>' + esc(p.identity_conf || "--") + "</b></div>" +
+      (p.attention_label ? '<div class="person-kv" title="Luật viết tay theo khẩu lệnh GV, chưa kiểm định"><span>Chú ý (GV)</span><b>' + esc(attnText(p)) + "</b></div>" : "") +
       (p.alert ? '<div class="person-alert">' + ico("warn") + " " + esc(p.alert) + "</div>" : "") +
       bindRow +
       "</div>";
   }).join("");
+}
+
+/* Nhãn chú ý từ lõi Python là chữ ASCII không dấu ("TAP TRUNG", "MAT TAP TRUNG (Xs)",
+   "Dang theo doi...") vì console không in được tiếng Việt có dấu; màn hình thì phải có dấu. */
+function attnText(p) {
+  const l = p.attention_label || "";
+  let t = l.indexOf("MAT TAP TRUNG") === 0 ? "Mất tập trung" + l.slice(13)
+    : l.indexOf("Dang theo doi") >= 0 ? "Đang theo dõi"
+    : "Tập trung";
+  if (p.attention_reason) t += " — " + p.attention_reason;
+  return t;
+}
+
+const TV_CTX_LABEL = {LECTURE: "Nghe giảng", STUDY_NOTE: "Ghi bài / tự học", GROUP_WORK: "Thảo luận nhóm"};
+
+async function refreshVoicePanel() {
+  if (!$("tv-ctx")) return;
+  try {
+    const st = await api("/api/teacher-voice");
+    S.voice = st;
+    const src = st.context_source === "voice" ? " (giọng nói)" : st.context_source === "manual" ? " (chọn tay)" : "";
+    $("tv-ctx").textContent = (TV_CTX_LABEL[st.context] || st.context) + src;
+    $("tv-utt").textContent = st.last_utterance || "chưa có";
+    $("tv-engine").textContent = st.is_running
+      ? (st.engine === "vosk-vi-offline" ? "Vosk tiếng Việt — offline, đang nghe"
+        : st.engine === "manual" ? "không nghe được — chỉ chọn tay" : "đang khởi động…")
+      : "đã tắt";
+    $("tv-listen").textContent = st.is_running ? "Tắt nghe" : "Bật nghe";
+  } catch (e) { /* server chưa chạy thì giữ nguyên bảng */ }
+}
+
+async function toggleVoiceListen() {
+  const on = S.voice && S.voice.is_running;
+  try {
+    const r = await api("/api/teacher-voice/listen", {action: on ? "stop" : "start"});
+    if (r.ok) { toast(on ? "Đã tắt nghe khẩu lệnh" : "Đang nghe khẩu lệnh (offline)", "ok"); await refreshVoicePanel(); }
+    else toast(r.error || "Không bật/tắt được", "err");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function setVoiceContext(ctx) {
+  try {
+    const r = await api("/api/teacher-voice/context", {context: ctx});
+    if (r.ok) { toast("Ngữ cảnh: " + (TV_CTX_LABEL[ctx] || ctx), "ok"); await refreshVoicePanel(); }
+    else toast(r.error || "Không đổi được ngữ cảnh", "err");
+  } catch (e) { toast(e.message, "err"); }
 }
 
 async function saveCameraSettings() {
@@ -1667,7 +1740,7 @@ async function stopCamera() {
    Có tên thì lõi mới mở phiên đo và ghi SQLite khi chốt; guest chỉ đo trực tiếp, không lưu. */
 async function bindPerson(trackId) {
   const p = ((S.live && S.live.people) || []).find((x) => x.track_id === trackId);
-  const cur = p && p.student_id ? (p.name || "") : "";
+  const cur = p && p.student_id ? (p.name || "") : ((p && p.seat_hint) || "");
   const name = prompt("Tên của em này (ví dụ: Nguyễn Văn A):", cur);
   if (name == null) return;
   if (!name.trim()) { toast("Tên trống — chưa gắn", "err"); return; }
@@ -2021,6 +2094,8 @@ async function renderAlerts() {
     '<input type="date" id="al-date" value="' + esc(f.date) + '">' +
     '<label class="small" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="al-unseen"' +
     (f.unseen ? " checked" : "") + "> Chỉ chưa xem</label>" +
+    '<label class="small" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="al-summary"' +
+    (S.alertSummary ? " checked" : "") + "> Tóm tắt theo tiết</label>" +
     '<span class="spacer"></span>' +
     '<label class="small" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="al-sound"' +
     (S.soundOn ? " checked" : "") + "> Âm báo</label>" +
@@ -2033,6 +2108,11 @@ async function renderAlerts() {
   };
   for (const id of ["al-student", "al-kind", "al-level", "al-date", "al-unseen"]) $(id).onchange = reload;
   $("al-sound").onchange = (e) => { S.soundOn = e.target.checked; localStorage.setItem("fc_sound", S.soundOn ? "1" : "0"); };
+  $("al-summary").onchange = (e) => {
+    S.alertSummary = e.target.checked;
+    localStorage.setItem("fc_alert_summary", S.alertSummary ? "1" : "0");
+    loadAlerts();
+  };
   $("al-seen-all").onclick = async () => {
     try {
       await api("/api/alerts/seen_all", {});
@@ -2054,6 +2134,37 @@ async function loadAlerts() {
       list.innerHTML = '<div class="chart-empty">' + (window.FC_MODE === "web"
         ? "Db của máy này chưa có cảnh báo nào (bản web/app không ghi bảng alerts). Không có số liệu mẫu để thay vào."
         : "Không có cảnh báo nào khớp bộ lọc.") + "</div>";
+      return;
+    }
+    if (S.alertSummary) {
+      // Flood control: one row per session (per kid per lesson) with per-kind counts,
+      // instead of hundreds of near-identical event rows. Alerts without a session_row
+      // fall back to one group per student per day.
+      const groups = new Map();
+      for (const a of alerts) {
+        const key = a.session_row != null ? "s" + a.session_row
+          : (a.student_id || "?") + "|" + fmtDate(a.raised_at_wall_ms);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(a);
+      }
+      list.innerHTML = [...groups.values()].map((g) => {
+        g.sort((x, y) => x.raised_at_wall_ms - y.raised_at_wall_ms);
+        const first = g[0], last = g[g.length - 1];
+        const unseen = g.filter((a) => a.seen_at_ms == null).length;
+        const maxLevel = Math.max(...g.map((a) => a.level));
+        const byKind = {};
+        for (const a of g) byKind[a.kind] = (byKind[a.kind] || 0) + 1;
+        const kindsHtml = Object.entries(byKind).sort((x, y) => y[1] - x[1])
+          .map(([k, n]) => esc(KIND_LABEL[k] || k) + " ×" + n).join(" · ");
+        const names = [...new Set(g.map((a) => a.student_name || a.student_id))];
+        return '<div class="list-row' + (unseen ? " tint-red" : "") + '">' +
+          '<span class="level-dot level-' + maxLevel + '" style="margin-top:5px" title="Mức cao nhất ' + maxLevel + '"></span>' +
+          '<span class="list-time">' + fmtTime(first.raised_at_wall_ms) + "–" + fmtTime(last.raised_at_wall_ms) +
+          "<br>" + fmtDate(first.raised_at_wall_ms) + "</span>" +
+          '<span class="list-text"><b>' + esc(names.join(", ")) + "</b> — " + g.length + " cảnh báo" +
+          (unseen ? " (" + unseen + " chưa xem)" : " (đã xem hết)") +
+          '<br><span class="muted small">' + kindsHtml + "</span></span></div>";
+      }).join("");
       return;
     }
     list.innerHTML = alerts.map((a) => {
@@ -2170,7 +2281,6 @@ async function loadReport() {
 /* ============================== màn 7: Sao lưu ============================== */
 async function renderBackup() {
   const web = window.FC_MODE === "web";
-  const canAuto = allows("auto_backup");
   const st = S.settings;
   const wi = (S.overview && S.overview.web_info) || {};
   const sysDb = (S.system && S.system.database) || {};
@@ -2194,8 +2304,8 @@ async function renderBackup() {
         (MEASURE_HREF ? '<div class="cam-buttons mt"><a class="btn" href="#camera">' + ico("camera") + " Về màn Camera</a>" +
           '<a class="btn" href="' + MEASURE_HREF + '">' + ico("settings") + " Màn đo gốc (test)</a></div>" : "") + "</div>"
       : '<div class="card"><h3>' + ico("settings") + "Tự động & thời gian lưu</h3>" +
-        switchRow("bk-auto", "Sao lưu tự động theo lịch (Pro)", st.auto_backup === "1") +
-        (canAuto ? "" : '<div class="lock-note mt">' + ico("lock") + " Sao lưu tự động cần bậc Pro trở lên. Bản standard sao lưu thủ công ở nút bên.</div>") +
+        switchRow("bk-auto", "Sao lưu tự động theo lịch", st.auto_backup === "1") +
+        '<div class="lock-note mt">' + ico("info") + " Khi bật: dashboard tự sao lưu mỗi 24 giờ trong lúc đang chạy (mọi bậc, không cần Pro). Bản tự động quá thời gian lưu sẽ bị dọn; bản sao lưu tay không bao giờ bị xóa tự động.</div>" +
         '<div class="field mt"><label>Thời gian lưu dữ liệu (ngày) — tự xóa phiên quá hạn</label>' +
         '<input type="number" id="bk-retention" min="1" value="' + esc(st.retention_days || "180") + '"></div>' +
         '<button class="btn" id="bk-retention-save">' + ico("check") + " Lưu thời gian lưu</button>" +
@@ -2218,7 +2328,6 @@ async function renderBackup() {
   };
   if (!web) {
     const auto = $("bk-auto");
-    if (!canAuto) auto.disabled = true;
     auto.onchange = async (e) => {
       try {
         const r = await api("/api/settings", {auto_backup: e.target.checked ? "1" : "0"});

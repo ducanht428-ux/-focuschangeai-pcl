@@ -145,7 +145,11 @@ class CameraRunner:
             for _ in range(30):
                 cap.read()
             width = int((cfg.get("input") or {}).get("process_width", 640))
-            tick_ms = 1000.0 / max(1.0, float((cfg.get("detection") or {}).get("detect_fps", 8)))
+            # measure_fps (input) paces step(); yolo_every (detection) lets intermediate
+            # steps measure eyes on cached boxes without paying a YOLO pass each time.
+            detect_fps = float((cfg.get("detection") or {}).get("detect_fps", 8))
+            measure_fps = float((cfg.get("input") or {}).get("measure_fps", 0)) or detect_fps
+            tick_ms = 1000.0 / max(1.0, measure_fps)
             last_tick = 0.0
             last_step = 0.0
             fps = 0.0
@@ -252,6 +256,9 @@ class CameraRunner:
                 "student_id": v.student_id,
                 "name": v.student_name or (v.student_id or "guest-%d" % v.track_id),
                 "identity_conf": v.identity_conf,
+                "seat_hint": v.seat_hint,
+                "attention_label": v.attention_label,
+                "attention_reason": v.attention_reason,
                 "measurable": bool(v.measurable),
                 "sei": r.sei if r is not None else None,
                 "situation": r.situation.name if r is not None else "UNKNOWN",
@@ -282,7 +289,9 @@ class CameraRunner:
             angle = r.pitch if r.pitch is not None else r.yaw
             if angle is not None:
                 vals["angle"].append(abs(float(angle)))
-        return {k: (sum(v) / len(v) if v else None) for k, v in vals.items()}
+        means = {k: (sum(v) / len(v) if v else None) for k, v in vals.items()}
+        means["n"] = len(results)
+        return means
 
     @staticmethod
     def _average(rows: List[Dict]) -> Dict:
@@ -290,5 +299,9 @@ class CameraRunner:
         for key in ("sei", "ear", "mar", "angle"):
             vals = [r[key] for r in rows if r.get(key) is not None]
             out[key] = sum(vals) / len(vals) if vals else None
-        out["n"] = len(rows)
+        # n_students is the average number of measured heads per frame in this minute.
+        # Counting the accumulated rows instead would store the frame sample count under a
+        # column the chart labels as children, which is a different quantity entirely.
+        ns = [r["n"] for r in rows if r.get("n") is not None]
+        out["n"] = int(round(sum(ns) / len(ns))) if ns else 0
         return out

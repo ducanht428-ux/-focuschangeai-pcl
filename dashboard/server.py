@@ -1,7 +1,7 @@
 """Máy chủ cục bộ của dashboard FocusChangeAI - chỉ thư viện chuẩn Python + PyYAML.
 
 Vì sao là web cục bộ thay vì PySide6 (đặc tả mục 3 cho phép đổi nếu có lý do tốt hơn):
-  * không phải cài thêm bộ Qt nặng trên máy lớp yếu;双击 Chay-Dashboard.bat là chạy;
+  * không phải cài thêm bộ Qt nặng trên máy lớp yếu; nhấp đúp Chay-Dashboard.bat là chạy;
   * chính giao diện này sau này là màn hình xem cho điện thoại trong mạng lớp (đặc tả 6.2),
     nên một bản UI phục vụ cả hai thay vì viết hai lần;
   * bám sát mẫu đã duyệt (thẻ bo góc, tông xanh) dễ hơn và kiểm chứng bằng ảnh chụp thật được.
@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -625,9 +626,9 @@ def backups_list() -> list:
     return out
 
 
-def do_backup(conn) -> dict:
+def do_backup(conn, prefix="focuschange") -> dict:
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    name = "focuschange_%s.db" % time.strftime("%Y%m%d_%H%M%S")
+    name = "%s_%s.db" % (prefix, time.strftime("%Y%m%d_%H%M%S"))
     dest_path = os.path.join(BACKUP_DIR, name)
     dest = sqlite3.connect(dest_path)
     try:
@@ -636,6 +637,37 @@ def do_backup(conn) -> dict:
         dest.close()
     app.audit(conn, "teacher", "backup", name)
     return {"ok": True, "file": name, "bytes": os.path.getsize(dest_path)}
+
+
+AUTO_BACKUP_INTERVAL_S = 86_400   # one scheduled backup per day
+
+
+def auto_backup_tick(conn) -> dict:
+    """One scheduler pass: backup when enabled and the newest auto_ file is >= 24h old.
+
+    Auto files carry the auto_ prefix so the retention prune below can delete them
+    without ever touching a manual backup the teacher made on purpose.
+    """
+    if app.get_setting(conn, "auto_backup", "0") != "1":
+        return {"ran": False, "reason": "off"}
+    newest = 0.0
+    if os.path.isdir(BACKUP_DIR):
+        for name in os.listdir(BACKUP_DIR):
+            if name.startswith("auto_") and name.endswith(".db"):
+                newest = max(newest, os.path.getmtime(os.path.join(BACKUP_DIR, name)))
+    if time.time() - newest < AUTO_BACKUP_INTERVAL_S:
+        return {"ran": False, "reason": "fresh"}
+    res = do_backup(conn, prefix="auto")
+    days = int(app.get_setting(conn, "retention_days", "180"))
+    cutoff = time.time() - days * 86_400
+    pruned = 0
+    for name in os.listdir(BACKUP_DIR):
+        if name.startswith("auto_") and name.endswith(".db"):
+            p = os.path.join(BACKUP_DIR, name)
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                pruned += 1
+    return {"ran": True, "file": res["file"], "pruned": pruned}
 
 
 def do_restore(conn, runner, name: str) -> dict:
@@ -941,7 +973,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/teacher-voice/listen":
                 from focusedge.teacher_voice import get_teacher_voice
                 action = body.get("action", "start")
-                tv = get_teacher_voice()
+                tv = get_teacher_voice(cfg.get("teacher_voice"))
                 if action == "start":
                     tv.start()
                 elif action == "stop":
@@ -965,10 +997,6 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError
                 except ValueError:
                     return {"ok": False, "error": "Số ngày lưu phải >= 1"}
-            if key == "auto_backup" and value == "1":
-                tier = app.get_setting(conn, "tier", "standard")
-                if not app.tier_allows(tier, "auto_backup"):
-                    return {"ok": False, "error": "Sao lưu tự động cần bậc Pro trở lên"}
             app.set_setting(conn, key, value)
             changed.append(key)
         # Vài cài đặt là của lõi camera: ghi thẳng vào config.yaml để lần chạy sau giữ nguyên.
@@ -1041,6 +1069,22 @@ def main():
         return
     Handler.runner = camera_runner.CameraRunner(on_minute=on_minute)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+
+    def auto_backup_loop():
+        # Own connection per pass: sqlite3 connections are not shared across threads.
+        while True:
+            c = db()
+            try:
+                r = auto_backup_tick(c)
+                if r.get("ran"):
+                    print("auto backup: %s (pruned %d)" % (r["file"], r.get("pruned", 0)))
+            except Exception as e:
+                print("auto backup error: %s" % e)
+            finally:
+                c.close()
+            time.sleep(3600)
+
+    threading.Thread(target=auto_backup_loop, daemon=True).start()
     print("dashboard: %s  (db: %s)" % (url, resolve_db_path(load_cfg().get("storage", {}).get("db", ""))))
     print("retention: %d ngay, da don %d phien qua han" % (days, removed))
     print("nhan Ctrl-C de dung")

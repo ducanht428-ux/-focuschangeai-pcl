@@ -133,6 +133,7 @@ def test_tier_gates(tmp):
     check("ultra mở predict", app.tier_allows("ultra", "predict"))
     check("bậc lạ coi như standard", not app.tier_allows("khong_hop_le", "csv_export"))
     check("tính năng không cổng luôn mở", app.tier_allows("standard", "khong_co_trong_gates"))
+    check("standard mở sao lưu tự động", app.tier_allows("standard", "auto_backup"))
 
 
 def test_demo_isolation(tmp):
@@ -210,6 +211,44 @@ def test_backup_restore(tmp):
     conn.close()
 
 
+def test_auto_backup(tmp):
+    print("[auto backup]")
+    conn = new_conn(os.path.join(tmp, "ab.db"))
+    cfg = cfg_for(tmp)
+    add_real_student(conn, cfg)
+    old_backup_dir = server.BACKUP_DIR
+    server.BACKUP_DIR = os.path.join(tmp, "backups_auto")
+    try:
+        # standard lưu được auto_backup=1 (không còn cổng Pro). _save_settings không dùng self.
+        r = server.Handler._save_settings(None, conn, cfg, {"auto_backup": "1"})
+        check("standard bật được sao lưu tự động", r["ok"], str(r))
+        r1 = server.auto_backup_tick(conn)
+        check("tick đầu chạy và tạo file auto_", r1["ran"] and r1["file"].startswith("auto_"), str(r1))
+        check("file auto_ nằm trên đĩa", os.path.exists(os.path.join(server.BACKUP_DIR, r1["file"])))
+        r2 = server.auto_backup_tick(conn)
+        check("tick liền sau không chạy lại (24h)", not r2["ran"] and r2["reason"] == "fresh", str(r2))
+        # bản sao lưu tay + bản auto cũ: prune chỉ đụng auto_
+        manual = server.do_backup(conn)
+        old_auto = os.path.join(server.BACKUP_DIR, "auto_20200101_000000.db")
+        shutil.copyfile(os.path.join(server.BACKUP_DIR, r1["file"]), old_auto)
+        # đổi tên bản đầu sang một tên cũ khác: cùng một giây thì tên mới trùng tên cũ
+        older_auto = os.path.join(server.BACKUP_DIR, "auto_20200102_000000.db")
+        os.replace(os.path.join(server.BACKUP_DIR, r1["file"]), older_auto)
+        old_t = time.time() - 400 * 86_400
+        os.utime(old_auto, (old_t, old_t))
+        os.utime(older_auto, (old_t, old_t))
+        r3 = server.auto_backup_tick(conn)
+        check("auto cũ hơn 24h thì chạy lại", r3["ran"], str(r3))
+        check("prune dọn auto quá hạn", r3["pruned"] == 2 and not os.path.exists(old_auto), str(r3))
+        check("backup tay không bị prune", os.path.exists(os.path.join(server.BACKUP_DIR, manual["file"])))
+        app.set_setting(conn, "auto_backup", "0")
+        r4 = server.auto_backup_tick(conn)
+        check("tắt rồi thì tick không chạy", not r4["ran"] and r4["reason"] == "off", str(r4))
+    finally:
+        server.BACKUP_DIR = old_backup_dir
+    conn.close()
+
+
 def test_retention(tmp):
     print("[retention]")
     conn = new_conn(os.path.join(tmp, "r.db"))
@@ -259,6 +298,34 @@ def test_seen_and_cascade(tmp):
     conn.close()
 
 
+def test_minute_means(tmp):
+    print("[minute means]")
+    from types import SimpleNamespace
+    from dashboard import camera_runner
+    from focusedge.constants import HabitFeature
+
+    def kid(sei, ear, mar, pitch):
+        return SimpleNamespace(sei=sei, features={HabitFeature.EAR: ear, HabitFeature.MAR: mar},
+                               pitch=pitch, yaw=None)
+
+    # Ba khung, mỗi khung 2 em: n_students phải là 2 (số em), không phải 3 (số khung mẫu).
+    frames = [[kid(80, 0.25, 0.05, 5), kid(60, 0.21, 0.04, -3)],
+              [kid(90, 0.27, 0.06, 8), kid(70, 0.23, 0.05, 0)],
+              [kid(85, 0.26, 0.05, 2), kid(65, 0.22, 0.04, 4)]]
+    rows = [camera_runner.CameraRunner._means(f) for f in frames]
+    avg = camera_runner.CameraRunner._average(rows)
+    check("n_students đếm em, không đếm khung", avg["n"] == 2, str(avg["n"]))
+    check("SEI trung bình phút đúng", abs(avg["sei"] - 75.0) < 1e-9, str(avg["sei"]))
+    check("EAR trung bình phút đúng", abs(avg["ear"] - 0.24) < 1e-9, str(avg["ear"]))
+    check("góc lấy trị tuyệt đối", abs(avg["angle"] - 11.0 / 3.0) < 1e-9, str(avg["angle"]))
+    # Khung chỉ 1 em giữa phút không kéo số em lên thành số khung.
+    rows2 = [camera_runner.CameraRunner._means([kid(80, 0.25, 0.05, 5)] * 1)] * 4
+    check("một em suốt phút vẫn là 1", camera_runner.CameraRunner._average(rows2)["n"] == 1)
+    # Không có em nào: mọi số None, n=0, không NaN.
+    empty = camera_runner.CameraRunner._means([])
+    check("khung trống cho None chứ không NaN", empty["sei"] is None and empty["n"] == 0)
+
+
 def main():
     # Console Windows mặc định cp1252 không encode được tiếng Việt; đổi stdout sang UTF-8
     # (errors=replace) để không crash giữa chừng và vẫn đọc được khi chuyển hướng ra file.
@@ -272,8 +339,10 @@ def main():
         test_migration(tmp)
         test_tier_gates(tmp)
         test_demo_isolation(tmp)
+        test_minute_means(tmp)
         test_overview_reports(tmp)
         test_backup_restore(tmp)
+        test_auto_backup(tmp)
         test_retention(tmp)
         test_seen_and_cascade(tmp)
     finally:

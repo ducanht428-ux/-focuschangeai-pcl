@@ -980,7 +980,11 @@ def main(argv=None) -> int:
     cap = open_source(io_cfg.get("source", 0), io_cfg)
     process_width = int(io_cfg.get("process_width", 1280))
     detect_fps = float(io_cfg.get("detect_fps", 12))
-    tick_ms = 1000.0 / max(1.0, detect_fps)
+    # measure_fps paces pipeline.step(); with detection.yolo_every > 1 the intermediate
+    # steps only run FaceLandmarker on cached boxes, so the eye cadence can exceed the
+    # YOLO budget. 0/absent = old behavior (one step per detection tick).
+    measure_fps = float(io_cfg.get("measure_fps", 0)) or detect_fps
+    tick_ms = 1000.0 / max(1.0, measure_fps)
 
     session_reset_ms = int(args.session_minutes * 60_000) if args.session_minutes > 0 else 0
     started_wall = int(time.time() * 1000)

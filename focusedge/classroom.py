@@ -11,6 +11,7 @@ and the heavy objects are only built when ``ClassroomPipeline`` is constructed.
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections import deque
@@ -92,6 +93,9 @@ class PersonView(NamedTuple):
     gate: float = 0.0                      # bind_hi as configured, so the line can name the bar
     margin_gate: float = 0.0               # min_margin as configured
     measurable: bool = False               # did this face produce numbers recently at all
+    seat_hint: str = ""                    # remembered seat occupant's name, "" when no suggestion
+    attention_label: str = ""              # teacher-context verdict, "" before any measured frame
+    attention_reason: str = ""
 
 
 @dataclass
@@ -120,6 +124,11 @@ class TrackRuntime:
     alert_count: int = 0
     alerts: List[Dict] = field(default_factory=list)
     measured_frames: int = 0
+    # Per-track attention verdict against the teacher's spoken context (teacher_voice.py).
+    # Display only: it never opens an alert or changes a stored number.
+    attention_eval: object = None
+    attention_label: str = ""
+    attention_reason: str = ""
     # Wall clock of the moment this session started. The phone derives it from its session id,
     # which IS the start timestamp; here the id is a per-student counter, so the start time is
     # remembered separately rather than recomputed from the measured time.
@@ -133,6 +142,12 @@ class ClassroomPipeline:
     # Tuned for a tripod camera at the front of a room, where a body touching the edge means the
     # head is cut too; a phone held by the student is always framed whole, so it has no equivalent.
     CLIP_MAX_FRACTION = 0.25
+    # Seat memory: a manually named head that leaves the frame remembers its seat (normalized
+    # face-center) for this long, and a new guest head appearing within this radius is OFFERED
+    # that name on the first m press. Offered, never auto-bound: two children swapping seats
+    # must not silently swap their data.
+    SEAT_RADIUS = 0.10
+    SEAT_TTL_MS = 600_000
 
     def __init__(self, cfg: dict, detector, embedder, roster, analyzer, scheduler,
                  writer, profiles: Optional[Dict[str, HabitProfile]] = None,
@@ -165,6 +180,8 @@ class ClassroomPipeline:
         self._min_span = float(sched.get("min_eye_span_px", 12))
         self._reverify_ms = int(ident.get("reverify_ms", 30000))
         self._identity_enabled = embedder is not None
+        # Teacher's rule: 10 minutes of looking elsewhere before a head counts as off-task.
+        self._off_task_s = float(cfg.get("teacher_voice", {}).get("off_task_seconds", 600))
 
         # Layer 5 used to be two copies of every number - the cloud writer and a 5-table mirror
         # beside it. There is one copy now: the writer IS the database, so a disk that refuses the
@@ -177,6 +194,8 @@ class ClassroomPipeline:
         self._resolver = None
 
         self._tracks: Dict[int, TrackRuntime] = {}
+        self._seat_memory: Dict[str, Dict] = {}
+        self._last_wh = (0, 0)
         self._alerts: Deque[Dict] = deque(maxlen=200)
         # Preview-only: the last frame's raw layer-1 output. Overwritten every step().
         self.last_boxes = DetectionView()
@@ -193,6 +212,17 @@ class ClassroomPipeline:
         self._last_heartbeat_ms = 0
         self._last_step_ms = 0
         self._frame_dt_ms = 33.0
+
+        # YOLO stride: 1 = detect on every step (the old behavior). N > 1 reuses the previous
+        # YOLO boxes on the intermediate steps and only runs FaceLandmarker there, so blink
+        # sampling can run faster than one ~145 ms detection pass per frame allows. The boxes
+        # are at most N-1 frames stale; the alert windows downstream are seconds long.
+        self._yolo_every = max(1, int(det.get("yolo_every", 1)))
+        self._step_count = 0
+        self._cached_persons = []
+        self._cached_objects = []
+        self._cached_wh = (0, 0)
+        self.last_yolo_ran = True
 
     # ------------------------------------------------------------------
     # construction helper kept here so main.py stays thin
@@ -307,7 +337,21 @@ class ClassroomPipeline:
         self._last_step_ms = now_ms
 
         h, w = frame_bgr.shape[:2]
-        persons, scene_objects = self._detector.run(frame_bgr)
+        self._last_wh = (w, h)
+        self._step_count += 1
+        # An empty cache means an empty room: keep detecting every frame so a child who
+        # walks in is found at once, and a resolution change invalidates pixel boxes.
+        run_yolo = (self._yolo_every <= 1
+                    or self._step_count % self._yolo_every == 1
+                    or not self._cached_persons
+                    or self._cached_wh != (w, h))
+        if run_yolo:
+            persons, scene_objects = self._detector.run(frame_bgr)
+            self._cached_persons, self._cached_objects = persons, scene_objects
+            self._cached_wh = (w, h)
+        else:
+            persons, scene_objects = self._cached_persons, self._cached_objects
+        self.last_yolo_ran = run_yolo
         self.last_boxes = DetectionView(persons=tuple(persons), objects=tuple(scene_objects),
                                         frame_size=(w, h))
 
@@ -389,6 +433,7 @@ class ClassroomPipeline:
             res.landmarks = lm
             res.calibration_progress = rt.pipeline.calibration_progress
             rt.last_result = res
+            self._evaluate_attention(rt, res, wall_ms)
             results.append(res)
             measured.append((res.landmarks, res.face_bbox, rt.nearby))
             if res.alert:
@@ -446,30 +491,37 @@ class ClassroomPipeline:
             room=room_objects(persons, scene_objects),
         ), now_ms)
 
-        # Khẩu lệnh giọng nói của Giáo viên (nếu có) đóng vai trò công tắc ngữ cảnh
+        # Teacher voice commands act as a context switch, but the label may only claim speech
+        # when a real utterance (or an explicit manual pick) produced the switch. At boot and
+        # after the silence timeout the vision-based label stays in charge.
         try:
             from .teacher_voice import get_teacher_voice, TeacherContextAI
-            tv = get_teacher_voice()
+            tv = get_teacher_voice(self._cfg.get("teacher_voice"))
             tv_status = tv.get_status()
             tv_ctx = tv_status["context"]
-            if tv_ctx == TeacherContextAI.CONTEXT_GROUP_WORK:
-                snap = snap._replace(
-                    context=int(ClassContext.GROUP_DISCUSSION),
-                    label="thảo luận nhóm (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
-            elif tv_ctx == TeacherContextAI.CONTEXT_STUDY_NOTE:
-                snap = snap._replace(
-                    context=int(ClassContext.READING),
-                    label="đọc hoặc viết / tự học (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
-            elif tv_ctx == TeacherContextAI.CONTEXT_LECTURE and tv_status.get("elapsed_s", 999) < 180:
-                snap = snap._replace(
-                    context=int(ClassContext.PRESENTATION),
-                    label="nghe giảng (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
+            src = tv_status.get("context_source", "init")
+            if src in ("voice", "manual"):
+                tag = "giọng nói GV" if src == "voice" else "GV chọn tay"
+                evidence = ("GV khẩu lệnh: %s" % tv_status["last_utterance"]) if src == "voice" \
+                    else ("GV chọn: %s" % tv_status["last_speech"])
+                if tv_ctx == TeacherContextAI.CONTEXT_GROUP_WORK:
+                    snap = snap._replace(
+                        context=int(ClassContext.GROUP_DISCUSSION),
+                        label="thảo luận nhóm (%s)" % tag,
+                        evidence=evidence
+                    )
+                elif tv_ctx == TeacherContextAI.CONTEXT_STUDY_NOTE:
+                    snap = snap._replace(
+                        context=int(ClassContext.READING),
+                        label="đọc hoặc viết / tự học (%s)" % tag,
+                        evidence=evidence
+                    )
+                elif tv_ctx == TeacherContextAI.CONTEXT_LECTURE:
+                    snap = snap._replace(
+                        context=int(ClassContext.PRESENTATION),
+                        label="nghe giảng (%s)" % tag,
+                        evidence=evidence
+                    )
         except Exception:
             pass
 
@@ -519,6 +571,34 @@ class ClassroomPipeline:
     # ------------------------------------------------------------------
     # naming a head by hand, for the runs where recognition cannot answer at all
     # ------------------------------------------------------------------
+    def seat_suggestion(self, track_id: int, now_ms: Optional[int] = None) -> Optional[str]:
+        """Whose remembered seat this guest head is sitting in, or None.
+
+        A suggestion for the operator, never a binding: the m key (or the dashboard button)
+        still has to be pressed. Seats are normalized face centers, so the hint survives a
+        resolution change; the radius is a tenth of the frame, tighter than one desk apart.
+        """
+        rt = self._tracks.get(track_id)
+        if rt is None or rt.manual_student_id is not None:
+            return None
+        if rt.last_result is None or rt.last_result.face_bbox is None:
+            return None
+        w, h = self._last_wh
+        if not w or not h:
+            return None
+        now_ms = _wall_ms() if now_ms is None else now_ms
+        x0, y0, x1, y1 = rt.last_result.face_bbox
+        cx, cy = (x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h
+        taken = set(t.manual_student_id for tid, t in self._tracks.items() if tid != track_id)
+        best = None
+        for sid, m in self._seat_memory.items():
+            if sid in taken or now_ms - m["at_ms"] > self.SEAT_TTL_MS:
+                continue
+            d = math.hypot(cx - m["cx"], cy - m["cy"])
+            if d <= self.SEAT_RADIUS and (best is None or d < best[0]):
+                best = (d, sid)
+        return best[1] if best else None
+
     def bind_manual_next(self, track_id: int) -> Optional[str]:
         """The m key: give the chosen head a name the operator is stating, not a match.
 
@@ -540,7 +620,13 @@ class ClassroomPipeline:
         if current is None:
             taken = set(t.manual_student_id for tid, t in self._tracks.items() if tid != track_id)
             free = [s for s in ids if s not in taken]
-            nxt = free[0] if free else self._add_manual_slot(len(ids) + 1)
+            # A head in a remembered seat takes that student first: one press re-binds the
+            # child who left and came back, instead of walking the roster from slot one.
+            sug = self.seat_suggestion(track_id)
+            if sug is not None and sug in free:
+                nxt = sug
+            else:
+                nxt = free[0] if free else self._add_manual_slot(len(ids) + 1)
         elif current in ids:
             i = ids.index(current)
             nxt = ids[i + 1] if i + 1 < len(ids) else None
@@ -633,6 +719,26 @@ class ClassroomPipeline:
             return True
         return False
 
+    def _evaluate_attention(self, rt: TrackRuntime, res, wall_ms: int) -> None:
+        """Judge this head against the teacher's spoken context, for display only.
+
+        The context counts only when a real utterance or a manual pick produced it - the same
+        honesty rule as the room label. Before anyone speaks, a child reading a book must not
+        be told they are "not looking at the board": with no command there is no expectation,
+        so the evaluator's neutral branch runs instead.
+        """
+        if not res.measurable or res.yaw is None or res.pitch is None:
+            return
+        from .teacher_voice import StudentAttentionEvaluator, get_teacher_voice
+        if rt.attention_eval is None:
+            rt.attention_eval = StudentAttentionEvaluator(violation_threshold_s=self._off_task_s)
+        st = get_teacher_voice(self._cfg.get("teacher_voice")).get_status()
+        ctx = st["context"] if st.get("context_source") in ("voice", "manual") else ""
+        mar = float(res.features.get(HabitFeature.MAR, 0.0) or 0.0)
+        label, reason, _ = rt.attention_eval.evaluate(
+            float(res.yaw), float(res.pitch), mar, False, ctx, now=wall_ms / 1000.0)
+        rt.attention_label, rt.attention_reason = label, reason
+
     def _register_alert(self, rt: TrackRuntime, code: str, wall_ms: int) -> None:
         rt.alert_count += 1
         rt.alerts.append({"code": code, "wall_ms": wall_ms})
@@ -647,6 +753,15 @@ class ClassroomPipeline:
     # ------------------------------------------------------------------
     def _retire(self, rt: TrackRuntime, wall_ms: int) -> None:
         """Track died: close its session and (for bound students) commit + upload."""
+        if (rt.student_id and rt.identity_conf == "manual"
+                and rt.last_result is not None and rt.last_result.face_bbox is not None
+                and self._last_wh != (0, 0)):
+            w, h = self._last_wh
+            x0, y0, x1, y1 = rt.last_result.face_bbox
+            self._seat_memory[rt.student_id] = {
+                "cx": (x0 + x1) / 2.0 / w, "cy": (y0 + y1) / 2.0 / h,
+                "name": rt.student_name, "at_ms": wall_ms,
+            }
         s = rt.pipeline.commit_session()
         if s is None or rt.student_id is None:
             return
@@ -788,6 +903,8 @@ class ClassroomPipeline:
         margin_gate = float(getattr(self._resolver, "min_margin", 0.0) or 0.0)
         for rt in sorted(self._tracks.values(), key=lambda r: r.track_id):
             st = rt.identity
+            hint_id = self.seat_suggestion(rt.track_id) if rt.student_id is None else None
+            hint = self._seat_memory[hint_id]["name"] if hint_id else ""
             rows.append(PersonView(
                 track_id=rt.track_id, student_id=rt.student_id, student_name=rt.student_name,
                 identity_conf=rt.identity_conf,
@@ -796,7 +913,10 @@ class ClassroomPipeline:
                 samples=int(getattr(st, "samples", 0) or 0),
                 runner_up=str(getattr(st, "runner_up", "") or ""),
                 gate=gate, margin_gate=margin_gate,
-                measurable=bool(rt.last_result is not None and rt.last_result.measurable)))
+                measurable=bool(rt.last_result is not None and rt.last_result.measurable),
+                seat_hint=hint,
+                attention_label=rt.attention_label,
+                attention_reason=rt.attention_reason))
         return rows
 
     def person_result(self, track_id: Optional[int]):

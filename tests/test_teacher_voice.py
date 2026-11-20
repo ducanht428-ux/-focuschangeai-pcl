@@ -66,19 +66,59 @@ class TestTeacherVoice(unittest.TestCase):
         self.assertIn("MAT TAP TRUNG", status)
         self.assertEqual(reason, "Không nhìn lên bảng")
 
+    def test_evaluator_pitch_sign_matches_landmarks(self):
+        # landmarks.py: pitch DUONG = cui dau. Cui ghi bai (+25) trong LECTURE la khong nhin bang.
+        ev = StudentAttentionEvaluator()
+        status, reason, _ = ev.evaluate(yaw=0, pitch=25, mar=0.05, is_slouching=False,
+                                        context=TeacherContextAI.CONTEXT_LECTURE, now=100.0)
+        self.assertNotEqual(status, "TAP TRUNG")
+        self.assertEqual(reason, "Không nhìn lên bảng")
+        # Guc mat ngu (+50) phai bi bat o moi ngu canh, ke ca STUDY_NOTE von cho phep cui.
+        status, reason, _ = ev.evaluate(yaw=0, pitch=50, mar=0.0, is_slouching=False,
+                                        context=TeacherContextAI.CONTEXT_STUDY_NOTE, now=100.0)
+        self.assertEqual(reason, "Gục mặt / Tư thế xấu")
+        # Nhin len troi (-25) trong STUDY_NOTE khong phai la dang chep bai.
+        status, reason, _ = ev.evaluate(yaw=0, pitch=-25, mar=0.05, is_slouching=False,
+                                        context=TeacherContextAI.CONTEXT_STUDY_NOTE, now=100.0)
+        self.assertEqual(reason, "Không chép bài / nhìn linh tinh")
+
     def test_evaluator_study_note_context(self):
-        # Trong STUDY_NOTE: cúi đầu viết bài (pitch=-25, yaw=5) là TẬP TRUNG (không bị phạt)
-        status, reason, _ = self.evaluator.evaluate(yaw=5, pitch=-25, mar=0.05, is_slouching=False,
+        # Trong STUDY_NOTE: cúi đầu viết bài (pitch=+25, yaw=5) là TẬP TRUNG (không bị phạt)
+        status, reason, _ = self.evaluator.evaluate(yaw=5, pitch=25, mar=0.05, is_slouching=False,
                                                     context=TeacherContextAI.CONTEXT_STUDY_NOTE, now=200.0)
         self.assertEqual(status, "TAP TRUNG")
         self.assertEqual(reason, "Đang ghi/học bài")
 
     def test_evaluator_group_work_context(self):
         # Trong GROUP_WORK: quay sang bạn (yaw=35) và có nói chuyện (mar=0.25) -> TẬP TRUNG
-        status, reason, _ = self.evaluator.evaluate(yaw=35, pitch=-15, mar=0.25, is_slouching=False,
+        status, reason, _ = self.evaluator.evaluate(yaw=35, pitch=15, mar=0.25, is_slouching=False,
                                                     context=TeacherContextAI.CONTEXT_GROUP_WORK, now=300.0)
         self.assertEqual(status, "TAP TRUNG")
         self.assertEqual(reason, "Tích cực hoạt động nhóm")
+
+    def test_context_source_honesty(self):
+        # Luc khoi dong chua ai noi gi: khong duoc mang nhan "giong noi GV".
+        self.assertEqual(self.ai.get_status()["context_source"], "init")
+        self.assertIsNone(self.ai.get_status()["last_utterance"])
+        # Cau that co tu khoa -> nguon voice, kem nguyen van cau noi.
+        self.ai.note_utterance("cả lớp bắt đầu thảo luận")
+        st = self.ai.get_status()
+        self.assertEqual(st["context"], "GROUP_WORK")
+        self.assertEqual(st["context_source"], "voice")
+        self.assertEqual(st["last_utterance"], "cả lớp bắt đầu thảo luận")
+        # Cau khong co tu khoa: ghi nhan da nghe nhung khong doi ngu canh.
+        self.ai.note_utterance("trời hôm nay đẹp")
+        st = self.ai.get_status()
+        self.assertEqual(st["context"], "GROUP_WORK")
+        self.assertEqual(st["last_utterance"], "trời hôm nay đẹp")
+        # Chon tay qua API -> nguon manual, khong gia vo la giong noi.
+        self.ai.set_context(TeacherContextAI.CONTEXT_GROUP_WORK, reason="dashboard_api")
+        self.assertEqual(self.ai.get_status()["context_source"], "manual")
+        # Het thoi gian im lang -> nguon auto, nhan vision duoc tra lai.
+        time.sleep(2.2)
+        st = self.ai.get_status()
+        self.assertEqual(st["context"], "LECTURE")
+        self.assertEqual(st["context_source"], "auto")
 
     def test_calculate_mar(self):
         # Ngậm miệng: khoảng cách môi bé
