@@ -74,6 +74,7 @@ class TeacherContextAI:
         self.rules: Dict[str, List[str]] = {
             self.CONTEXT_GROUP_WORK: [
                 "bắt đầu thảo luận",  # Câu chỉ định
+                "thảo luận nhóm",
                 "thảo luận",
                 "hoạt động nhóm",
                 "nhóm đôi",
@@ -84,6 +85,9 @@ class TeacherContextAI:
             self.CONTEXT_LECTURE: [
                 "cả lớp chú ý",       # Câu chỉ định
                 "hết giờ thảo luận",  # Câu chỉ định
+                "bắt đầu vào bài học",
+                "bắt đầu bài học",
+                "vào bài học",
                 "nhìn lên bảng",
                 "nghe giảng",
                 "cô giảng",
@@ -95,6 +99,10 @@ class TeacherContextAI:
                 "chú ý",
             ],
             self.CONTEXT_STUDY_NOTE: [
+                "các em ghi bài",
+                "cả lớp ghi bài",
+                "các em chép bài",
+                "cả lớp chép bài",
                 "ghi bài",
                 "chép bài",
                 "viết vào vở",

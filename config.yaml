@@ -42,7 +42,7 @@ input:
   # open at all, so "0" is no longer a guess. If the picture is ever the wrong lens, re-enable the
   # built-in camera rather than swapping numbers: with two cameras present the index order is
   # decided by enumeration and is not predictable.
-  source: 0
+  source: 1
   # What to ASK the capture device for. main.py sets these with cap.set() and then prints what the
   # driver actually gave, because the two differ. Re-read from the C270 after the built-in was
   # disabled: 640x480 @ 30 fps delivered, and the driver stays in YUY2 (the MJPG request does not
