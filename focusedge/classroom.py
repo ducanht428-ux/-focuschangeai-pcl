@@ -823,17 +823,18 @@ class ClassroomPipeline:
 
     def _register_alert(self, rt: TrackRuntime, code: str, wall_ms: int) -> None:
         # Cảnh báo tối đa 5 phút 1 lần (300 giây) để chống spam chuông/thông báo tuyệt đối
-        cooldown_ms = int((self._cfg.get("alerts") or {}).get("cooldown_seconds", 300)) * 1000
-        room_last_alert = getattr(self, "_room_last_alert_ms", 0)
-        if wall_ms - room_last_alert < cooldown_ms:
-            return
+        cooldown_ms = int((self._cfg.get("alerts") or {}).get("cooldown_seconds", 0)) * 1000
+        if cooldown_ms > 0:
+            room_last_alert = getattr(self, "_room_last_alert_ms", 0)
+            if wall_ms - room_last_alert < cooldown_ms:
+                return
 
-        last_alert_time = getattr(rt, "_last_alert_wall_ms", 0)
-        if wall_ms - last_alert_time < cooldown_ms:
-            return
+            last_alert_time = getattr(rt, "_last_alert_wall_ms", 0)
+            if wall_ms - last_alert_time < cooldown_ms:
+                return
 
-        self._room_last_alert_ms = wall_ms
-        rt._last_alert_wall_ms = wall_ms
+            self._room_last_alert_ms = wall_ms
+            rt._last_alert_wall_ms = wall_ms
 
         rt.alert_count += 1
         rt.alerts.append({"code": code, "wall_ms": wall_ms})

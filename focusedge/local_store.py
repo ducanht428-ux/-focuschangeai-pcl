@@ -373,8 +373,8 @@ class LocalStore:
         msg = alert_sentence(code, None, None) or code
         try:
             self._conn.execute(
-                "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms, seen_at_ms)"
-                " VALUES (0, ?, ?, ?, ?, NULL)",
+                "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms)"
+                " VALUES (0, ?, ?, ?, ?)",
                 (student_id, code, msg, int(wall_ms)))
             self._conn.commit()
         except Exception:
@@ -387,15 +387,18 @@ class LocalStore:
             if not code:
                 continue
             wall_ms = int(a.get("wall_ms") or 0)
-            cur = self._conn.execute(
-                "UPDATE alerts SET session_row = ? WHERE session_row = 0 AND student_id = ? AND raised_at_wall_ms = ?",
-                (session_row, student_id, wall_ms))
-            if cur.rowcount == 0:
-                self._conn.execute(
-                    "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms, seen_at_ms)"
-                    " VALUES (?, ?, ?, ?, ?, NULL)",
-                    (session_row, student_id, code,
-                     alert_sentence(code, None, None) or code, wall_ms))
+            try:
+                cur = self._conn.execute(
+                    "UPDATE alerts SET session_row = ? WHERE session_row = 0 AND student_id = ? AND raised_at_wall_ms = ?",
+                    (session_row, student_id, wall_ms))
+                if cur.rowcount == 0:
+                    self._conn.execute(
+                        "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (session_row, student_id, code,
+                         alert_sentence(code, None, None) or code, wall_ms))
+            except Exception:
+                pass
 
     # ==================================================================
     # learned bands

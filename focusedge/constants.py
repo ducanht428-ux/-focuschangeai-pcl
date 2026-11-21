@@ -203,8 +203,8 @@ BPM_RELIABLE_AFTER_MS = 15000
 LOW_VS_PERSONAL_MS = 45000
 LOW_VS_PERSONAL_K = 1.5
 PERSONAL_SEI_MIN_SPREAD = 8.0
-# Nhắc nhở nghỉ giải lao / đổi tư thế: 5 phút 1 lần (cửa sổ thông báo 30s)
-BREAK_REMINDER_MS = 5 * 60 * 1000
+# Nhắc nhở nghỉ giải lao / đổi tư thế: 20 phút 1 lần (cửa sổ thông báo 30s)
+BREAK_REMINDER_MS = 20 * 60 * 1000
 BREAK_REMINDER_SHOW_MS = 30000
 # MainActivity.kt:356. An empty frame only counts as a break after this long; a shorter gap leaves
 # the work clock running, so the reminder cannot be reset by looking away for a second.
