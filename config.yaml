@@ -1,0 +1,183 @@
+# FocusChangeAI edge server configuration.
+# Everything the pipeline needs to run one classroom. Copy to config.local.yaml
+# and edit that so real credentials / camera URLs never land in git.
+
+# Which class this box serves. Stored in every session row as observation_sessions.class_id, and
+# it is what a class_live JSON is named after.
+class_id: "lop12a"
+# The words printed on the preview window. Kept separate from class_id on purpose: that one is a
+# class key and has to stay an ASCII slug, this one is what a teacher or a judge reads.
+class_label: "Lớp học"
+
+# --- Assets loaded from disk (paths are relative to the folder you run main.py from) ---
+# FaceLandmarker asset: the SAME file the APK ships (app/src/main/assets, sha256 64184e22...), so a
+# landmark means the same 478-point thing on both devices. No download needed - it is in git.
+# Spelled as the copy tracked at the ROOT of this repo, not "../app/src/main/assets/...": that parent
+# folder only exists inside the full FocusChangeAIApp tree, so on a standalone clone of this leg the
+# old spelling resolved to nothing and MediaPipe failed deep inside its own loader. The root copy is
+# in git (git ls-files face_landmarker.task), so every clone has it and tests/test_assets.py can prove
+# the run starts from any working folder.
+face_landmarker_task: "face_landmarker.task"
+# ArcFace templates written by tools/enroll_roster.py. A missing or empty roster is not an error,
+# it just means nobody is bound automatically: every track stays a guest and no session row is
+# written for it until somebody names it (see the M key below, or enroll templates for ArcFace).
+roster: "roster.json"
+# Model weights ARE in git (yolo11n.pt = 5.6 MB, yolo11m.pt = 40 MB, both measured here);
+# the insightface buffalo_l pack (~280 MB) is not, and ultralytics would download a missing
+# checkpoint on first use.
+# Only the optional insightface pack needs internet on a new machine. insightface is deliberately absent on the
+# laptop used for this project: it has no cp312 Windows wheel and the source build needs MSVC, which this
+# box does not have. onnxruntime itself is fixed at 1.20.1 (requirements.txt): 1.31.1 segfaulted on import
+# here (exit 139, three runs out of three), 1.20.1 imports and runs inference. Identity is optional
+# (see classroom.py "identity off").
+# A guest can still be named without any of that: in the preview, 1-9 picks a head and M declares
+# which student it is. That is enough for _retire to store the session, and the row carries
+# identity "manual" in its notes, so a table of declared names never reads as a table of matches.
+
+# --- Input: where frames come from ---
+input:
+  # One of: camera index (0), a video file path, or an RTSP/HTTP stream URL.
+  # The Logitech C270 is the mandated lens for this project, so the laptop's built-in webcam is no
+  # longer competing for the index: it was disabled in Windows (USB\VID_0BDA&PID_5756, now Status
+  # Error in Get-PnpDevice) and a live probe of indexes 0-3 after that returned exactly one camera -
+  # index 0, "Logi C270 HD WebCam" (USB\VID_046D&PID_0825), 640x480 @ 30 fps. Indexes 1-3 did not
+  # open at all, so "0" is no longer a guess. If the picture is ever the wrong lens, re-enable the
+  # built-in camera rather than swapping numbers: with two cameras present the index order is
+  # decided by enumeration and is not predictable.
+  source: 1
+  # What to ASK the capture device for. main.py sets these with cap.set() and then prints what the
+  # driver actually gave, because the two differ. Re-read from the C270 after the built-in was
+  # disabled: 640x480 @ 30 fps delivered, and the driver stays in YUY2 (the MJPG request does not
+  # take effect; uncompressed 720p does not fit USB 2.0 on this bus). The printed line stays truth.
+  width: 640
+  height: 480
+  fps: 30
+  fourcc: "MJPG"
+  # Target processing width; frames are downscaled to this so YOLO/pose stay real-time.
+  # 640 matches the camera above. Leaving it larger than the device is not harmless: detection.imgsz
+  # used to be derived from this value, so a 640-wide feed was being upscaled to 1280 and paying four
+  # times the compute for pixels the lens never captured.
+  process_width: 640
+  # Cap the analysis frame rate (detection runs at most this many times per second).
+  detect_fps: 20
+  # How often pipeline.step() runs (eye measurement cadence). With detection.yolo_every = 3
+  # only every third step pays a YOLO pass; the steps between measure eyes on the cached
+  # boxes, which is what lets a 100-400 ms blink land inside a measured frame more often.
+  measure_fps: 30
+
+# --- Layer 1: detection + tracking (YOLO + ByteTrack) ---
+detection:
+  model: "yolo11n.pt"
+  # Inference size: 480x480 yields 2x faster inference on CPU while keeping accurate detections.
+  imgsz: 480
+  person_class: 0            # COCO class id for "person"
+  conf: 0.45                 # raised from 0.35 → helps reject low-conf detections (photo frames)
+  tracker: "bytetrack.yaml"  # built into ultralytics
+  # Run YOLO on every 3rd step to maximize FPS and smooth video feed.
+  yolo_every: 3
+  # A track whose last sighting is older than this is dropped (its PersonPipeline parks).
+  track_ttl_ms: 15000
+  # Minimum person-box height in pixels. Photo frames / posters on the wall produce small boxes
+  # (60-100 px) while a real seated student fills at least 120 px on a 480-px frame.
+  # Raise this if phantom faces from posters/pictures are still detected.
+  min_person_height_px: 120
+
+# --- Layer 2: identity (ArcFace + roster) ---
+identity:
+  # ArcFace recognition pack from insightface; buffalo_l is the accurate default.
+  recognition_pack: "buffalo_l"
+  # The gates that turn a face into a name. Two gates now, not one: the score alone cannot tell
+  # "this is em A" from "em A and em B are 0.02 apart and the camera is choosing randomly", which is
+  # how one child's session ended up beside the other child's name. min_margin is that gap.
+  # These four numbers are CHOSEN, not measured on this room's faces. The screen now prints the
+  # score and the margin for every person (line "Nhận diện: ..."), so a run of two minutes tells
+  # you which way to move them: too many "chưa gắn tên" -> lower bind_hi; a wrong name -> raise
+  # min_margin first.
+  bind_hi: 0.52              # a NEW binding needs this score and the margin below
+  bind_lo: 0.38              # an EXISTING binding is kept down to this, so a turned head is not
+                             # read as a different student
+  min_margin: 0.05           # how far the chosen template must beat the next-closest student
+  min_samples: 10            # face samples averaged before any of the two are trusted
+  # Re-verification: how often (ms) to re-check the bound face against its template.
+  reverify_ms: 30000
+  # Rolling window of embeddings averaged before a match is trusted.
+  embed_window: 40
+  # Deviation held this long with no match -> unbind the track back to guest.
+  unbind_hold_ms: 10000
+
+# --- Layer 3: scheduler (who gets the expensive FaceMesh budget) ---
+scheduler:
+  # Max faces run through FaceLandmarker+blendshapes per frame.
+  max_active_faces: 10
+  # A face smaller than this (px, eye-corner span) is not measurable at all.
+  min_eye_span_px: 12
+  # Round-robin fairness: a track not measured for this long gets priority next frame.
+  starve_ms: 1500
+  # Suspicious (low SEI / dozing) faces get measured this many times more often.
+  hot_multiplier: 3
+
+# --- Cấu hình cảnh báo định kỳ (5 phút 1 lần) ---
+alerts:
+  cooldown_seconds: 300       # Giãn cách giữa 2 lần cảnh báo cùng loại (5 phút)
+  break_reminder_minutes: 5    # Nhắc giải lao / đổi tư thế định kỳ 5 phút
+
+# --- Layer 4: per-person measurement ---
+person:
+  # Sensitivity level 0..3 applied to every pipeline (see MuscleSensitivity).
+  sensitivity: 1
+  # Session is committed to the habit profile only when it clears HabitConfig bars.
+  habit_learn: true
+
+# --- Teacher voice commands (OFFLINE, focusedge/teacher_voice.py) ---
+# Speech is decoded on this machine by Vosk with a Vietnamese model; no audio is uploaded
+# anywhere. The old recognize_google path was a cloud API, not a downloadable library, and is gone.
+# The model is NOT in git (32 MB zip, Apache 2.0). Fetch it once:
+#   https://alphacephei.com/vosk/models/vosk-model-small-vn-0.4.zip
+# and unzip into models/ so models/vosk-model-small-vn-0.4/ exists. Without it the listen
+# button reports "manual" and the context can still be picked by hand in the dashboard.
+# Measured on the project laptop (i5-5200U): model load 0.95 s, decode real-time factor ~1.18,
+# so a command lands a few seconds after it is spoken and speech during decode is missed.
+teacher_voice:
+  model_path: "models/vosk-model-small-vn-0.4"
+  # Silence this long after a command returns the context to LECTURE (vision label in charge).
+  auto_reset_seconds: 180
+  # The teacher's rule: a head looking elsewhere for 10 minutes counts as off-task. The verdict
+  # is display only (person card "Chu y"), never an alert and never a stored number.
+  off_task_seconds: 600
+
+# --- Layer 5: local storage (SQLite + out/) ---
+# Nothing leaves this machine any more. Measured sessions, their per-feature statistics, the
+# learned bands and the alerts go into one SQLite file; the two live views are written beside the
+# program as JSON. The schema is database/focuschange_db.py and the writer is
+# focusedge/local_store.py.
+storage:
+  # Where the data lands. Empty means the schema's own default, <repo>/data/focuschange.db.
+  # A relative path here is anchored at the repository root, NOT at the folder you run main.py
+  # from, so Chay-Cam.bat and "python edge-server/main.py" fill the same file.
+  db: ""
+  # classes.school_year is NOT NULL and is half the key a class membership points at, so a run has
+  # to say which year it belongs to. Format: "2026-2027". Change it once, at the start of the year.
+  school_year: "2026-2027"
+  # How often the class board JSON is rewritten; independent of class size (single writer).
+  class_live_ms: 20000
+  # Per-student heartbeat cadence; the phone beats on the same 5 minute timer.
+  heartbeat_ms: 300000
+
+# --- The two live views ---
+# What actually appears here: out/class_live_<class>.json (the whole room, one file, overwritten on
+# class_live_ms) and out/presence_<student>.json (one file per bound student, overwritten on
+# heartbeat_ms). Both are a picture of the last few seconds, which is why they are files and not
+# database rows: the ten-table schema records measurements, and a heartbeat is not one.
+# There is NO per-frame CSV on the camera leg yet - the phone writes one per session and the server
+# has no equivalent, so frame-level rows only exist in the live overlay.
+local_output:
+  dir: "out"
+
+# --- The preview window ---
+# One column of the phone's full HUD per person in frame (the 2026-11-14 request): every child gets
+# their own SEI, alerts, habit and calibration lines, with their own sparkline. The cap is what a
+# 1366 px screen holds at readable type; beyond it the extra people are named on a plate under the
+# camera and reached with 1-9. Set 1 to force the legacy single-column view even with several
+# people in shot.
+display:
+  max_panels: 3

@@ -1,0 +1,52 @@
+# FocusChangeAI edge server - multi-person focus monitoring.
+# Python 3.10+ recommended (matches MediaPipe Tasks and Ultralytics support).
+
+# --- Vision: detection + tracking (Layer 1) ---
+ultralytics>=8.2.0          # YOLO11 + built-in ByteTrack/BoT-SORT trackers
+opencv-python>=4.9.0        # frame IO, ROI cropping, drawing
+numpy>=1.26.0
+
+# --- Identity: face recognition + roster matching (Layer 2) --- PARTIALLY OPTIONAL
+# onnxruntime is pinned to the one version family measured to work on the project laptop
+# (i5-5200U, Python 3.12, NumPy 2.x): 1.31.1 SEGFAULTS on import (exit 139, three runs out
+# of three), 1.17.3 is compiled against NumPy 1.x and refuses to load under NumPy 2,
+# 1.20.1 imports AND runs real inference (yolo11n.onnx, ~151 ms/pass, CPUExecutionProvider).
+# Do not "upgrade" this pin without re-running that import probe on the target machine.
+onnxruntime==1.20.1
+# insightface still needs a C++ compiler (no cp312 Windows wheel for 0.7.3; the source build
+# fails on a machine without MSVC), so it stays out of this file. Without it identity.py prints
+# "identity off (ModuleNotFoundError: No module named 'insightface') - every track stays a guest".
+# What that costs, said plainly: a guest-only run still writes class_live, but NO sessions/bands/presence
+# document, because those three are keyed per bound student. Guests can still be named by hand
+# (1-9 picks a head, M declares the student). On a machine with MSVC Build Tools, run by hand:
+#     pip install insightface==0.7.3
+# insightface>=0.7.3
+
+# --- Detailed face/eye measurement (Layer 4) ---
+# Same face_landmarker.task asset the Android app ships, so blendshapes line up 1:1.
+mediapipe>=0.10.14
+
+# --- On-screen text ---
+# main.py draws the HUD and the plate text with PIL, lazily inside the draw helpers: a machine
+# without Pillow opens the window and then fails the first time it paints a line, which is worse
+# than failing at install. opencv's own putText cannot do the Vietnamese diacritics.
+Pillow>=10.0.0
+
+# --- Configuration (and Layer 5's data file) ---
+# PyYAML reads config.yaml. Layer 5 itself needs no package at all: it is sqlite3, which ships with
+# Python. firebase-admin used to be listed here and is gone - measured rows are stored locally, so a
+# machine with no internet still stores exactly what it measures. There is no outbound call left:
+# the teacher-voice recognizer below now decodes on this machine too.
+PyYAML>=6.0
+
+# --- Teacher voice context (optional, off until /api/teacher-voice/listen starts it) ---
+# OFFLINE Vietnamese command recognition. SpeechRecognition + PyAudio only CAPTURE the mic;
+# Vosk does the decoding locally with vosk-model-small-vn-0.4 (32 MB zip, Apache 2.0, NOT in
+# git - see config.yaml teacher_voice for the one-time download). The old recognize_google
+# path was a cloud API call, not a downloadable library, and has been removed: no audio leaves
+# the machine. Measured on the project laptop: model load 0.95 s, decode RTF ~1.18.
+# Without these packages the listener degrades to manual context picks and says so.
+# PyAudio ships Windows wheels; on Linux it needs the portaudio19-dev headers to build.
+SpeechRecognition>=3.17.0
+PyAudio>=0.2.14
+vosk>=0.3.45
