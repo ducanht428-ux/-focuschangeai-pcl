@@ -116,6 +116,11 @@ scheduler:
   # Suspicious (low SEI / dozing) faces get measured this many times more often.
   hot_multiplier: 3
 
+# --- Cấu hình cảnh báo định kỳ (5 phút 1 lần) ---
+alerts:
+  cooldown_seconds: 300       # Giãn cách giữa 2 lần cảnh báo cùng loại (5 phút)
+  break_reminder_minutes: 5    # Nhắc giải lao / đổi tư thế định kỳ 5 phút
+
 # --- Layer 4: per-person measurement ---
 person:
   # Sensitivity level 0..3 applied to every pipeline (see MuscleSensitivity).

@@ -549,8 +549,12 @@ async function tickFast() {
     if (voice) S.voice = voice;
     // Âm báo khi có cảnh báo CHƯA XEM mới (đặc tả 5.7). Lần đầu chỉ ghi mốc, không kêu.
     if (S.lastUnseen != null && ov.alerts_unseen > S.lastUnseen) {
-      beep();
-      toast("Có cảnh báo mới (" + (ov.alerts_unseen - S.lastUnseen) + ")", "err");
+      const now = Date.now();
+      if (!window._lastAlertToastTime || now - window._lastAlertToastTime >= 300000) {
+        window._lastAlertToastTime = now;
+        beep();
+        toast("Có cảnh báo mới (" + (ov.alerts_unseen - S.lastUnseen) + ")", "err");
+      }
     }
     S.lastUnseen = ov.alerts_unseen;
     updateChips();
@@ -1567,9 +1571,7 @@ function renderCamera() {
     '<div class="avg-note" id="cam-status-note"></div>' +
     '<div class="people-grid" id="cam-people"></div></div>' +
     '<div><div class="card"><h3>' + ico("settings") + 'Cài đặt camera</h3>' +
-    '<div class="field"><label>Nguồn camera</label><select id="cam-source">' +
-    '<option value="0" selected>Webcam máy này (index 0)</option>' +
-    '<option value="phone" disabled>Điện thoại ghép nối — giai đoạn 3</option></select></div>' +
+    '<div class="field"><label>Nguồn camera</label>' + sel("cam-source", [[0, "Cam máy tính (Built-in, index 0)"], [1, "Webcam rời USB (Logitech C270, index 1)"], [2, "Camera phụ (index 2)"]], cc.source != null ? cc.source : 1) + "</div>" +
     '<div class="field"><label>Độ phân giải xử lý</label>' + sel("cam-width", [[640, "640×480"], [480, "480×360"], [320, "320×240"]], cc.process_width) + "</div>" +
     '<div class="field"><label>Số mặt đo cùng lúc</label>' + sel("cam-faces", [[1, "1"], [2, "2"], [3, "3"], [4, "4"], [10, "10 (tối đa)"]], cc.max_active_faces) + "</div>" +
     '<div class="field"><label>Tần suất quét (khung/giây)</label>' + sel("cam-fps-set", [[8, "8 (Tiết kiệm)"], [12, "12"], [15, "15"], [20, "20 (Mượt)"], [25, "25"], [30, "30 (Tối đa)"]], cc.detect_fps || 20) + "</div>" +
@@ -1942,6 +1944,7 @@ async function setVoiceContext(ctx) {
 
 async function saveCameraSettings() {
   const body = {camera: {
+    source: parseInt($("cam-source").value, 10),
     process_width: parseInt($("cam-width").value, 10),
     max_active_faces: parseInt($("cam-faces").value, 10),
     detect_fps: parseInt($("cam-fps-set").value, 10),
@@ -2478,8 +2481,12 @@ async function loadAlerts() {
 /* Âm báo ngắn bằng WebAudio - không cần file âm thanh ngoài. Trình duyệt chỉ cho phát
    sau tương tác đầu tiên của người dùng; nếu chưa được phép thì bỏ qua lặng lẽ. */
 let audioCtx = null;
+let _lastBeepWallMs = 0;
 function beep() {
   if (!S.soundOn) return;
+  const now = Date.now();
+  if (now - _lastBeepWallMs < 300000) return; // Giãn cách tối thiểu 5 phút 1 lần để chống spam chuông
+  _lastBeepWallMs = now;
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === "suspended") audioCtx.resume();
@@ -2759,8 +2766,8 @@ async function renderSettings() {
     '<input type="number" id="set-repeat" min="1" value="' + esc(st.alert_repeat || "2") + '"></div>' +
     '<div class="field"><label>Số lần lặp cho ngưỡng cá nhân (4–5)</label>' +
     '<input type="number" id="set-personal" min="1" value="' + esc(st.alert_personal_repeat || "4") + '"></div>' +
-    '<div class="field"><label>Thời gian chờ giữa 2 cảnh báo cùng loại (giây)</label>' +
-    '<input type="number" id="set-cooldown" min="0" value="' + esc(st.alert_cooldown_s || "60") + '"></div>' +
+    '<div class="field"><label>Thời gian chờ giữa 2 cảnh báo cùng loại (giây, mặc định 300s = 5 phút)</label>' +
+    '<input type="number" id="set-cooldown" min="0" value="' + esc(st.alert_cooldown_s || "300") + '"></div>' +
     '<button class="btn btn-primary" id="set-alert-save">' + ico("check") + " Lưu ngưỡng</button>" +
     '<div class="lock-note mt">Ngưỡng lưu trong CSDL để chỉnh được như đặc tả 7.2; lõi đo sẽ đọc các giá trị này ở bước nối tiếp theo (hiện lõi dùng ngưỡng trong mã/config).</div></div>' +
     '<div class="card mt"><h3>' + ico("eye") + "Giao diện & ngôn ngữ</h3>" +
