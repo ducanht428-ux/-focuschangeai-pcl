@@ -8,3 +8,6 @@ data/
 backups/
 out/
 roster.jsonmodels/
+
+edge-server/edge-server/
+

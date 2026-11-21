@@ -1,9 +1,0 @@
-# Bytecode Python - sinh lại mỗi lần chạy, không phải mã nguồn
-__pycache__/
-*.pyc
-
-# Dữ liệu người dùng và chẩn đoán cục bộ - không lên git
-data/
-backups/
-out/
-roster.json
