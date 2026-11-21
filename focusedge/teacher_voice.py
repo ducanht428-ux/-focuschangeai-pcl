@@ -37,16 +37,22 @@ class TeacherContextAI:
     Also supports offline fallback, auto-reset timeout, and manual overrides.
     """
 
+    CONTEXT_UNKNOWN = "UNKNOWN"         # Chưa nghe khẩu lệnh nào - không được coi là một hoạt động
     CONTEXT_LECTURE = "LECTURE"         # Nghe giảng (nhìn bảng)
-    CONTEXT_STUDY_NOTE = "STUDY_NOTE"   # Ghi bài / làm bài tập (cúi đầu)
+    CONTEXT_STUDY_NOTE = "STUDY_NOTE"   # Ghi bài / chép bài (cúi đầu xuống vở)
     CONTEXT_GROUP_WORK = "GROUP_WORK"   # Thảo luận nhóm (quay mặt + mấp máy môi)
+    CONTEXT_SEATWORK = "SEATWORK"       # Làm bài tập / suy nghĩ cá nhân (tài liệu 3)
+    CONTEXT_Q_AND_A = "Q_AND_A"         # Hỏi - đáp, giơ tay phát biểu (tài liệu 3)
+
+    CONTEXTS = (CONTEXT_LECTURE, CONTEXT_STUDY_NOTE, CONTEXT_GROUP_WORK,
+                CONTEXT_SEATWORK, CONTEXT_Q_AND_A)
 
     def __init__(self, auto_reset_seconds: int = 180, language: str = "vi-VN",
                  model_path: str = "models/vosk-model-small-vn-0.4"):
         self.context = self.CONTEXT_LECTURE
         self.last_speech = "Hệ thống sẵn sàng"
         self.last_switch_time = time.time()
-        self.auto_reset_seconds = auto_reset_seconds  # Tự quay về LECTURE sau 3-5 phút nếu GV im lặng
+        self.auto_reset_seconds = auto_reset_seconds  # Hết thời gian -> UNKNOWN, không phải LECTURE
         self.running = False
         self.language = language
         self.model_path = model_path
@@ -55,6 +61,7 @@ class TeacherContextAI:
         # The dashboard prints this so a silent mic is never mistaken for a listening one.
         self.engine = "init"
         self.thread: Optional[threading.Thread] = None
+        self.last_error = ""
         self._lock = threading.Lock()
         # Where the current context came from: "init" (nobody spoke or clicked yet), "voice",
         # "manual" (dashboard API / shortcut) or "auto" (silence timeout). The classroom label
@@ -83,6 +90,8 @@ class TeacherContextAI:
                 "nghe giảng",
                 "cô giảng",
                 "thầy giảng",
+                "cô giải thích",      # Tài liệu 3, bảng ngữ cảnh LECTURE
+                "thầy giải thích",
                 "hết giờ",
                 "quan sát",
                 "chú ý",
@@ -95,6 +104,27 @@ class TeacherContextAI:
                 "mở sách",
                 "ghi chép",
                 "chép định nghĩa",
+            ],
+            # Tài liệu 3 tách SEATWORK (làm bài tập / suy nghĩ) khỏi NOTE_TAKING (ghi chép).
+            # Hai tài liệu MÂU THUẪN ở "làm bài tập" / "mở sách": tài liệu 2 xếp chúng vào
+            # STUDY_NOTE và test_teacher_voice đã khoá điều đó ("mở sách làm bài tập" ->
+            # STUDY_NOTE). Giữ nguyên STUDY_NOTE cho hai từ này; SEATWORK nhận các từ còn
+            # lại của tài liệu 3. Nhờ khớp dài-nhất-trước, "tự làm bài tập" vẫn về STUDY_NOTE.
+            self.CONTEXT_SEATWORK: [
+                "làm bài một mình",
+                "bài tập cá nhân",
+                "tự làm",
+                "tự học",
+                "suy nghĩ",
+            ],
+            self.CONTEXT_Q_AND_A: [
+                "trả lời câu hỏi",
+                "ai trả lời",
+                "giơ tay",
+                "phát biểu",
+                "mời một bạn",
+                "mời em",
+                "hỏi đáp",
             ],
         }
 
@@ -146,7 +176,6 @@ class TeacherContextAI:
     def get_status(self) -> Dict[str, any]:
         """Return snapshot of current state."""
         with self._lock:
-            # Kiểm tra auto-reset timeout
             now = time.time()
             if self.context != self.CONTEXT_LECTURE and (now - self.last_switch_time > self.auto_reset_seconds):
                 self.context = self.CONTEXT_LECTURE
@@ -215,7 +244,6 @@ class TeacherContextAI:
             with mic as source:
                 recognizer.adjust_for_ambient_noise(source, duration=1)
                 while self.running:
-                    # Kiểm tra auto-reset về LECTURE
                     now = time.time()
                     with self._lock:
                         if self.context != self.CONTEXT_LECTURE and (now - self.last_switch_time > self.auto_reset_seconds):
@@ -231,6 +259,8 @@ class TeacherContextAI:
                         continue
                     except Exception:
                         # Bắt mọi lỗi ngoại lệ để không bao giờ dừng luồng chính
+                        with self._lock:
+                            self.last_error = "Lỗi luồng nghe: %s" % err
                         time.sleep(0.5)
                         continue
 

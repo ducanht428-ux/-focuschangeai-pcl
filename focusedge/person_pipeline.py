@@ -1153,3 +1153,12 @@ class PersonPipeline:
         cutoff = now_ms - self.BPM_WINDOW_MS
         while self._blink_ts and self._blink_ts[0] < cutoff:
             self._blink_ts.popleft()
+
+    def blinks_since(self, ts_ms: int) -> List[Tuple[int, int]]:
+        """Các nhịp chớp mắt (timestamp, duration_ms) MỚI HƠN ts_ms, chỉ đọc.
+
+        TicWatch (theo dõi dấu hiệu giật lặp lại - tài liệu Tic) đọc cùng một nguồn
+        với BPM của điện thoại thay vì tự đếm lại: một phép đo, hai người đọc.
+        Không thay đổi bất kỳ số liệu parity nào.
+        """
+        return [(t, d) for t, d in zip(self._blink_ts, self._blink_dur) if t > ts_ms]

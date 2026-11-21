@@ -847,6 +847,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(students_list(conn, cfg))
             if path == "/api/student":
                 return self._json(student_detail(conn, q.get("id", "")))
+            if path == "/api/student/tic-history":
+                # Đọc dọc nhiều phiên (notes JSON) - mốc 4 tuần DSM-5 của tài liệu Tic.
+                # Khuyến nghị theo dõi/đi khám, KHÔNG chẩn đoán; kèm trích dẫn y khoa.
+                from focusedge.tic_watch import tic_history
+                return self._json(tic_history(conn, q.get("id", "")))
             if path == "/api/analysis":
                 return self._json(analysis(conn, q.get("id", ""), q.get("scope", "buoi")))
             if path == "/api/alerts":

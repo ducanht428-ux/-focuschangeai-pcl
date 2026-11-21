@@ -174,6 +174,15 @@ def test_the_name_survives_a_restart():
     assert again.name_of("hs1") == "Học sinh 1"
 
 
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    for k, v in sorted(globals().items()):
+        if k.startswith("test_") and callable(v):
+            suite.addTest(unittest.FunctionTestCase(v))
+    return suite
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

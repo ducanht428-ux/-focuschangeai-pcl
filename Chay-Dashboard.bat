@@ -4,20 +4,20 @@ rem Double-click this file. A browser tab opens at http://127.0.0.1:8730 .
 rem Ctrl+C in this black window stops the server. Everything stays on this PC (offline).
 cd /d "%~dp0"
 
-rem Same interpreter fallback as Chay-Cam.bat: known-good path, then py launcher, then PATH.
-set "PY=C:\Users\Admin\AppData\Local\Programs\Python\Python312\python.exe"
+rem Same interpreter fallback as Chay-Cam.bat: PATH, py launcher, then known paths.
+set "PY="
+for /f "delims=" %%i in ('where python.exe 2^>nul') do if not defined PY set "PY=%%i"
 if exist "%PY%" goto found
 
-set "PY="
 for /f "delims=" %%i in ('py -3.12 -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%i"
 if exist "%PY%" goto found
 
-set "PY="
 for /f "delims=" %%i in ('py -c "import sys;print(sys.executable)" 2^>nul') do set "PY=%%i"
 if exist "%PY%" goto found
 
-set "PY="
-for /f "delims=" %%i in ('where python.exe 2^>nul') do if not defined PY set "PY=%%i"
+set "PY=C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python313\python.exe"
+if exist "%PY%" goto found
+set "PY=C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python312\python.exe"
 if exist "%PY%" goto found
 
 echo Python was not found on this PC.
