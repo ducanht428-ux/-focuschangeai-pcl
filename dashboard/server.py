@@ -790,6 +790,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("index.html")
         if path in ("/app.css", "/app.js"):
             return self._static(path[1:])
+        if path == "/download/FocusChangeAI-PC-app.zip":
+            candidates = [
+                r"D:\Downloads\FocusChangeAI-PC-app.zip",
+                r"C:\Users\Admin\Documents\Qoder\2026-10-21\FocusChangeAI-PC-app.zip"
+            ]
+            target = next((p for p in candidates if os.path.isfile(p)), None)
+            if not target:
+                return self._json({"error": "app file not found"}, 404)
+            size = os.path.getsize(target)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", 'attachment; filename="FocusChangeAI-PC-app.zip"')
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(target, "rb") as f:
+                while True:
+                    chunk = f.read(131072)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
         if not path.startswith("/api/"):
             return self._json({"error": "not found"}, 404)
         try:
@@ -882,7 +903,7 @@ class Handler(BaseHTTPRequestHandler):
                 if jpeg:
                     self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                      + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
-                time.sleep(0.1)
+                time.sleep(0.033)
         except Exception:
             return   # trình duyệt đóng tab / dừng stream: kết thúc lặng lẽ
 

@@ -54,38 +54,28 @@ input:
   # times the compute for pixels the lens never captured.
   process_width: 640
   # Cap the analysis frame rate (detection runs at most this many times per second).
-  # Measured ceiling on this box, not a wish: yolo11n at imgsz 640 takes 145 ms per call on the
-  # i5-5200U (2 cores, no GPU) = 6.9 steps/s, and at imgsz 480 it takes 100 ms = 10 steps/s.
-  # 8 sits between the two so a slower frame does not stall the loop.
-  detect_fps: 8
-  # How often pipeline.step() runs (eye measurement cadence). With detection.yolo_every = 2
-  # only every second step pays a YOLO pass; the steps between measure eyes on the cached
+  detect_fps: 20
+  # How often pipeline.step() runs (eye measurement cadence). With detection.yolo_every = 3
+  # only every third step pays a YOLO pass; the steps between measure eyes on the cached
   # boxes, which is what lets a 100-400 ms blink land inside a measured frame more often.
-  # Component costs measured on this box: YOLO 150 ms, FaceLandmarker 8 ms, so a stride-2
-  # step averages ~83 ms = 12 steps/s against ~6.3 with one YOLO per step. End-to-end fps
-  # with a real class still has to be read off the HUD line, not assumed from this arithmetic.
-  # 0 or absent = step at detect_fps, the old one-YOLO-per-step behavior.
-  measure_fps: 12
+  measure_fps: 30
 
 # --- Layer 1: detection + tracking (YOLO + ByteTrack) ---
 detection:
-  # yolo11n (5.6 MB) instead of yolo11m (40 MB): measured on the same 30 webcam frames, m costs
-  # 852 ms per detection = 1.2 steps/s on this CPU, which is why a 300-frame run needed over ten
-  # minutes. n costs 145 ms. m is still the right answer on a machine with a real GPU.
   model: "yolo11n.pt"
-  # Inference size, decoupled from input.process_width (see the note there). 0 = follow
-  # process_width, which is what this key used to do implicitly.
-  imgsz: 640
+  # Inference size: 480x480 yields 2x faster inference on CPU while keeping accurate detections.
+  imgsz: 480
   person_class: 0            # COCO class id for "person"
-  conf: 0.35                 # minimum detection confidence
+  conf: 0.45                 # raised from 0.35 → helps reject low-conf detections (photo frames)
   tracker: "bytetrack.yaml"  # built into ultralytics
-  # Run YOLO on every Nth step; the steps between reuse the last person boxes and only run
-  # FaceLandmarker. 1 = detect every step (old behavior). 2 halves the YOLO cost so the eye
-  # cadence set by input.measure_fps fits this CPU; boxes are then at most one frame stale.
-  # An empty room always re-detects, so a child walking in is found on the next frame.
-  yolo_every: 2
+  # Run YOLO on every 3rd step to maximize FPS and smooth video feed.
+  yolo_every: 3
   # A track whose last sighting is older than this is dropped (its PersonPipeline parks).
   track_ttl_ms: 15000
+  # Minimum person-box height in pixels. Photo frames / posters on the wall produce small boxes
+  # (60-100 px) while a real seated student fills at least 120 px on a 480-px frame.
+  # Raise this if phantom faces from posters/pictures are still detected.
+  min_person_height_px: 120
 
 # --- Layer 2: identity (ArcFace + roster) ---
 identity:

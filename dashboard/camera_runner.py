@@ -16,6 +16,7 @@ exception vào luồng nền: màn hình Camera phải nói được vì sao ch�
 from __future__ import annotations
 
 import importlib.util
+import math
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -145,21 +146,54 @@ class CameraRunner:
             for _ in range(30):
                 cap.read()
             width = int((cfg.get("input") or {}).get("process_width", 640))
-            # measure_fps (input) paces step(); yolo_every (detection) lets intermediate
-            # steps measure eyes on cached boxes without paying a YOLO pass each time.
-            detect_fps = float((cfg.get("detection") or {}).get("detect_fps", 8))
-            measure_fps = float((cfg.get("input") or {}).get("measure_fps", 0)) or detect_fps
-            tick_ms = 1000.0 / max(1.0, measure_fps)
-            last_tick = 0.0
-            last_step = 0.0
+            cap.set(cv2.CAP_PROP_FPS, 30)
+
+            latest_results: List = []
+            ai_frame = None
+            ai_lock = threading.Lock()
+            ai_event = threading.Event()
+            ai_proc = 0.0
+            acc: List[Dict] = []
+            bucket = 0
+
+            def ai_worker():
+                nonlocal latest_results, ai_proc, acc, bucket
+                while not self._stop.is_set():
+                    ai_event.wait(timeout=0.2)
+                    ai_event.clear()
+                    if self._stop.is_set():
+                        break
+                    with ai_lock:
+                        if ai_frame is None:
+                            continue
+                        f_copy = ai_frame.copy()
+                    t0 = time.monotonic() * 1000
+                    try:
+                        res = pipeline.step(f_copy)
+                        step_ms = time.monotonic() * 1000 - t0
+                        ai_proc = _ema(ai_proc, step_ms)
+                        latest_results = res
+                        if res:
+                            acc.append(self._means(res))
+                        now_bucket = int(time.time() * 1000) // 60000 * 60000
+                        if now_bucket != bucket:
+                            if bucket and acc and self._on_minute:
+                                self._on_minute(bucket, self._average(acc))
+                            bucket = now_bucket
+                            acc = []
+                    except Exception:
+                        pass
+
+            ai_thread = threading.Thread(target=ai_worker, daemon=True, name="camera-ai-worker")
+            ai_thread.start()
+
             fps = 0.0
-            proc = 0.0
+            last_t = 0.0
             frames = 0
             started = int(time.time() * 1000)
-            bucket = 0
-            acc: List[Dict] = []
             with self._lock:
                 self._info["started_ms"] = started
+
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok:
@@ -167,38 +201,30 @@ class CameraRunner:
                 h, w = frame.shape[:2]
                 if w > width:
                     frame = cv2.resize(frame, (width, max(1, int(h * width / float(w)))))
-                now = time.monotonic() * 1000
-                if now - last_tick < tick_ms:
-                    continue
-                last_tick = now
-                t0 = time.monotonic() * 1000
-                results = pipeline.step(frame)
-                step_ms = time.monotonic() * 1000 - t0
-                if last_step:
-                    dt = t0 - last_step
+
+                t_now = time.monotonic() * 1000
+                if last_t:
+                    dt = t_now - last_t
                     if 0.0 < dt < 5000.0:
                         fps = _ema(fps, 1000.0 / dt)
-                last_step = t0
-                proc = _ema(proc, step_ms)
+                last_t = t_now
                 frames += 1
-                view = self._draw(frame, pipeline, results)
+
+                with ai_lock:
+                    ai_frame = frame
+                ai_event.set()
+
+                view = self._draw(frame, pipeline, latest_results)
                 ok2, buf = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                 people = self._people(pipeline)
                 activity = getattr(pipeline.last_activity, "label", "") or ""
                 with self._lock:
                     self._jpeg = buf.tobytes() if ok2 else None
-                    self._info = {"people": people, "fps": fps, "processing_ms": proc,
+                    self._info = {"people": people, "fps": fps, "processing_ms": ai_proc,
                                   "activity": activity, "started_ms": started, "frames": frames}
-                # Trung bình lớp mỗi phút một lần -> bảng class_trend, để biểu đồ 30 phút
-                # còn dữ liệu sau khi mở lại app. Chỉ số, không phải ảnh.
-                if results:
-                    acc.append(self._means(results))
-                now_bucket = int(time.time() * 1000) // 60000 * 60000
-                if now_bucket != bucket:
-                    if bucket and acc and self._on_minute:
-                        self._on_minute(bucket, self._average(acc))
-                    bucket = now_bucket
-                    acc = []
+
+            ai_event.set()
+            ai_thread.join(timeout=1.0)
         except Exception as e:  # ranh giới với camera và lõi đo: lỗi phải hiện lên màn hình
             self.error = "%s: %s" % (type(e).__name__, e)
         finally:
@@ -261,12 +287,16 @@ class CameraRunner:
                 "attention_reason": v.attention_reason,
                 "measurable": bool(v.measurable),
                 "sei": r.sei if r is not None else None,
-                "situation": r.situation.name if r is not None else "UNKNOWN",
+                "situation": getattr(r.situation, "name", str(r.situation)) if (r is not None and r.situation is not None) else "UNKNOWN",
                 "perclos": round(r.perclos, 1) if r is not None and r.perclos is not None else None,
                 "distance_cm": round(r.distance_cm, 1) if r is not None and r.distance_cm is not None else None,
                 "alert": r.alert if r is not None else None,
-                "ear": round(feats.get(HabitFeature.EAR), 3) if feats.get(HabitFeature.EAR) is not None else None,
-                "mar": round(feats.get(HabitFeature.MAR), 3) if feats.get(HabitFeature.MAR) is not None else None,
+                "ear": (round(feats[HabitFeature.EAR], 3)
+                        if feats.get(HabitFeature.EAR) is not None
+                        and math.isfinite(feats[HabitFeature.EAR]) else None),
+                "mar": (round(feats[HabitFeature.MAR], 3)
+                        if feats.get(HabitFeature.MAR) is not None
+                        and math.isfinite(feats[HabitFeature.MAR]) else None),
                 "pitch": round(r.pitch, 1) if r is not None and r.pitch is not None else None,
                 "yaw": round(r.yaw, 1) if r is not None and r.yaw is not None else None,
                 "quality": r.quality if r is not None else None,

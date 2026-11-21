@@ -137,11 +137,11 @@ class TrackRuntime:
 
 class ClassroomPipeline:
     # head region of the person box fed to FaceLandmarker (faces live near the top)
-    FACE_TOP_FRACTION = 0.55
+    FACE_TOP_FRACTION = 0.65
     # Fraction of that region allowed to fall outside the frame before the face is skipped.
-    # Tuned for a tripod camera at the front of a room, where a body touching the edge means the
-    # head is cut too; a phone held by the student is always framed whole, so it has no equivalent.
-    CLIP_MAX_FRACTION = 0.25
+    # 0.25 was tuned for a tripod 5m away; for a laptop webcam 50-80cm away the face fills
+    # the frame much more and often touches the top/side edges. 0.50 lets those frames through.
+    CLIP_MAX_FRACTION = 0.50
     # Seat memory: a manually named head that leaves the frame remembers its seat (normalized
     # face-center) for this long, and a new guest head appearing within this radius is OFFERED
     # that name on the first m press. Offered, never auto-bound: two children swapping seats
@@ -253,6 +253,7 @@ class ClassroomPipeline:
             person_class=int(det_cfg.get("person_class", 0)),
             imgsz=int(det_cfg.get("imgsz") or cfg.get("input", {}).get("process_width", 1280)),
             device=det_cfg.get("device"),
+            min_person_height_px=int(det_cfg.get("min_person_height_px", 100)),
         )
         # Identity is optional: without insightface/roster templates the pipeline
         # still measures bodies, it just keeps everyone as a guest.

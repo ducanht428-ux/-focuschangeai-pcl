@@ -313,7 +313,10 @@ function buildNav() {
     '<button class="nav-item' + (S.view === id ? " active" : "") + '" data-view="' + id + '">' +
     ico(icon) + "<span>" + label + "</span>" +
     (id === "alerts" ? '<span class="nav-badge" id="nav-alert-badge"' + (unseen ? "" : " hidden") + ">" + unseen + "</span>" : "") +
-    "</button>").join("");
+    "</button>").join("") +
+    '<a class="nav-item" href="/download/FocusChangeAI-PC-app.zip" download ' +
+    'style="margin-top:10px;border:1px dashed var(--blue);color:var(--blue);font-weight:600;text-decoration:none;" title="Tải trọn gói ứng dụng PC không cần mạng">' +
+    ico("download") + '<span>Tải App PC (144MB)</span></a>';
   for (const btn of $("nav").querySelectorAll(".nav-item")) {
     btn.onclick = () => { location.hash = "#" + btn.dataset.view; closeNav(); };
   }
@@ -781,7 +784,8 @@ function renderOverview() {
       : '<div class="card"><h3>' + ico("camera") + 'Camera thời gian thực</h3>' +
         '<div class="cam-wrap" id="ov-wrap"><img id="ov-stream" alt="Luồng camera" hidden>' +
         '<div class="cam-empty" id="ov-empty"></div><span class="fps-chip" id="ov-fps" hidden></span></div>' +
-        cameraButtons("ov") + '<div class="avg-note" id="ov-cam-note"></div></div>') +
+        cameraButtons("ov") + '<div class="avg-note" id="ov-cam-note"></div>' +
+        '<div class="people-grid mt" id="cam-people"></div></div>') +
     '<div class="card"><h3>' + ico("target") + 'Chỉ số trung bình lớp</h3><div id="ov-avgs"></div>' +
     '<div class="avg-note" id="ov-avg-note"></div></div>' +
     '<div class="card"><h3>' + ico("chart") + 'Xu hướng chú ý 30 phút</h3><div id="ov-trend"></div>' +
@@ -1540,7 +1544,7 @@ function renderCamera() {
     '<option value="phone" disabled>Điện thoại ghép nối — giai đoạn 3</option></select></div>' +
     '<div class="field"><label>Độ phân giải xử lý</label>' + sel("cam-width", [[640, "640×480"], [480, "480×360"], [320, "320×240"]], cc.process_width) + "</div>" +
     '<div class="field"><label>Số mặt đo cùng lúc</label>' + sel("cam-faces", [[1, "1"], [2, "2"], [3, "3"], [4, "4"], [10, "10 (tối đa)"]], cc.max_active_faces) + "</div>" +
-    '<div class="field"><label>Tần suất quét (khung/giây)</label>' + sel("cam-fps-set", [[4, "4"], [8, "8"], [12, "12"], [15, "15"]], cc.detect_fps) + "</div>" +
+    '<div class="field"><label>Tần suất quét (khung/giây)</label>' + sel("cam-fps-set", [[8, "8 (Tiết kiệm)"], [12, "12"], [15, "15"], [20, "20 (Mượt)"], [25, "25"], [30, "30 (Tối đa)"]], cc.detect_fps || 20) + "</div>" +
     '<div class="field"><label>Độ nhạy</label>' + sel("cam-sens", [[0, "Thấp"], [1, "Vừa"], [2, "Cao"], [3, "Rất cao"]], cc.sensitivity) + "</div>" +
     '<button class="btn btn-primary" id="cam-save">' + ico("save") + " Lưu cài đặt camera</button>" +
     '<div class="lock-note mt">Thông số lưu vào config.yaml, áp dụng từ lần bật camera kế tiếp. ' +
@@ -1597,8 +1601,8 @@ function switchRow(id, label, checked) {
 function updateCameraParts() {
   if (window.FC_MODE === "web") { livePaint(); livePlaceSoon(); return; }
   if ($("tv-ctx")) refreshVoicePanel();
-  if (!$("cam-stream")) return;
-  syncStream("cam-stream", "cam-empty", "cam-fps");
+  if (!$("cam-stream") && !$("ov-stream")) return;
+  if ($("cam-stream")) syncStream("cam-stream", "cam-empty", "cam-fps");
   const cam = (S.live && S.live.camera) || {};
   if ($("cam-status-note")) {
     $("cam-status-note").textContent = window.FC_MODE === "web"
