@@ -7,6 +7,12 @@
 <meta name="description" content="Bản web của dashboard FocusChangeAI: đọc số đo thật từ SQLite của máy này, tự nối về dashboard cục bộ khi đang chạy; không hiển thị số liệu mẫu trừ khi gọi ?mode=demo.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 44 44'%3E%3Crect width='44' height='44' rx='12' fill='%231f6feb'/%3E%3Cpath d='M8 22s5.5-9 14-9 14 9 14 9-5.5 9-14 9-14-9-14-9z' fill='none' stroke='%23fff' stroke-width='2.4'/%3E%3Ccircle cx='22' cy='22' r='4.4' fill='%23fff'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
+<script>
+  // This page is served by the Python dashboard itself, so it IS the live backend.
+  // The hosted build loads hosted-bridge.js after this tag and overwrites the mode
+  // with its own probe/forced value, so declaring live here cannot break DEMO/web.
+  window.FC_MODE = window.FC_MODE || "live";
+</script>
 </head>
 <body>
 <div id="app">

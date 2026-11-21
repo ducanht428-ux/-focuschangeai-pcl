@@ -510,6 +510,9 @@ def _identity_evidence(v) -> str:
     if v.identity_conf == "manual":
         return ("Nhận diện: tự khai - người vận hành gán tên bằng phím, không có khuôn mặt nào "
                 "được so với danh sách lớp")
+    if getattr(v, "seat_hint", "") and not v.student_id:
+        return ("Nhận diện: chỗ này trước đó là em %s - bấm M để gắn lại tên cũ, "
+                "hoặc bấm tiếp để chọn em khác" % v.seat_hint)
     if not v.samples:
         return "Nhận diện: chưa có mẫu mặt nào để so với danh sách lớp"
     if not v.score:

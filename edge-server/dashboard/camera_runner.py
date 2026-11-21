@@ -16,6 +16,7 @@ exception vào luồng nền: màn hình Camera phải nói được vì sao ch�
 from __future__ import annotations
 
 import importlib.util
+import math
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -145,17 +146,54 @@ class CameraRunner:
             for _ in range(30):
                 cap.read()
             width = int((cfg.get("input") or {}).get("process_width", 640))
-            tick_ms = 1000.0 / max(1.0, float((cfg.get("detection") or {}).get("detect_fps", 8)))
-            last_tick = 0.0
-            last_step = 0.0
+            cap.set(cv2.CAP_PROP_FPS, 30)
+
+            latest_results: List = []
+            ai_frame = None
+            ai_lock = threading.Lock()
+            ai_event = threading.Event()
+            ai_proc = 0.0
+            acc: List[Dict] = []
+            bucket = 0
+
+            def ai_worker():
+                nonlocal latest_results, ai_proc, acc, bucket
+                while not self._stop.is_set():
+                    ai_event.wait(timeout=0.2)
+                    ai_event.clear()
+                    if self._stop.is_set():
+                        break
+                    with ai_lock:
+                        if ai_frame is None:
+                            continue
+                        f_copy = ai_frame.copy()
+                    t0 = time.monotonic() * 1000
+                    try:
+                        res = pipeline.step(f_copy)
+                        step_ms = time.monotonic() * 1000 - t0
+                        ai_proc = _ema(ai_proc, step_ms)
+                        latest_results = res
+                        if res:
+                            acc.append(self._means(res))
+                        now_bucket = int(time.time() * 1000) // 60000 * 60000
+                        if now_bucket != bucket:
+                            if bucket and acc and self._on_minute:
+                                self._on_minute(bucket, self._average(acc))
+                            bucket = now_bucket
+                            acc = []
+                    except Exception:
+                        pass
+
+            ai_thread = threading.Thread(target=ai_worker, daemon=True, name="camera-ai-worker")
+            ai_thread.start()
+
             fps = 0.0
-            proc = 0.0
+            last_t = 0.0
             frames = 0
             started = int(time.time() * 1000)
-            bucket = 0
-            acc: List[Dict] = []
             with self._lock:
                 self._info["started_ms"] = started
+
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok:
@@ -163,41 +201,49 @@ class CameraRunner:
                 h, w = frame.shape[:2]
                 if w > width:
                     frame = cv2.resize(frame, (width, max(1, int(h * width / float(w)))))
-                now = time.monotonic() * 1000
-                if now - last_tick < tick_ms:
-                    continue
-                last_tick = now
-                t0 = time.monotonic() * 1000
-                results = pipeline.step(frame)
-                step_ms = time.monotonic() * 1000 - t0
-                if last_step:
-                    dt = t0 - last_step
+
+                t_now = time.monotonic() * 1000
+                if last_t:
+                    dt = t_now - last_t
                     if 0.0 < dt < 5000.0:
                         fps = _ema(fps, 1000.0 / dt)
-                last_step = t0
-                proc = _ema(proc, step_ms)
+                last_t = t_now
                 frames += 1
-                view = self._draw(frame, pipeline, results)
+
+                with ai_lock:
+                    ai_frame = frame
+                ai_event.set()
+
+                view = self._draw(frame, pipeline, latest_results)
                 ok2, buf = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                people = self._people(pipeline)
+                people = self._people(pipeline, ai_proc, fps)
                 activity = getattr(pipeline.last_activity, "label", "") or ""
+                top_hud = []
+                try:
+                    from focusedge.hud import hud_lines
+                    primary_r = latest_results[0] if latest_results else None
+                    raw_hud = hud_lines(primary_r, len(people), ai_proc, fps, activity=pipeline.last_activity)
+                    top_hud = [{"text": l.text, "size": l.size, "colour": list(l.colour), "bold": l.bold} for l in raw_hud]
+                except Exception:
+                    pass
+
+                recent_alerts = list(getattr(pipeline, "_alerts", []))[-10:]
                 with self._lock:
                     self._jpeg = buf.tobytes() if ok2 else None
-                    self._info = {"people": people, "fps": fps, "processing_ms": proc,
-                                  "activity": activity, "started_ms": started, "frames": frames}
-                # Trung bình lớp mỗi phút một lần -> bảng class_trend, để biểu đồ 30 phút
-                # còn dữ liệu sau khi mở lại app. Chỉ số, không phải ảnh.
-                if results:
-                    acc.append(self._means(results))
-                now_bucket = int(time.time() * 1000) // 60000 * 60000
-                if now_bucket != bucket:
-                    if bucket and acc and self._on_minute:
-                        self._on_minute(bucket, self._average(acc))
-                    bucket = now_bucket
-                    acc = []
+                    self._info = {"people": people, "fps": fps, "processing_ms": ai_proc,
+                                  "activity": activity, "started_ms": started, "frames": frames,
+                                  "hud_lines": top_hud, "recent_alerts": recent_alerts}
+
+            ai_event.set()
+            ai_thread.join(timeout=1.0)
         except Exception as e:  # ranh giới với camera và lõi đo: lỗi phải hiện lên màn hình
             self.error = "%s: %s" % (type(e).__name__, e)
         finally:
+            if bucket and acc and self._on_minute:
+                try:
+                    self._on_minute(bucket, self._average(acc))
+                except Exception:
+                    pass
             self._pipeline = None
             if pipeline is not None:
                 try:
@@ -232,6 +278,20 @@ class CameraRunner:
             if self.options.get("overlay") and rt_result is not None and rt_result.sei is not None:
                 cv2.putText(view, "SEI %d" % rt_result.sei, (x0, min(view.shape[0] - 6, y1 + 16)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 2)
+                # Trạng thái theo ngữ cảnh GV: ASCII (cv2.putText không vẽ được dấu tiếng Việt).
+                ctx = pipeline.context_view(person.track_id) or {}
+                st = ctx.get("state", "NEUTRAL")
+                if st == "ON_TASK":
+                    cv2.putText(view, "ON-TASK", (x0, min(view.shape[0] - 6, y1 + 34)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
+                elif st == "WATCH":
+                    cv2.putText(view, "WATCH %ds" % int(ctx.get("off_s", 0)),
+                                (x0, min(view.shape[0] - 6, y1 + 34)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 220), 2)
+                elif st == "OFF_TASK":
+                    cv2.putText(view, "OFF-TASK %ds" % int(ctx.get("off_s", 0)),
+                                (x0, min(view.shape[0] - 6, y1 + 34)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         for tid, region in boxes.face_regions:
             if region is None:
                 # _face_region trả None khi cửa sổ mặt bị mép khung hình ăn quá nhiều;
@@ -241,28 +301,76 @@ class CameraRunner:
             cv2.rectangle(view, (x0, y0), (x1, y1), (0, 220, 220), 1)
         return view
 
-    def _people(self, pipeline) -> List[Dict]:
+    def _people(self, pipeline, processing_ms: float = 0.0, fps: float = 0.0) -> List[Dict]:
         from focusedge.constants import HabitFeature
+        from focusedge.hud import hud_lines
+        from focusedge.person_pipeline import HudState
         out = []
-        for v in pipeline.people():
+        people_views = list(pipeline.people())
+        face_count = len(people_views)
+        for v in people_views:
             r = pipeline.person_result(v.track_id)
             feats = r.features if r is not None else {}
+            if r is not None:
+                if r.hud is None:
+                    r.hud = HudState()
+                ear_val = feats.get(HabitFeature.EAR)
+                if ear_val is not None and (r.hud.ear1 is None or math.isnan(r.hud.ear1)):
+                    r.hud.ear1 = float(ear_val)
+                    r.hud.ear2 = float(ear_val)
+                mar_val = feats.get(HabitFeature.MAR)
+                if mar_val is not None and (r.hud.mar is None or math.isnan(r.hud.mar)):
+                    r.hud.mar = float(mar_val)
+                    if r.hud.bfr is None or math.isnan(r.hud.bfr):
+                        r.hud.bfr = 0.0
+                if r.pitch is not None and r.hud.pitch is None:
+                    r.hud.pitch = r.pitch
+                if r.yaw is not None and r.hud.yaw is None:
+                    r.hud.yaw = r.yaw
+                if r.distance_cm is not None and r.hud.distance_cm is None:
+                    r.hud.distance_cm = r.distance_cm
+                if r.sei is not None and r.hud.sei is None:
+                    r.hud.sei = r.sei
+                if r.perclos is not None and r.hud.perclos is None:
+                    r.hud.perclos = r.perclos
+                if r.quality is not None and r.hud.quality is None:
+                    r.hud.quality = r.quality
+
+            p_hud = []
+            try:
+                raw = hud_lines(r, face_count, processing_ms, fps, activity=pipeline.last_activity)
+                p_hud = [{"text": l.text, "size": l.size, "colour": list(l.colour), "bold": l.bold} for l in raw]
+            except Exception:
+                pass
+
             out.append({
                 "track_id": v.track_id,
                 "student_id": v.student_id,
                 "name": v.student_name or (v.student_id or "guest-%d" % v.track_id),
                 "identity_conf": v.identity_conf,
+                "seat_hint": v.seat_hint,
+                "attention_label": v.attention_label,
+                "attention_reason": v.attention_reason,
                 "measurable": bool(v.measurable),
                 "sei": r.sei if r is not None else None,
-                "situation": r.situation.name if r is not None else "UNKNOWN",
+                "situation": getattr(r.situation, "name", str(r.situation)) if (r is not None and r.situation is not None) else "UNKNOWN",
                 "perclos": round(r.perclos, 1) if r is not None and r.perclos is not None else None,
                 "distance_cm": round(r.distance_cm, 1) if r is not None and r.distance_cm is not None else None,
                 "alert": r.alert if r is not None else None,
-                "ear": round(feats.get(HabitFeature.EAR), 3) if feats.get(HabitFeature.EAR) is not None else None,
-                "mar": round(feats.get(HabitFeature.MAR), 3) if feats.get(HabitFeature.MAR) is not None else None,
+                "ear": (round(feats[HabitFeature.EAR], 3)
+                        if feats.get(HabitFeature.EAR) is not None
+                        and math.isfinite(feats[HabitFeature.EAR]) else None),
+                "mar": (round(feats[HabitFeature.MAR], 3)
+                        if feats.get(HabitFeature.MAR) is not None
+                        and math.isfinite(feats[HabitFeature.MAR]) else None),
                 "pitch": round(r.pitch, 1) if r is not None and r.pitch is not None else None,
                 "yaw": round(r.yaw, 1) if r is not None and r.yaw is not None else None,
                 "quality": r.quality if r is not None else None,
+                # Lớp khuyến nghị sư phạm (tài liệu 1+2+3): đánh giá theo ngữ cảnh khẩu
+                # lệnh GV + theo dõi dấu hiệu giật lặp lại. None khi track không tồn tại.
+                "context": pipeline.context_view(v.track_id),
+                "tic": pipeline.tic_view(v.track_id),
+                "hud_lines": p_hud,
             })
         return out
 
@@ -282,7 +390,9 @@ class CameraRunner:
             angle = r.pitch if r.pitch is not None else r.yaw
             if angle is not None:
                 vals["angle"].append(abs(float(angle)))
-        return {k: (sum(v) / len(v) if v else None) for k, v in vals.items()}
+        means = {k: (sum(v) / len(v) if v else None) for k, v in vals.items()}
+        means["n"] = len(results)
+        return means
 
     @staticmethod
     def _average(rows: List[Dict]) -> Dict:
@@ -290,5 +400,9 @@ class CameraRunner:
         for key in ("sei", "ear", "mar", "angle"):
             vals = [r[key] for r in rows if r.get(key) is not None]
             out[key] = sum(vals) / len(vals) if vals else None
-        out["n"] = len(rows)
+        # n_students is the average number of measured heads per frame in this minute.
+        # Counting the accumulated rows instead would store the frame sample count under a
+        # column the chart labels as children, which is a different quantity entirely.
+        ns = [r["n"] for r in rows if r.get("n") is not None]
+        out["n"] = int(round(sum(ns) / len(ns))) if ns else 0
         return out

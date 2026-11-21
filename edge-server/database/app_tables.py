@@ -116,7 +116,8 @@ TIERS = ("standard", "pro", "promax", "ultra")
 # API đều hỏi hàm tier_allows chứ không tự rẽ nhánh theo bậc ở nhiều nơi.
 TIER_GATES = {
     "csv_export": "pro",
-    "auto_backup": "pro",
+    # auto_backup is deliberately NOT gated: losing real student data to a broken
+    # machine must not depend on a paid tier, so basic scheduled backup is standard.
     "personal_baseline": "pro",
     "multi_class": "promax",
     "parent_report": "promax",

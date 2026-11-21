@@ -176,6 +176,18 @@ html[data-theme="dark"] #demo-banner.banner-real { color: #86efac; border-color:
 .stat-sub { color: var(--ink-soft); font-size: 12px; }
 .stat.warn .stat-num, .stat.warn .stat-label { color: var(--orange); }
 .stat.danger .stat-num, .stat.danger .stat-label { color: var(--red); }
+/* Thẻ thứ 5 "Đang mất tập trung": 5 cột khi rộng, tự xuống hàng khi hẹp (không phá màn Báo cáo 4 thẻ). */
+.grid-stats.five { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.stat-click { cursor: pointer; transition: box-shadow .15s, transform .15s; }
+.stat-click:hover, .stat-click:focus-visible { box-shadow: 0 4px 14px rgba(31, 111, 235, .18); transform: translateY(-1px); outline: none; }
+/* Danh sách em mất tập trung trong modal (bấm thẻ đếm ở Tổng quan). */
+.offtask-sec { font-weight: 700; margin: 10px 0 6px; }
+.offtask-row { border: 1px solid var(--line); border-left-width: 4px; border-radius: 10px; padding: 8px 10px; margin-bottom: 8px; }
+.offtask-row.bad { border-left-color: var(--red); background: var(--red-soft, rgba(239, 68, 68, .06)); }
+.offtask-row.warn { border-left-color: var(--orange); background: var(--orange-soft, rgba(245, 158, 11, .07)); }
+.offtask-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.offtask-kv { font-size: 12.5px; color: var(--ink-soft); margin-top: 3px; }
+.offtask-kv b { color: var(--ink); }
 
 /* ---------------- camera ---------------- */
 .cam-wrap { position: relative; background: #0b1524; border-radius: 10px; overflow: hidden; aspect-ratio: 16 / 9; }
@@ -254,9 +266,22 @@ html[data-theme="dark"] .status-ok { color: #4ade80; }
 .person-alert { margin-top: 6px; font-size: 12px; color: var(--red); font-weight: 600; }
 .person-bind { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .person-bind .small { font-size: 11px; }
+.voice-btns { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+#voice-card .lock-note { margin-top: 8px; }
+#voice-heard { margin-top: 6px; }
 .sit-chip { font-size: 11px; border-radius: 6px; padding: 2px 8px; background: var(--green-soft); color: #16a34a; font-weight: 600; }
 .sit-chip.bad { background: var(--red-soft); color: var(--red); }
 .sit-chip.warn { background: var(--orange-soft); color: #b45309; }
+
+/* Ngữ cảnh từng em + dấu hiệu Tic (lớp khuyến nghị - context_eval.py / tic_watch.py).
+   Huy hiệu Tic dùng cursor:help vì title chứa disclaimer "không phải chẩn đoán". */
+.ctx-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.ctx-reason { font-size: 12px; color: var(--ink-soft); }
+.tic-badge { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; font-weight: 600; border-radius: 8px; padding: 6px 8px; cursor: help; }
+.tic-badge svg { width: 14px; height: 14px; flex: none; }
+.tic-badge.lv1 { background: var(--orange-soft); color: #b45309; }
+.tic-badge.lv2 { background: var(--red-soft); color: var(--red); }
+.list-row.tint-orange { background: var(--orange-soft); }
 
 /* ---------------- form / modal / toast ---------------- */
 .field { margin-bottom: 12px; }
@@ -450,3 +475,41 @@ a.btn { text-decoration: none; }
   .chip-live, .chip-sound { padding: 6px 9px; }
   .live-veil p { font-size: 12px; }
 }
+
+/* Bảng chỉ số chi tiết (HUD) ở tab Camera */
+.hud-lines-box {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-family: inherit;
+  line-height: 1.45;
+  max-height: 480px;
+  overflow-y: auto;
+  box-shadow: var(--shadow);
+}
+.hud-line-row {
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 2px 0;
+  min-height: 1.25em;
+}
+.hud-line-spacer {
+  height: 8px;
+}
+.hud-chart-divider {
+  height: 2px;
+  background: linear-gradient(90deg, var(--blue), transparent);
+  margin: 6px 0;
+  border-radius: 1px;
+}
+.hud-target-bar {
+  margin-bottom: 8px;
+}
+.hud-target-chips {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+

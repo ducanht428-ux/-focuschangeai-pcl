@@ -115,7 +115,8 @@ class Detector:
 
     def __init__(self, model: str = "yolo11m.pt", conf: float = 0.35,
                  tracker: str = "bytetrack.yaml", person_class: int = COCO_PERSON,
-                 imgsz: int = 1280, device: Optional[str] = None) -> None:
+                 imgsz: int = 1280, device: Optional[str] = None,
+                 min_person_height_px: int = 80) -> None:
         from ultralytics import YOLO  # lazy
         self._model = YOLO(model)
         self._conf = conf
@@ -123,6 +124,11 @@ class Detector:
         self._person_class = person_class
         self._imgsz = imgsz
         self._device = device
+        # Minimum person-box height in pixels. Photo frames / posters on the wall produce
+        # small boxes (typically 60-100 px tall on a 480-px frame) while a real seated
+        # student fills at least 120-150 px. Filtering here stops those false tracks before
+        # they reach the face cropper, identity engine, and pipeline.
+        self._min_person_h = min_person_height_px
         # Face boxes are produced separately by the FaceLandmarker/BlazeFace; the
         # detector only yields bodies + context objects.
         #
@@ -173,7 +179,13 @@ class Detector:
         raw_objects = []
         for tid, box, c, cf in zip(ids, xyxy, cls, conf):
             if c == self._person_class:
-                raw_persons.append(PersonTrack(track_id=int(tid), bbox=tuple(box), conf=float(cf)))
+                pt = PersonTrack(track_id=int(tid), bbox=tuple(box), conf=float(cf))
+                # Drop tiny boxes that are almost certainly photo frames / posters on the wall,
+                # not real seated students. A person box shorter than min_person_h px cannot
+                # produce a usable face crop anyway (the eye span check inside the pipeline
+                # would reject it too, but catching it here stops it from being tracked at all).
+                if pt.height >= self._min_person_h:
+                    raw_persons.append(pt)
             elif c in self._context_ids:
                 raw_objects.append((self._context_ids[c], tuple(box), float(cf)))
 

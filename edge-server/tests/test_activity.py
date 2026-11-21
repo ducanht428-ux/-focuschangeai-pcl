@@ -492,6 +492,123 @@ def test_a_pipeline_that_measured_nothing_still_counts_the_boxes_it_saw():
     assert "chưa có mặt nào" in cp.last_activity.evidence, cp.last_activity.evidence
 
 
+# ---------------------------------------------------------------------------
+# Khẩu lệnh giáo viên (focusedge/teacher_voice.py) nối vào _update_activity.
+# Năm test này là hàng rào chống lại đúng cái hỏng đã đo được: teacher_voice từng khởi động ở LECTURE
+# với last_speech "Hệ thống sẵn sàng", và classroom.py coi đó là khẩu lệnh thật -> mọi phiên bị dán
+# nhãn "nghe giảng (giọng nói GV)" trong 3 phút đầu dù không có micro. Nhãn phải do luật viết tay đọc
+# từ hình ảnh, trừ khi CÓ một khẩu lệnh thật và khung đó CÓ mặt để đọc.
+# ---------------------------------------------------------------------------
+def _voice():
+    from focusedge.teacher_voice import TeacherContextAI, get_teacher_voice
+    tv = get_teacher_voice()
+    tv.set_context(TeacherContextAI.CONTEXT_UNKNOWN)
+    return tv
+
+
+def _one_head_pipeline():
+    cp = _bare_pipeline()
+    one = _mesh()
+    cp._update_activity([(one[0], one[1], {})], [PersonTrack(1, (0, 0, 300, 480), 0.8)], [],
+                        FRAME_W, FRAME_H, T0)
+    return cp
+
+
+def test_without_a_teacher_command_the_label_is_the_rules_own():
+    tv = _voice()
+    try:
+        cp = _one_head_pipeline()
+        assert cp.last_activity.context == ClassContext.INDIVIDUAL_STUDY, cp.last_activity
+        assert cp.last_activity.label == CLASS_CONTEXT_VI[ClassContext.INDIVIDUAL_STUDY]
+        assert "khẩu lệnh" not in cp.last_activity.label and "GV chọn" not in cp.last_activity.label
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
+def test_a_heard_command_switches_the_label_and_says_where_it_came_from():
+    tv = _voice()
+    try:
+        assert tv.feed_text("cả lớp bắt đầu thảo luận nhóm") == tv.CONTEXT_GROUP_WORK
+        cp = _one_head_pipeline()
+        assert cp.last_activity.context == ClassContext.GROUP_DISCUSSION, cp.last_activity
+        assert "khẩu lệnh GV" in cp.last_activity.label, cp.last_activity.label
+        assert "bắt đầu thảo luận" in cp.last_activity.evidence, cp.last_activity.evidence
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
+def test_a_clicked_context_is_not_reported_as_a_voice_command():
+    tv = _voice()
+    try:
+        tv.set_context(tv.CONTEXT_STUDY_NOTE, reason="dashboard_api")
+        cp = _one_head_pipeline()
+        assert cp.last_activity.context == ClassContext.READING, cp.last_activity
+        assert "GV chọn" in cp.last_activity.label, cp.last_activity.label
+        assert "khẩu lệnh" not in cp.last_activity.label
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
+def test_an_expired_command_hands_the_label_back_to_the_rules():
+    import time
+    tv = _voice()
+    try:
+        tv.feed_text("các em thảo luận nhóm đôi")
+        # Đẩy mốc đặt khẩu lệnh về quá khứ thay vì ngủ: cùng một đường hết hạn mà get_status() dùng.
+        tv.last_switch_time = time.time() - (tv.auto_reset_seconds + 5)
+        assert tv.get_status()["has_command"] is False
+        assert tv.get_status()["context"] == tv.CONTEXT_UNKNOWN
+        cp = _one_head_pipeline()
+        assert cp.last_activity.context == ClassContext.INDIVIDUAL_STUDY, cp.last_activity
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
+def test_a_command_does_not_invent_activity_when_no_face_was_measured():
+    tv = _voice()
+    try:
+        tv.feed_text("bắt đầu thảo luận")
+        cp = _bare_pipeline()
+        cp._update_activity([], [PersonTrack(i, (0, 0, 10, 10), 0.8) for i in (1, 2, 3)], [],
+                            FRAME_W, FRAME_H, T0)
+        assert cp.last_activity.raw is None
+        assert "chưa có mặt nào" in cp.last_activity.evidence, cp.last_activity.evidence
+        assert "khẩu lệnh" not in cp.last_activity.label
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
+def test_a_command_does_not_invent_activity_in_an_empty_room():
+    tv = _voice()
+    try:
+        tv.feed_text("bắt đầu thảo luận")
+        cp = _bare_pipeline()
+        cp._update_activity([], [], [], FRAME_W, FRAME_H, T0)
+        assert cp.last_activity.raw == ClassContext.UNKNOWN, cp.last_activity
+        assert cp.last_activity.label == CLASS_CONTEXT_VI[ClassContext.UNKNOWN]
+        assert "khẩu lệnh" not in cp.last_activity.label
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
+def test_a_command_still_labels_a_room_whose_heads_look_away():
+    tv = _voice()
+    try:
+        tv.feed_text("cả lớp chú ý nhìn lên bảng")
+        cp = _bare_pipeline()
+        # Một đầu quay hẳn 60°: không hướng ống kính, không cúi, không quay sang bạn nào -> luật
+        # viết tay bó tay (UNKNOWN). Đúng lúc nghe giảng cả lớp nhìn lên bảng, nên lời giáo viên
+        # là bằng chứng thật và được phép đặt nhãn, miễn trong khung CÓ người.
+        away = _mesh(yaw=60.0)
+        cp._update_activity([(away[0], away[1], {})], [PersonTrack(1, (0, 0, 300, 480), 0.8)], [],
+                            FRAME_W, FRAME_H, T0)
+        assert cp.last_activity.raw == ClassContext.UNKNOWN, cp.last_activity
+        assert cp.last_activity.context == ClassContext.PRESENTATION, cp.last_activity
+        assert "khẩu lệnh GV" in cp.last_activity.label
+    finally:
+        tv.set_context(tv.CONTEXT_UNKNOWN)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
@@ -504,6 +621,15 @@ def main():
             print("FAIL %s: %s" % (fn.__name__, exc))
     print("%d passed, %d failed" % (len(tests) - failed, failed))
     return 1 if failed else 0
+
+
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    for k, v in sorted(globals().items()):
+        if k.startswith("test_") and callable(v):
+            suite.addTest(unittest.FunctionTestCase(v))
+    return suite
 
 
 if __name__ == "__main__":

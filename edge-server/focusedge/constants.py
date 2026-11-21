@@ -203,7 +203,7 @@ BPM_RELIABLE_AFTER_MS = 15000
 LOW_VS_PERSONAL_MS = 45000
 LOW_VS_PERSONAL_K = 1.5
 PERSONAL_SEI_MIN_SPREAD = 8.0
-# The 20-20-20 reminder, MainActivity.kt:354-355: it shows for a 30 s window, not forever.
+# Nhắc nhở nghỉ giải lao / đổi tư thế: 20 phút 1 lần (cửa sổ thông báo 30s)
 BREAK_REMINDER_MS = 20 * 60 * 1000
 BREAK_REMINDER_SHOW_MS = 30000
 # MainActivity.kt:356. An empty frame only counts as a break after this long; a shorter gap leaves

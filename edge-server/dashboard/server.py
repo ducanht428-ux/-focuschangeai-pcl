@@ -1,7 +1,7 @@
 """Máy chủ cục bộ của dashboard FocusChangeAI - chỉ thư viện chuẩn Python + PyYAML.
 
 Vì sao là web cục bộ thay vì PySide6 (đặc tả mục 3 cho phép đổi nếu có lý do tốt hơn):
-  * không phải cài thêm bộ Qt nặng trên máy lớp yếu;双击 Chay-Dashboard.bat là chạy;
+  * không phải cài thêm bộ Qt nặng trên máy lớp yếu; nhấp đúp Chay-Dashboard.bat là chạy;
   * chính giao diện này sau này là màn hình xem cho điện thoại trong mạng lớp (đặc tả 6.2),
     nên một bản UI phục vụ cả hai thay vì viết hai lần;
   * bám sát mẫu đã duyệt (thẻ bo góc, tông xanh) dễ hơn và kiểm chứng bằng ảnh chụp thật được.
@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -194,9 +195,18 @@ def live_payload(cfg, runner) -> dict:
                 except Exception:
                     pass
     _, info = runner.snapshot()
+    hud_lines_out = info.get("hud_lines", [])
+    if not hud_lines_out:
+        try:
+            from focusedge.hud import hud_lines
+            raw = hud_lines(None, 0, 0.0, 0.0)
+            hud_lines_out = [{"text": l.text, "size": l.size, "colour": list(l.colour), "bold": l.bold} for l in raw]
+        except Exception:
+            hud_lines_out = []
     return {"board": board, "age_s": age, "presence": presence,
-            "camera": runner.status(), "people": info["people"],
-            "fps": round(info["fps"], 1), "activity": info["activity"]}
+            "camera": runner.status(), "people": info.get("people", []),
+            "fps": round(info.get("fps", 0), 1), "activity": info.get("activity", ""),
+            "hud_lines": hud_lines_out, "recent_alerts": info.get("recent_alerts", [])}
 
 
 def trend(conn, minutes: int = 30) -> list:
@@ -222,6 +232,7 @@ def system_status(cfg, runner) -> dict:
         # Giá trị camera đang nằm trong config.yaml, để màn Camera hiện đúng thứ sẽ chạy
         # lần bật tới thay vì đoán mò. Ghi thì qua POST /api/settings (body.camera).
         "camera_cfg": {
+            "source": (cfg.get("input") or {}).get("source", 0),
             "sensitivity": (cfg.get("person") or {}).get("sensitivity", 1),
             "max_active_faces": (cfg.get("scheduler") or {}).get("max_active_faces", 10),
             "process_width": (cfg.get("input") or {}).get("process_width", 640),
@@ -625,9 +636,9 @@ def backups_list() -> list:
     return out
 
 
-def do_backup(conn) -> dict:
+def do_backup(conn, prefix="focuschange") -> dict:
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    name = "focuschange_%s.db" % time.strftime("%Y%m%d_%H%M%S")
+    name = "%s_%s.db" % (prefix, time.strftime("%Y%m%d_%H%M%S"))
     dest_path = os.path.join(BACKUP_DIR, name)
     dest = sqlite3.connect(dest_path)
     try:
@@ -636,6 +647,37 @@ def do_backup(conn) -> dict:
         dest.close()
     app.audit(conn, "teacher", "backup", name)
     return {"ok": True, "file": name, "bytes": os.path.getsize(dest_path)}
+
+
+AUTO_BACKUP_INTERVAL_S = 86_400   # one scheduled backup per day
+
+
+def auto_backup_tick(conn) -> dict:
+    """One scheduler pass: backup when enabled and the newest auto_ file is >= 24h old.
+
+    Auto files carry the auto_ prefix so the retention prune below can delete them
+    without ever touching a manual backup the teacher made on purpose.
+    """
+    if app.get_setting(conn, "auto_backup", "0") != "1":
+        return {"ran": False, "reason": "off"}
+    newest = 0.0
+    if os.path.isdir(BACKUP_DIR):
+        for name in os.listdir(BACKUP_DIR):
+            if name.startswith("auto_") and name.endswith(".db"):
+                newest = max(newest, os.path.getmtime(os.path.join(BACKUP_DIR, name)))
+    if time.time() - newest < AUTO_BACKUP_INTERVAL_S:
+        return {"ran": False, "reason": "fresh"}
+    res = do_backup(conn, prefix="auto")
+    days = int(app.get_setting(conn, "retention_days", "180"))
+    cutoff = time.time() - days * 86_400
+    pruned = 0
+    for name in os.listdir(BACKUP_DIR):
+        if name.startswith("auto_") and name.endswith(".db"):
+            p = os.path.join(BACKUP_DIR, name)
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                pruned += 1
+    return {"ran": True, "file": res["file"], "pruned": pruned}
 
 
 def do_restore(conn, runner, name: str) -> dict:
@@ -758,6 +800,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("index.html")
         if path in ("/app.css", "/app.js"):
             return self._static(path[1:])
+        if path == "/download/FocusChangeAI-PC-app.zip":
+            candidates = [
+                r"D:\Downloads\FocusChangeAI-PC-app.zip",
+                r"C:\Users\Admin\Documents\Qoder\2026-10-21\FocusChangeAI-PC-app.zip"
+            ]
+            target = next((p for p in candidates if os.path.isfile(p)), None)
+            if not target:
+                return self._json({"error": "app file not found"}, 404)
+            size = os.path.getsize(target)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", 'attachment; filename="FocusChangeAI-PC-app.zip"')
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(target, "rb") as f:
+                while True:
+                    chunk = f.read(131072)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
         if not path.startswith("/api/"):
             return self._json({"error": "not found"}, 404)
         try:
@@ -794,6 +857,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(students_list(conn, cfg))
             if path == "/api/student":
                 return self._json(student_detail(conn, q.get("id", "")))
+            if path == "/api/student/tic-history":
+                # Đọc dọc nhiều phiên (notes JSON) - mốc 4 tuần DSM-5 của tài liệu Tic.
+                # Khuyến nghị theo dõi/đi khám, KHÔNG chẩn đoán; kèm trích dẫn y khoa.
+                from focusedge.tic_watch import tic_history
+                return self._json(tic_history(conn, q.get("id", "")))
             if path == "/api/analysis":
                 return self._json(analysis(conn, q.get("id", ""), q.get("scope", "buoi")))
             if path == "/api/alerts":
@@ -850,7 +918,7 @@ class Handler(BaseHTTPRequestHandler):
                 if jpeg:
                     self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                      + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
-                time.sleep(0.1)
+                time.sleep(0.033)
         except Exception:
             return   # trình duyệt đóng tab / dừng stream: kết thúc lặng lẽ
 
@@ -897,6 +965,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/restore":
                 return self._json(do_restore(conn, self.runner, body.get("file", "")))
             if path == "/api/camera/start":
+                cfg = load_cfg()
                 res = self.runner.start(cfg)
                 if res.get("ok"):
                     conn.execute("INSERT INTO cameras (camera_id, kind, label, status, last_seen_ms)"
@@ -941,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/teacher-voice/listen":
                 from focusedge.teacher_voice import get_teacher_voice
                 action = body.get("action", "start")
-                tv = get_teacher_voice()
+                tv = get_teacher_voice(cfg.get("teacher_voice"))
                 if action == "start":
                     tv.start()
                 elif action == "stop":
@@ -965,15 +1034,18 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError
                 except ValueError:
                     return {"ok": False, "error": "Số ngày lưu phải >= 1"}
-            if key == "auto_backup" and value == "1":
-                tier = app.get_setting(conn, "tier", "standard")
-                if not app.tier_allows(tier, "auto_backup"):
-                    return {"ok": False, "error": "Sao lưu tự động cần bậc Pro trở lên"}
             app.set_setting(conn, key, value)
             changed.append(key)
         # Vài cài đặt là của lõi camera: ghi thẳng vào config.yaml để lần chạy sau giữ nguyên.
         cam = body.get("camera") or {}
         if cam:
+            if "source" in cam:
+                src = cam["source"]
+                try:
+                    src = int(src)
+                except (ValueError, TypeError):
+                    pass
+                cfg.setdefault("input", {})["source"] = src
             if "sensitivity" in cam:
                 cfg.setdefault("person", {})["sensitivity"] = int(cam["sensitivity"])
             if "max_active_faces" in cam:
@@ -1041,6 +1113,22 @@ def main():
         return
     Handler.runner = camera_runner.CameraRunner(on_minute=on_minute)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+
+    def auto_backup_loop():
+        # Own connection per pass: sqlite3 connections are not shared across threads.
+        while True:
+            c = db()
+            try:
+                r = auto_backup_tick(c)
+                if r.get("ran"):
+                    print("auto backup: %s (pruned %d)" % (r["file"], r.get("pruned", 0)))
+            except Exception as e:
+                print("auto backup error: %s" % e)
+            finally:
+                c.close()
+            time.sleep(3600)
+
+    threading.Thread(target=auto_backup_loop, daemon=True).start()
     print("dashboard: %s  (db: %s)" % (url, resolve_db_path(load_cfg().get("storage", {}).get("db", ""))))
     print("retention: %d ngay, da don %d phien qua han" % (days, removed))
     print("nhan Ctrl-C de dung")

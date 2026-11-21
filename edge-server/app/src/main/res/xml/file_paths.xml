@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- The research CSVs live under getExternalFilesDir(null)/research, and fall back to
+         filesDir/research when external storage is unavailable. Both roots are declared so the
+         same file name resolves whichever root the logger actually picked. -->
+    <external-files-path
+        name="research_external"
+        path="research/" />
+    <files-path
+        name="research_internal"
+        path="research/" />
+    <!-- Zip exports are packed here, handed to the share sheet, then left for the system to clear. -->
+    <cache-path
+        name="export"
+        path="export/" />
+</paths>

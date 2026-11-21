@@ -190,12 +190,18 @@ class LocalStore:
                       ineligible_reason: Optional[str], alerts_total: int,
                       csv_rows: int, avg_fps: float, false_alerts: int = 0,
                       alerts: Sequence[Dict] = (),
-                      identity: Optional[str] = None) -> None:
+                      identity: Optional[str] = None,
+                      context_summary: Optional[Dict] = None,
+                      tic_summary: Optional[Dict] = None) -> None:
         """One measured session: its row, its per-feature statistics, its alerts.
 
         ``s.id`` IS the wall clock of the session start (``start_session(wall_ms)`` in
         person_pipeline, the phone's rule), so ``started_at_wall_ms`` is read from it rather than
         carried as a second copy of the same fact that could disagree.
+
+        ``context_summary`` / ``tic_summary`` là tổng kết lớp KHUYẾN NGHỊ sư phạm (tài liệu
+        1+2+3), không phải số liệu parity: chúng đi vào notes JSON dưới khoá riêng
+        (context_eval / tic_watch), không đụng alerts_total hay bất kỳ cột nào của điện thoại.
         """
         if self._conn is None:
             return
@@ -206,7 +212,8 @@ class LocalStore:
                 self._replace_session(student_id, s.id)
                 row = self._insert_session(
                     student_id, s, ended_at_wall_ms, device, ineligible_reason, alerts_total,
-                    false_alerts, csv_rows, avg_fps, band_outcomes, identity)
+                    false_alerts, csv_rows, avg_fps, band_outcomes, identity,
+                    context_summary, tic_summary)
                 self._insert_features(row, s)
                 self._insert_alerts(row, student_id, alerts)
                 self._conn.commit()
@@ -278,7 +285,9 @@ class LocalStore:
     def _insert_session(self, student_id: str, s: SessionSummary, ended_at_wall_ms: int,
                         device: str, ineligible_reason: Optional[str], alerts_total: int,
                         false_alerts: int, csv_rows: int, avg_fps: float,
-                        band_outcomes, identity: Optional[str] = None) -> int:
+                        band_outcomes, identity: Optional[str] = None,
+                        context_summary: Optional[Dict] = None,
+                        tic_summary: Optional[Dict] = None) -> int:
         meta: Dict = {
             "face_ratio": _round4(s.face_ratio),
             "valid_ratio": _round4(s.valid_ratio),
@@ -305,6 +314,13 @@ class LocalStore:
             meta["band_frames"] = s.band_samples
             meta["band_below"] = s.band_below
             meta["band_above"] = s.band_above
+        # Lớp khuyến nghị sư phạm (tài liệu 1+2+3) - khoá riêng trong notes, không phải
+        # cột parity. tic_watch kể cả level 0: ngày quan sát không mẫu hình là mẫu số
+        # của tỉ lệ "gần như mỗi ngày" khi tic_history() đọc dọc trên 4 tuần.
+        if context_summary is not None:
+            meta["context_eval"] = context_summary
+        if tic_summary is not None:
+            meta["tic_watch"] = tic_summary
         for b in band_outcomes or ():
             key = HabitFeature.KEYS[b.feature]
             meta["band_" + key] = {"min": _round2(b.min), "max": _round2(b.max),
@@ -349,17 +365,40 @@ class LocalStore:
                 "INSERT OR REPLACE INTO feature_records (session_row, feature, mean, std, n,"
                 " extractor) VALUES (?, ?, ?, ?, ?, ?)", rows)
 
+    def write_instant_alert(self, student_id: str, student_name: str, code: str,
+                            wall_ms: int) -> None:
+        """Ghi ngay cảnh báo vào SQLite ngay trong lúc quay (không chờ phiên kết thúc)."""
+        if not self._conn:
+            return
+        msg = alert_sentence(code, None, None) or code
+        try:
+            self._conn.execute(
+                "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms)"
+                " VALUES (0, ?, ?, ?, ?)",
+                (student_id, code, msg, int(wall_ms)))
+            self._conn.commit()
+        except Exception:
+            pass
+
     def _insert_alerts(self, session_row: int, student_id: str,
                        alerts: Sequence[Dict]) -> None:
         for a in alerts:
             code = str(a.get("code") or "")
             if not code:
                 continue
-            self._conn.execute(
-                "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (session_row, student_id, code,
-                 alert_sentence(code, None, None) or code, int(a.get("wall_ms") or 0)))
+            wall_ms = int(a.get("wall_ms") or 0)
+            try:
+                cur = self._conn.execute(
+                    "UPDATE alerts SET session_row = ? WHERE session_row = 0 AND student_id = ? AND raised_at_wall_ms = ?",
+                    (session_row, student_id, wall_ms))
+                if cur.rowcount == 0:
+                    self._conn.execute(
+                        "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (session_row, student_id, code,
+                         alert_sentence(code, None, None) or code, wall_ms))
+            except Exception:
+                pass
 
     # ==================================================================
     # learned bands
@@ -433,7 +472,8 @@ class LocalStore:
         })
 
     def write_class_live(self, class_id: str, students: Dict[str, Dict],
-                         alerts: List[Dict], updated_at_wall_ms: int) -> None:
+                         alerts: List[Dict], updated_at_wall_ms: int,
+                         advisories: Sequence[Dict] = ()) -> None:
         self._dump("class_live_%s.json" % class_id, {
             "class_id": class_id,
             "class_label": self.class_label,
@@ -441,6 +481,9 @@ class LocalStore:
             "updated_at_wall_ms": updated_at_wall_ms,
             "students": students,
             "alerts": alerts[-50:],  # keep the tail, not the whole history
+            # Khuyến nghị sư phạm (off-task theo ngữ cảnh / dấu hiệu Tic) - tách khỏi
+            # alerts của chuỗi parity điện thoại.
+            "advisories": list(advisories)[-50:],
         })
 
     def _dump(self, name: str, payload: Dict) -> None:

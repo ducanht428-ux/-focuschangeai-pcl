@@ -158,7 +158,129 @@
     var DISP = Object.assign({ boxes: true, overlay: false, brighten: false },
       ((D.live || {}).camera || {}).options || {});
     var FIX_AVG = JSON.parse(JSON.stringify(D.overview.averages || null));
-    var SIM = { running: false, started_ms: 0, frames: 0, people: [], lastAlert: {} };
+    var SIM = { running: false, started_ms: 0, frames: 0, people: [], lastAlert: {}, advisories: [],
+      voice: { context: "UNKNOWN", source: null, last_speech: "", listening: false, at: Date.now(), next: 0 } };
+
+    /* Khẩu lệnh giáo viên ở DEMO: mô phỏng trong trình duyệt, KHÔNG thu âm. Cùng hợp đồng JSON với
+       /api/teacher-voice của server Python để app.js chạy một đường code cho cả LIVE và DEMO.
+       Mặc định UNKNOWN - không có khẩu lệnh thì không có ngữ cảnh áp đặt, đúng như bản thật. */
+    var VOICE_PHRASES = [
+      ["cả lớp chú ý nhìn lên bảng", "LECTURE"],
+      ["các em ghi bài vào vở", "STUDY_NOTE"],
+      ["bắt đầu thảo luận nhóm đôi", "GROUP_WORK"],
+      ["các em tự làm bài nhé", "SEATWORK"],
+      ["ai trả lời câu hỏi này", "Q_AND_A"],
+      ["hết giờ thảo luận", "LECTURE"]
+    ];
+    var VOICE_VI = { UNKNOWN: "", LECTURE: "Nghe giảng", STUDY_NOTE: "Đọc hoặc viết", GROUP_WORK: "Thảo luận nhóm",
+      SEATWORK: "Làm bài tập", Q_AND_A: "Hỏi – đáp" };
+
+    /* Đánh giá ngữ cảnh từng em ở DEMO: bản gương gọn của focusedge/context_eval.py (cùng bảng
+       ngưỡng, cùng nguyên tắc KHÔNG khẩu lệnh / không đo được thì NEUTRAL). Chạy trên số liệu
+       mô phỏng của SIM, gắn nhãn DEMO khắp nơi - không phải số đo thật. */
+    var CTX_CRITERIA = {
+      LECTURE: { yaw: 25, pmin: -15, pmax: 20, win: 7000, vi: "nghe giảng", on: "Đang nghe giảng", off: "Không nhìn lên bảng" },
+      STUDY_NOTE: { yaw: 30, pmin: -42, pmax: -10, win: 15000, vi: "ghi bài", on: "Đang ghi/học bài", off: "Không chép bài / nhìn linh tinh" },
+      SEATWORK: { yaw: 30, pmin: -42, pmax: 15, win: 20000, vi: "làm bài tập", on: "Đang làm bài / suy nghĩ", off: "Không làm bài / nhìn linh tinh" },
+      Q_AND_A: { yaw: 25, pmin: -15, pmax: 20, win: 7000, vi: "hỏi – đáp", on: "Đang hướng về GV / bạn trả lời", off: "Cúi gằm tránh né / làm việc riêng" },
+      GROUP_WORK: { win: 10000, vi: "thảo luận nhóm" }
+    };
+    var CTX_STATE_VI = { NEUTRAL: "Chưa đánh giá theo ngữ cảnh", ON_TASK: "Đang tập trung theo ngữ cảnh",
+      WATCH: "Đang theo dõi (lệch nhẹ)", OFF_TASK: "Mất tập trung theo ngữ cảnh" };
+    var TIC_LABEL = { 1: "Dấu hiệu giật lặp lại - nên theo dõi (DEMO)",
+      2: "Dấu hiệu giật lặp lại dày đặc / kéo dài - nên trao đổi với phụ huynh (DEMO)" };
+    var TIC_DISCLAIMER = "Đây KHÔNG phải chẩn đoán y khoa. Camera chỉ ghi nhận mẫu hình cử động lặp lại; " +
+      "chẩn đoán rối loạn tíc thuộc về chuyên khoa Thần kinh / Tâm thần nhi. (DEMO: số liệu mô phỏng trong trình duyệt)";
+    var TIC_REFS = [
+      { title: "DSM-5: Tourette's disorder and other tic disorders (PMC3038221)", url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC3038221/" },
+      { title: "Bảng phân loại rối loạn tíc theo DSM-5 (PMC6690237)", url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC6690237/" },
+      { title: "Thang mức độ nghiêm trọng tíc toàn cầu Yale YGTSS (PMC10687404)", url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC10687404/" },
+      { title: "BV Nhi Trung ương: Hiểu đúng về rối loạn Tic", url: "https://benhviennhitrunguong.gov.vn/hieu-dung-cham-tot-hieu-dung-ve-roi-loan-tic-dau-hieu-nguyen-nhan-va-khi-nao-can-can-thiep.html" }
+    ];
+    var TIC_MILESTONES = [
+      { range: "Dưới 4 tuần", meaning: "Co giật cơ sinh lý tạm thời - thường do thiếu ngủ, mỏi mắt, căng thẳng; có thể tự hết khi nghỉ ngơi." },
+      { range: "Từ 4 tuần đến dưới 1 năm", meaning: "Khoảng theo dõi rối loạn tíc nhất thời - cần theo dõi sát tần suất và yếu tố kích phát." },
+      { range: "Trên 1 năm, gần như mỗi ngày", meaning: "Khoảng rối loạn tíc mạn tính / Hội chứng Tourette - chỉ chuyên khoa mới kết luận được." }
+    ];
+    function pushAdvisory(p, kind, fields) {
+      var a = { kind: kind, student_id: p.student_id, student_name: p.name, track_id: p.track_id, wall_ms: Date.now() };
+      Object.keys(fields || {}).forEach(function (k) { a[k] = fields[k]; });
+      SIM.advisories.push(a);
+      if (SIM.advisories.length > 50) SIM.advisories.shift();
+    }
+    function simContext(p, now) {
+      var ctx = SIM.voice.context, c = CTX_CRITERIA[ctx], st = p.ctx;
+      if (!c) { st.state = "NEUTRAL"; st.offStart = 0; st.reason = ""; st.ctx = ctx; return; }
+      if (ctx !== st.ctx) { st.offStart = 0; st.ctx = ctx; }  // đổi ngữ cảnh: reset đồng hồ liên tục
+      var on, reason;
+      if (p.pitch < -45) { on = false; reason = "Gục mặt / tư thế xấu"; }
+      else if (ctx === "GROUP_WORK") {
+        if (p.mar > 0.25) st.lastTalk = now;
+        var talk = now - st.lastTalk <= 15000;
+        var facing = (Math.abs(p.yaw) >= 20 && Math.abs(p.yaw) <= 75) || (p.pitch >= -40 && p.pitch <= -12);
+        on = facing && talk;
+        reason = on ? "Tích cực hoạt động nhóm" : (!facing ? "Tách nhóm / nhìn chỗ khác" : "Thụ động / không trao đổi");
+      } else {
+        on = Math.abs(p.yaw) <= c.yaw && p.pitch >= c.pmin && p.pitch <= c.pmax;
+        reason = on ? c.on : c.off;
+      }
+      st.reason = reason;
+      if (on) { st.state = "ON_TASK"; st.offStart = 0; return; }
+      if (!st.offStart) st.offStart = now;
+      st.total += 1000;  // simTick chạy mỗi 1 giây
+      if (now - st.offStart >= c.win) {
+        if (st.state !== "OFF_TASK") { st.episodes += 1; pushAdvisory(p, "CONTEXT_OFF_TASK", { context: ctx, reason: reason }); }
+        st.state = "OFF_TASK";
+      } else st.state = "WATCH";
+    }
+    function ctxView(p, now) {
+      var st = p.ctx, ctx = SIM.voice.context, c = CTX_CRITERIA[ctx];
+      var offS = st.offStart && (st.state === "WATCH" || st.state === "OFF_TASK") ? (now - st.offStart) / 1000 : 0;
+      var totalS = st.total / 1000;
+      return { context: c ? ctx : "UNKNOWN", context_vi: c ? c.vi : "", state: st.state,
+        state_vi: CTX_STATE_VI[st.state], reason: st.reason, evidence: [],
+        off_s: Math.round(offS * 10) / 10, off_total_s: Math.round(totalS * 10) / 10,
+        window_s: c ? c.win / 1000 : 0, severity: totalS >= 600 ? "nang" : totalS >= 180 ? "trung_binh" : "",
+        episodes: st.episodes, talk_recent: false, facing_group: false, group_close: false };
+    }
+    function ticView(p, now) {
+      return { level: p.tic_level, label: TIC_LABEL[p.tic_level] || "", eye_bursts: p.tic_level ? 5 : 0,
+        mouth_jerks: 0, eye_pattern: p.tic_level >= 1, mouth_pattern: false, mouth_is_weak_signal: true,
+        dense: false, observed_s: Math.round((now - SIM.started_ms) / 1000),
+        disclaimer: TIC_DISCLAIMER, references: p.tic_level >= 1 ? TIC_REFS : [] };
+    }
+    function demoTicHistory(sid) {
+      // Lịch sử DỌC mô phỏng: 12 ngày quan sát, 3 ngày có mẫu hình, chưa đủ mốc 4 tuần
+      // nên chưa khuyến nghị đi khám - đúng luật tic_history() của bản thật.
+      var days = [], pattern = { 2: 1, 6: 1, 10: 1 };
+      for (var i = 11; i >= 0; i--) {
+        var d = new Date(Date.now() - i * 86400000);
+        var ds = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+        days.push({ day: ds, level: pattern[i] || 0 });
+      }
+      return { student_id: sid, level: 1, label: TIC_LABEL[1], sessions_observed: 12,
+        days_observed: 12, days_with_pattern: 3, span_days: 12, recommend_exam: false,
+        note: "Đã ghi nhận mẫu hình giật lặp lại ở 3 ngày quan sát (DEMO). Tiếp tục theo dõi; nếu kéo dài trên 4 tuần hoặc dày lên khi căng thẳng/mệt mỏi, nên trao đổi với phụ huynh và cân nhắc đi khám.",
+        disclaimer: TIC_DISCLAIMER, references: TIC_REFS, milestones: TIC_MILESTONES, days: days, demo: true };
+    }
+    function voiceStatus() {
+      var v = SIM.voice, now = Date.now();
+      if (v.context !== "UNKNOWN" && now - v.at > 180000) {
+        v.context = "UNKNOWN"; v.source = null; v.last_speech = ""; v.at = now;
+      }
+      return { context: v.context, last_speech: v.last_speech,
+        elapsed_s: Math.round((now - v.at) / 100) / 10, is_running: v.listening,
+        has_command: v.context !== "UNKNOWN", source: v.source,
+        mic_available: true, sends_audio_offsite: true, auto_reset_seconds: 180, last_error: "",
+        privacy_note: "DEMO: micro mô phỏng, không thu âm thật.", demo: true };
+    }
+    function voiceSimTick() {
+      var v = SIM.voice, now = Date.now();
+      if (!v.listening || !SIM.running || now < v.next) return;
+      var p = VOICE_PHRASES[Math.floor(Math.random() * VOICE_PHRASES.length)];
+      v.context = p[1]; v.source = "speech"; v.last_speech = p[0] + " (DEMO)";
+      v.at = now; v.next = now + rnd(14000, 28000);
+    }
     function rnd(a, b) { return a + Math.random() * (b - a); }
     function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
     function mean(arr) { return arr.length ? arr.reduce(function (x, y) { return x + y; }, 0) / arr.length : null; }
@@ -178,6 +300,9 @@
           away_at: now + rnd(12000, 40000), away_until: 0,
           doze_at: now + rnd(25000, 80000), doze_until: 0,
           situation: "FORWARD", alert: "", identity_conf: "demo",
+          ctx: { state: "NEUTRAL", offStart: 0, total: 0, episodes: 0, lastTalk: 0, reason: "", ctx: "UNKNOWN" },
+          // Một em (track 2) được hẹn giờ nổ mẫu hình Tic mức 1 để DEMO cho thấy huy hiệu + khuyến nghị.
+          tic_at: i === 1 ? now + rnd(30000, 60000) : 0, tic_level: 0,
           shirt: ["#2f6fb2", "#b2542f", "#2f9e6e", "#7a4fbf"][i % 4],
           skin: ["#e8b98a", "#c98d5e", "#f0c9a0", "#a86e42"][i % 4] };
       });
@@ -202,7 +327,9 @@
         if (now > p.blink_at) { p.blink_until = now + 260; p.blink_at = now + rnd(2500, 6500); }
         if (now > p.yawn_at) { p.yawn_until = now + 1600; p.yawn_at = now + rnd(45000, 110000);
           pushAlert(p, "YAWN", 2, "Ngáp dài — có thể đang mệt."); }
-        if (now > p.away_at) { p.away_until = now + rnd(2500, 5000); p.away_at = now + rnd(25000, 70000);
+        // Cơn quay đầu 3–12s: phải có cơn DÀI HƠN cửa sổ 7s của LECTURE thì thẻ đếm
+        // "Đang mất tập trung" ở Tổng quan mới có ca OFF_TASK thật để trình diễn (bản DEMO).
+        if (now > p.away_at) { p.away_until = now + rnd(3000, 12000); p.away_at = now + rnd(25000, 70000);
           p.away_dir = Math.random() < 0.5 ? -1 : 1;
           pushAlert(p, "LOOK_AWAY", 2, "Đầu đang quay lệch khỏi màn hình."); }
         if (now > p.doze_at) { p.doze_until = now + rnd(3000, 6000); p.doze_at = now + rnd(60000, 140000);
@@ -211,7 +338,7 @@
           away = now < p.away_until, yawing = now < p.yawn_until;
         var earT = blinking || dozing ? 0.06 : 0.26 + 0.06 * Math.sin(now / 4000 + p.track_id);
         var marT = yawing ? 0.62 : 0.08 + 0.05 * Math.sin(now / 5000 + p.track_id * 2);
-        var yawT = away ? 24 * (p.away_dir || 1) : 7 * Math.sin(now / 6000 + p.track_id);
+        var yawT = away ? 34 * (p.away_dir || 1) : 7 * Math.sin(now / 6000 + p.track_id);
         var pitchT = dozing ? 18 : 6 * Math.sin(now / 7000 + p.track_id * 3);
         p.ear += (earT - p.ear) * 0.5; p.mar += (marT - p.mar) * 0.5;
         p.yaw += (yawT - p.yaw) * 0.4; p.pitch += (pitchT - p.pitch) * 0.4;
@@ -223,10 +350,15 @@
           (p.ear < 0.15 ? 22 : 0) - (p.mar > 0.5 ? 10 : 0) - p.perclos * 0.3 + rnd(-3, 3);
         p.sei += (clamp(seiT, 5, 98) - p.sei) * 0.35;
         if (!blinking && !dozing && !away && !yawing) p.alert = "";
+        simContext(p, now);
+        if (p.tic_at && now > p.tic_at) {
+          p.tic_at = 0; p.tic_level = 1;
+          pushAdvisory(p, "TIC_WATCH", { level: 1, label: TIC_LABEL[1] });
+        }
       });
       var n = SIM.people.length;
       var fps = (cfg.detect_fps || 8) + rnd(-0.4, 0.4);
-      D.live = { board: null, age_s: Math.round((now - SIM.started_ms) / 1000),
+      D.live = { board: { advisories: SIM.advisories.slice(-50) }, age_s: Math.round((now - SIM.started_ms) / 1000),
         presence: SIM.people.map(function (p) {
           return { student_id: p.student_id, name: p.name, sei: Math.round(p.sei), situation: p.situation, last_seen_ms: now }; }),
         camera: { running: true, error: "", people: n, fps: fps, processing_ms: rnd(85, 140),
@@ -234,8 +366,14 @@
         people: SIM.people.map(function (p) {
           return { track_id: p.track_id, student_id: p.student_id, name: p.name, ear: p.ear, mar: p.mar,
             yaw: p.yaw, pitch: p.pitch, sei: p.sei, perclos: p.perclos, distance_cm: p.distance_cm,
-            quality: p.quality, situation: p.situation, alert: p.alert, identity_conf: p.identity_conf }; }),
+            quality: p.quality, situation: p.situation, alert: p.alert, identity_conf: p.identity_conf,
+            context: ctxView(p, now), tic: ticView(p, now) }; }),
         fps: fps, activity: ["Học cá nhân", "Thảo luận nhóm", "Đọc hoặc viết", "Học cá nhân"][Math.floor(now / 20000) % 4] };
+      voiceSimTick();
+      // Có khẩu lệnh (DEMO) thì ngữ cảnh lớp nghe theo khẩu lệnh, giống classroom.py ở bản thật.
+      if (SIM.voice.context !== "UNKNOWN") {
+        D.live.activity = VOICE_VI[SIM.voice.context] + " (khẩu lệnh GV · DEMO)";
+      }
       D.overview.camera = { state: "on", note: "demo · " + n + " em trong khung (mô phỏng)" };
       D.overview.ai = { state: "active", note: "Engine mô phỏng chạy trong trình duyệt" };
       D.overview.averages = { ear: mean(SIM.people.map(function (p) { return p.ear; })),
@@ -251,7 +389,7 @@
       syncOverview();
     }
     function simStart() {
-      initPeople(); SIM.running = true; SIM.started_ms = Date.now(); SIM.frames = 0; SIM.lastAlert = {};
+      initPeople(); SIM.running = true; SIM.started_ms = Date.now(); SIM.frames = 0; SIM.lastAlert = {}; SIM.advisories = [];
       simTick(); audit("camera_start", "demo mo phong");
     }
     function simStop() {
@@ -435,6 +573,7 @@
           case "/api/alerts": return jsonRes(filterAlerts(q));
           case "/api/settings": return jsonRes(D.settings);
           case "/api/camera/options": return jsonRes(DISP);
+          case "/api/teacher-voice": return jsonRes(voiceStatus());
           case "/api/camera/snapshot": {
             // Same single-JPEG contract as the server endpoint, so the watchStream() fallback in
             // app.js also works when the page is running the in-browser simulation.
@@ -448,6 +587,7 @@
           }
           case "/api/students": return jsonRes(D.students);
           case "/api/student": return jsonRes(D.student[q.get("id")] || D.student_empty);
+          case "/api/student/tic-history": return jsonRes(demoTicHistory(q.get("id") || ""));
           case "/api/analysis": {
             var per = D.analysis[q.get("id")] || {};
             return jsonRes(per[q.get("scope")] || D.analysis_empty[q.get("scope")] || D.analysis_empty.buoi);
@@ -488,6 +628,27 @@
         case "/api/camera/stop":
           simStop();
           return jsonRes({ ok: true });
+        case "/api/teacher-voice/context": {
+          var want = (body || {}).context || "UNKNOWN";
+          if (["UNKNOWN", "LECTURE", "STUDY_NOTE", "GROUP_WORK", "SEATWORK", "Q_AND_A"].indexOf(want) < 0) {
+            return jsonRes({ ok: false, error: "DEMO: ngữ cảnh không hợp lệ" }, 400);
+          }
+          var vv = SIM.voice;
+          vv.context = want; vv.at = Date.now();
+          vv.source = want === "UNKNOWN" ? null : "manual";
+          // Không bịa câu nói khi bấm nút: last_speech chỉ chứa lời nghe được (mô phỏng), giống
+          // teacher_voice.py ở bản thật. Nguồn đã nằm ở trường source.
+          vv.last_speech = "";
+          audit("voice_context", want);
+          return jsonRes({ ok: true, status: voiceStatus() });
+        }
+        case "/api/teacher-voice/listen": {
+          var on = ((body || {}).action || "start") === "start";
+          SIM.voice.listening = on;
+          SIM.voice.next = Date.now() + 4000;
+          audit("voice_listen", on ? "start" : "stop");
+          return jsonRes({ ok: true, status: voiceStatus() });
+        }
         case "/api/camera/options":
           Object.assign(DISP, body || {});
           if (D.live && D.live.camera) D.live.camera.options = DISP;

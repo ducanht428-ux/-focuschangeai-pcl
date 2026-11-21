@@ -24,8 +24,16 @@ from .constants import (
     BREAK_DETECT_MS,
     DISTANCE_RECOVER_CM,
     DROWSY_CLOSURE_MS,
+    EYE_L_IN,
+    EYE_L_LOW,
+    EYE_L_OUT,
+    EYE_L_UP,
     EYE_MAX_PITCH_DEG,
     EYE_MAX_YAW_DEG,
+    EYE_R_IN,
+    EYE_R_LOW,
+    EYE_R_OUT,
+    EYE_R_UP,
     GAZE_H_DRIFT,
     GAZE_V_DRIFT,
     HabitFeature,
@@ -605,8 +613,24 @@ class PersonPipeline:
         if not self.calibrated:
             done = self._maybe_calibrate(yaw, pitch, gaze_v, gaze_h, bfr, raw_dist, lm, w, h, bs)
             if not done:
+                # Calibration still running, but we CAN compute instant EAR & MAR right now
+                # (they are pure geometry, no baseline needed). Show real numbers immediately.
+                mar = self._mar(lm, w, h)
+                ear = None  # stays None if _ear5 returns NaN or throws
+                try:
+                    e1 = self.eye._ear5(lm, EYE_R_UP, EYE_R_LOW, EYE_R_OUT, EYE_R_IN, w, h)
+                    e2 = self.eye._ear5(lm, EYE_L_UP, EYE_L_LOW, EYE_L_IN, EYE_L_OUT, w, h)
+                    avg = (e1 + e2) / 2.0
+                    if math.isfinite(avg):
+                        ear = avg
+                except Exception:
+                    pass
+                # MAR can also be 0.0 from _mar fallback - only suppress if truly bad
+                mar_safe = mar if (mar is not None and math.isfinite(mar)) else None
+                instant_feats = {HabitFeature.EAR: ear, HabitFeature.MAR: mar_safe}
                 return self._result(student_id, student_name, identity_conf, True,
-                                    Situation.UNKNOWN, None, None, calibrated=False)
+                                    Situation.UNKNOWN, None, None, calibrated=False,
+                                    yaw=yaw, pitch=pitch, features=instant_feats)
             self._monitoring_start_ms = now_ms
 
         if self._monitoring_start_ms == 0:
@@ -885,8 +909,27 @@ class PersonPipeline:
     def _observe_session(self, now_ms, eye, bpm, bpm_reliable, dist, yaw, pitch,
                          gaze_h, gaze_v, mar, bfr, perclos, sei_val,
                          quality: Optional[int] = None) -> Dict[int, float]:
-        hs = self.session
         feats: Dict[int, float] = {}
+        # Raw physical EAR (~0.20 - 0.40) from landmark geometry
+        ear_val = None
+        if hasattr(eye, "ear1") and hasattr(eye, "ear2"):
+            e1_ok = eye.ear1 is not None and math.isfinite(float(eye.ear1))
+            e2_ok = eye.ear2 is not None and math.isfinite(float(eye.ear2))
+            if e1_ok and e2_ok:
+                ear_val = (float(eye.ear1) + float(eye.ear2)) / 2.0
+            elif e1_ok:
+                ear_val = float(eye.ear1)
+            elif e2_ok:
+                ear_val = float(eye.ear2)
+        if ear_val is None and eye.openness is not None and math.isfinite(float(eye.openness)):
+            ear_val = float(eye.openness) * 0.3
+
+        if ear_val is not None:
+            feats[HabitFeature.EAR] = float(ear_val)
+        if mar is not None and math.isfinite(float(mar)):
+            feats[HabitFeature.MAR] = float(mar)
+
+        hs = self.session
         if hs is None:
             return feats
         habit_valid = eye.valid and not eye.closed and sei_val is not None
@@ -914,7 +957,9 @@ class PersonPipeline:
         hs.observe(HabitFeature.GAZE_V, gaze_v); feats[HabitFeature.GAZE_V] = gaze_v
         hs.observe(HabitFeature.MAR, mar); feats[HabitFeature.MAR] = mar
         hs.observe(HabitFeature.BFR, bfr); feats[HabitFeature.BFR] = bfr
-        hs.observe(HabitFeature.EAR, eye.openness); feats[HabitFeature.EAR] = eye.openness
+        hs.observe(HabitFeature.EAR, eye.openness)
+        if ear_val is not None:
+            feats[HabitFeature.EAR] = float(ear_val)
         hs.observe(HabitFeature.PERCLOS, perclos); feats[HabitFeature.PERCLOS] = perclos
         hs.observe(HabitFeature.SEI, float(sei_val)); feats[HabitFeature.SEI] = float(sei_val)
         # two-sided band verdicts
@@ -1077,13 +1122,15 @@ class PersonPipeline:
             self._work_start_ms = 0
 
     def _result(self, student_id, student_name, identity_conf, measurable, situation,
-                sei_val, perclos_val, calibrated=True) -> PersonResult:
+                sei_val, perclos_val, calibrated=True,
+                yaw=None, pitch=None, features=None) -> PersonResult:
         result = PersonResult(
             track_id=self.track_id, student_id=student_id, student_name=student_name,
             identity_conf=identity_conf, measurable=measurable, calibrated=calibrated,
             sei=sei_val, situation=situation, eye_valid=False, openness=1.0,
-            perclos=perclos_val, bpm=None, distance_cm=None, yaw=None, pitch=None,
-            alert=None, features={},
+            perclos=perclos_val, bpm=None, distance_cm=None,
+            yaw=yaw, pitch=pitch,
+            alert=None, features=features if features is not None else {},
         )
         # The phone's HUD has a line for every one of these three states (no face, still learning
         # this person, measuring), so the payload has to exist even when nothing is measured yet.
@@ -1106,3 +1153,12 @@ class PersonPipeline:
         cutoff = now_ms - self.BPM_WINDOW_MS
         while self._blink_ts and self._blink_ts[0] < cutoff:
             self._blink_ts.popleft()
+
+    def blinks_since(self, ts_ms: int) -> List[Tuple[int, int]]:
+        """Các nhịp chớp mắt (timestamp, duration_ms) MỚI HƠN ts_ms, chỉ đọc.
+
+        TicWatch (theo dõi dấu hiệu giật lặp lại - tài liệu Tic) đọc cùng một nguồn
+        với BPM của điện thoại thay vì tự đếm lại: một phép đo, hai người đọc.
+        Không thay đổi bất kỳ số liệu parity nào.
+        """
+        return [(t, d) for t, d in zip(self._blink_ts, self._blink_dur) if t > ts_ms]

@@ -11,6 +11,7 @@ and the heavy objects are only built when ``ClassroomPipeline`` is constructed.
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections import deque
@@ -21,10 +22,25 @@ from .activity import (
     CONTEXT_T, ClassContext, ClassContextEngine, ClassSnapshot, Signals, head_signals, room_objects,
 )
 from .constants import HabitFeature, Situation
+from .context_eval import ContextEvaluator
 from .habit import HabitProfile
 from .landmarks import focal_px
 from .person_pipeline import PersonPipeline, PersonResult
 from .quality import face_light, to_gray
+from .teacher_voice import TeacherContextAI, get_teacher_voice
+from .tic_watch import TicWatch
+
+# Khẩu lệnh giáo viên -> nhãn của activity.py. Chỉ dùng khi CÓ khẩu lệnh thật (xem _update_activity).
+# Nhãn giữ đúng chữ của CLASS_CONTEXT_VI rồi thêm nguồn trong ngoặc, để người đọc biết đây là lời
+# giáo viên chứ không phải luật viết tay đọc được từ hình ảnh. SEATWORK/Q_AND_A (tài liệu 3) dùng
+# nhãn riêng cho lời người đọc; enum vẫn là hạng mục thị giác gần nhất (READING/PRESENTATION).
+_VOICE_CONTEXT = {
+    TeacherContextAI.CONTEXT_GROUP_WORK: (ClassContext.GROUP_DISCUSSION, "thảo luận nhóm"),
+    TeacherContextAI.CONTEXT_STUDY_NOTE: (ClassContext.READING, "đọc hoặc viết / tự học"),
+    TeacherContextAI.CONTEXT_LECTURE: (ClassContext.PRESENTATION, "nghe giảng"),
+    TeacherContextAI.CONTEXT_SEATWORK: (ClassContext.READING, "làm bài tập / tự học"),
+    TeacherContextAI.CONTEXT_Q_AND_A: (ClassContext.PRESENTATION, "hỏi – đáp"),
+}
 
 # edge-server/, whichever folder the process was started from.
 _PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -92,6 +108,9 @@ class PersonView(NamedTuple):
     gate: float = 0.0                      # bind_hi as configured, so the line can name the bar
     margin_gate: float = 0.0               # min_margin as configured
     measurable: bool = False               # did this face produce numbers recently at all
+    seat_hint: str = ""                    # remembered seat occupant's name, "" when no suggestion
+    attention_label: str = ""              # teacher-context verdict, "" before any measured frame
+    attention_reason: str = ""
 
 
 @dataclass
@@ -120,19 +139,35 @@ class TrackRuntime:
     alert_count: int = 0
     alerts: List[Dict] = field(default_factory=list)
     measured_frames: int = 0
+    # Per-track attention verdict against the teacher's spoken context (teacher_voice.py).
+    # Display only: it never opens an alert or changes a stored number.
+    attention_eval: object = None
+    attention_label: str = ""
+    attention_reason: str = ""
     # Wall clock of the moment this session started. The phone derives it from its session id,
     # which IS the start timestamp; here the id is a per-student counter, so the start time is
     # remembered separately rather than recomputed from the measured time.
     session_started_wall_ms: int = 0
+    # Lớp khuyến nghị sư phạm chạy SONG SONG với chuỗi parity (không đụng SEI/alerts_total):
+    # đánh giá tập trung theo khẩu lệnh GV (context_eval.py, tài liệu 2+3) và theo dõi dấu
+    # hiệu giật lặp lại kiểu Tic (tic_watch.py, tài liệu 1). Mỗi track một bộ, sống theo phiên.
+    context_eval: ContextEvaluator = field(default_factory=ContextEvaluator)
+    tic: TicWatch = field(default_factory=TicWatch)
 
 
 class ClassroomPipeline:
     # head region of the person box fed to FaceLandmarker (faces live near the top)
-    FACE_TOP_FRACTION = 0.55
+    FACE_TOP_FRACTION = 0.65
     # Fraction of that region allowed to fall outside the frame before the face is skipped.
-    # Tuned for a tripod camera at the front of a room, where a body touching the edge means the
-    # head is cut too; a phone held by the student is always framed whole, so it has no equivalent.
-    CLIP_MAX_FRACTION = 0.25
+    # 0.25 was tuned for a tripod 5m away; for a laptop webcam 50-80cm away the face fills
+    # the frame much more and often touches the top/side edges. 0.50 lets those frames through.
+    CLIP_MAX_FRACTION = 0.50
+    # Seat memory: a manually named head that leaves the frame remembers its seat (normalized
+    # face-center) for this long, and a new guest head appearing within this radius is OFFERED
+    # that name on the first m press. Offered, never auto-bound: two children swapping seats
+    # must not silently swap their data.
+    SEAT_RADIUS = 0.10
+    SEAT_TTL_MS = 600_000
 
     def __init__(self, cfg: dict, detector, embedder, roster, analyzer, scheduler,
                  writer, profiles: Optional[Dict[str, HabitProfile]] = None,
@@ -165,6 +200,8 @@ class ClassroomPipeline:
         self._min_span = float(sched.get("min_eye_span_px", 12))
         self._reverify_ms = int(ident.get("reverify_ms", 30000))
         self._identity_enabled = embedder is not None
+        # Teacher's rule: 10 minutes of looking elsewhere before a head counts as off-task.
+        self._off_task_s = float(cfg.get("teacher_voice", {}).get("off_task_seconds", 600))
 
         # Layer 5 used to be two copies of every number - the cloud writer and a 5-table mirror
         # beside it. There is one copy now: the writer IS the database, so a disk that refuses the
@@ -177,7 +214,12 @@ class ClassroomPipeline:
         self._resolver = None
 
         self._tracks: Dict[int, TrackRuntime] = {}
+        self._seat_memory: Dict[str, Dict] = {}
+        self._last_wh = (0, 0)
         self._alerts: Deque[Dict] = deque(maxlen=200)
+        # Khuyến nghị (off-task theo ngữ cảnh, dấu hiệu Tic) - tách khỏi _alerts của parity:
+        # không đếm vào alerts_total, không ghi vào bảng alerts, đi vào notes JSON + class_live.
+        self._advisories: Deque[Dict] = deque(maxlen=200)
         # Preview-only: the last frame's raw layer-1 output. Overwritten every step().
         self.last_boxes = DetectionView()
 
@@ -193,6 +235,17 @@ class ClassroomPipeline:
         self._last_heartbeat_ms = 0
         self._last_step_ms = 0
         self._frame_dt_ms = 33.0
+
+        # YOLO stride: 1 = detect on every step (the old behavior). N > 1 reuses the previous
+        # YOLO boxes on the intermediate steps and only runs FaceLandmarker there, so blink
+        # sampling can run faster than one ~145 ms detection pass per frame allows. The boxes
+        # are at most N-1 frames stale; the alert windows downstream are seconds long.
+        self._yolo_every = max(1, int(det.get("yolo_every", 1)))
+        self._step_count = 0
+        self._cached_persons = []
+        self._cached_objects = []
+        self._cached_wh = (0, 0)
+        self.last_yolo_ran = True
 
     # ------------------------------------------------------------------
     # construction helper kept here so main.py stays thin
@@ -223,6 +276,7 @@ class ClassroomPipeline:
             person_class=int(det_cfg.get("person_class", 0)),
             imgsz=int(det_cfg.get("imgsz") or cfg.get("input", {}).get("process_width", 1280)),
             device=det_cfg.get("device"),
+            min_person_height_px=int(det_cfg.get("min_person_height_px", 100)),
         )
         # Identity is optional: without insightface/roster templates the pipeline
         # still measures bodies, it just keeps everyone as a guest.
@@ -307,7 +361,21 @@ class ClassroomPipeline:
         self._last_step_ms = now_ms
 
         h, w = frame_bgr.shape[:2]
-        persons, scene_objects = self._detector.run(frame_bgr)
+        self._last_wh = (w, h)
+        self._step_count += 1
+        # An empty cache means an empty room: keep detecting every frame so a child who
+        # walks in is found at once, and a resolution change invalidates pixel boxes.
+        run_yolo = (self._yolo_every <= 1
+                    or self._step_count % self._yolo_every == 1
+                    or not self._cached_persons
+                    or self._cached_wh != (w, h))
+        if run_yolo:
+            persons, scene_objects = self._detector.run(frame_bgr)
+            self._cached_persons, self._cached_objects = persons, scene_objects
+            self._cached_wh = (w, h)
+        else:
+            persons, scene_objects = self._cached_persons, self._cached_objects
+        self.last_yolo_ran = run_yolo
         self.last_boxes = DetectionView(persons=tuple(persons), objects=tuple(scene_objects),
                                         frame_size=(w, h))
 
@@ -389,10 +457,69 @@ class ClassroomPipeline:
             res.landmarks = lm
             res.calibration_progress = rt.pipeline.calibration_progress
             rt.last_result = res
+            self._evaluate_attention(rt, res, wall_ms)
             results.append(res)
             measured.append((res.landmarks, res.face_bbox, rt.nearby))
             if res.alert:
                 self._register_alert(rt, res.alert, wall_ms)
+            elif rt.attention_label and rt.attention_label.startswith("MAT TAP TRUNG"):
+                self._register_alert(rt, "LOOK_AWAY", wall_ms)
+
+        # -- Lớp khuyến nghị sư phạm: đánh giá từng em THEO NGỮ CẢNH khẩu lệnh GV -----
+        # (context_eval.py - tài liệu 2+3) và theo dõi dấu hiệu giật lặp lại kiểu Tic
+        # (tic_watch.py - tài liệu 1). Chạy sau khi đo, đọc lại chính số liệu khung này;
+        # không sửa SEI, không đụng chuỗi cảnh báo parity. Không có khẩu lệnh hoặc mặt
+        # không đo được -> NEUTRAL, đồng hồ dừng (hai nguyên tắc của teacher_voice).
+        tv_ctx = get_teacher_voice().get_status().get("context", "UNKNOWN")
+        centers = {}
+        for res in results:
+            if res.measurable and res.face_bbox:
+                x0, y0, x1, y1 = res.face_bbox
+                centers[res.track_id] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        measured_ids = set()
+        for res in results:
+            rt = self._tracks.get(res.track_id)
+            if rt is None:
+                continue
+            measured_ids.add(res.track_id)
+            meas = res.measurable and res.yaw is not None and res.pitch is not None
+            nearest = None
+            c = centers.get(res.track_id)
+            if c is not None and len(centers) > 1:
+                # Khoảng cách PIXEL tới mặt gần nhất: tiêu chí 3 chỉ so TỈ LỆ xích lại
+                # gần baseline nên px hay cm không đổi kết luận (cùng một camera, cùng
+                # tiêu cự khung hình). Tín hiệu MỀM, không phải cổng cứng.
+                nearest = min(math.hypot(c[0] - o[0], c[1] - o[1])
+                              for tid, o in centers.items() if tid != res.track_id)
+            # Mắt chỉ kết luận mở/nhắm khi EyeEngine đọc được; góc đầu quá nghiêng cho
+            # eye gate thì None = không biết, KHÔNG được coi là nhắm mắt (context_eval).
+            eyes_open = (res.openness >= 0.5) if res.eye_valid else None
+            mar = res.hud.mar if res.hud is not None else None
+            yawn = bool(res.hud.yawn_confirmed) if res.hud is not None else False
+            eps_before = len(rt.context_eval.episodes)
+            rt.context_eval.update(now_ms, tv_ctx, meas, res.yaw, res.pitch, mar,
+                                   eyes_open=eyes_open, nearest_cm=nearest)
+            if len(rt.context_eval.episodes) > eps_before:
+                ep = rt.context_eval.episodes[-1]
+                self._register_advisory(rt, "CONTEXT_OFF_TASK", wall_ms,
+                                        context=ep["context"], reason=ep["reason"])
+            rt.tic.update(now_ms, rt.pipeline.blinks_since(rt.tic.last_blink_seen_ms),
+                          mar, yawn, tv_ctx, res.measurable)
+            if rt.tic.level_rose:
+                self._register_advisory(rt, "TIC_WATCH", wall_ms, level=rt.tic.level,
+                                        reason=rt.tic.view()["label"])
+        # Track không được đo nhịp này: chỉ dừng đồng hồ khi mặt THỰC SỰ không đo được
+        # hoặc đã lâu không đo. Scheduler bỏ qua một nhịp (đông mặt) không phải là mất
+        # mặt - reset nhầm sẽ khiến đồng hồ 7 giây không bao giờ đầy trong lớp đông.
+        for rt in self._tracks.values():
+            if rt.track_id in measured_ids:
+                continue
+            r = rt.last_result
+            absent = (r is None or not r.measurable
+                      or now_ms - rt.last_measured_ms > 2000)
+            if absent:
+                rt.context_eval.update(now_ms, tv_ctx, False, None, None, None)
+                rt.tic.update(now_ms, [], None, False, tv_ctx, False)
 
         # -- what the room as a whole is doing -----------------------------
         self._update_activity(measured, persons, scene_objects, w, h, now_ms)
@@ -446,30 +573,37 @@ class ClassroomPipeline:
             room=room_objects(persons, scene_objects),
         ), now_ms)
 
-        # Khẩu lệnh giọng nói của Giáo viên (nếu có) đóng vai trò công tắc ngữ cảnh
+        # Teacher voice commands act as a context switch, but the label may only claim speech
+        # when a real utterance (or an explicit manual pick) produced the switch. At boot and
+        # after the silence timeout the vision-based label stays in charge.
         try:
             from .teacher_voice import get_teacher_voice, TeacherContextAI
-            tv = get_teacher_voice()
+            tv = get_teacher_voice(self._cfg.get("teacher_voice"))
             tv_status = tv.get_status()
             tv_ctx = tv_status["context"]
-            if tv_ctx == TeacherContextAI.CONTEXT_GROUP_WORK:
-                snap = snap._replace(
-                    context=int(ClassContext.GROUP_DISCUSSION),
-                    label="thảo luận nhóm (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
-            elif tv_ctx == TeacherContextAI.CONTEXT_STUDY_NOTE:
-                snap = snap._replace(
-                    context=int(ClassContext.READING),
-                    label="đọc hoặc viết / tự học (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
-            elif tv_ctx == TeacherContextAI.CONTEXT_LECTURE and tv_status.get("elapsed_s", 999) < 180:
-                snap = snap._replace(
-                    context=int(ClassContext.PRESENTATION),
-                    label="nghe giảng (giọng nói GV)",
-                    evidence="GV khẩu lệnh: %s" % tv_status["last_speech"]
-                )
+            src = tv_status.get("context_source", "init")
+            if src in ("voice", "manual"):
+                tag = "giọng nói GV" if src == "voice" else "GV chọn tay"
+                evidence = ("GV khẩu lệnh: %s" % tv_status["last_utterance"]) if src == "voice" \
+                    else ("GV chọn: %s" % tv_status["last_speech"])
+                if tv_ctx == TeacherContextAI.CONTEXT_GROUP_WORK:
+                    snap = snap._replace(
+                        context=int(ClassContext.GROUP_DISCUSSION),
+                        label="thảo luận nhóm (%s)" % tag,
+                        evidence=evidence
+                    )
+                elif tv_ctx == TeacherContextAI.CONTEXT_STUDY_NOTE:
+                    snap = snap._replace(
+                        context=int(ClassContext.READING),
+                        label="đọc hoặc viết / tự học (%s)" % tag,
+                        evidence=evidence
+                    )
+                elif tv_ctx == TeacherContextAI.CONTEXT_LECTURE:
+                    snap = snap._replace(
+                        context=int(ClassContext.PRESENTATION),
+                        label="nghe giảng (%s)" % tag,
+                        evidence=evidence
+                    )
         except Exception:
             pass
 
@@ -519,6 +653,34 @@ class ClassroomPipeline:
     # ------------------------------------------------------------------
     # naming a head by hand, for the runs where recognition cannot answer at all
     # ------------------------------------------------------------------
+    def seat_suggestion(self, track_id: int, now_ms: Optional[int] = None) -> Optional[str]:
+        """Whose remembered seat this guest head is sitting in, or None.
+
+        A suggestion for the operator, never a binding: the m key (or the dashboard button)
+        still has to be pressed. Seats are normalized face centers, so the hint survives a
+        resolution change; the radius is a tenth of the frame, tighter than one desk apart.
+        """
+        rt = self._tracks.get(track_id)
+        if rt is None or rt.manual_student_id is not None:
+            return None
+        if rt.last_result is None or rt.last_result.face_bbox is None:
+            return None
+        w, h = self._last_wh
+        if not w or not h:
+            return None
+        now_ms = _wall_ms() if now_ms is None else now_ms
+        x0, y0, x1, y1 = rt.last_result.face_bbox
+        cx, cy = (x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h
+        taken = set(t.manual_student_id for tid, t in self._tracks.items() if tid != track_id)
+        best = None
+        for sid, m in self._seat_memory.items():
+            if sid in taken or now_ms - m["at_ms"] > self.SEAT_TTL_MS:
+                continue
+            d = math.hypot(cx - m["cx"], cy - m["cy"])
+            if d <= self.SEAT_RADIUS and (best is None or d < best[0]):
+                best = (d, sid)
+        return best[1] if best else None
+
     def bind_manual_next(self, track_id: int) -> Optional[str]:
         """The m key: give the chosen head a name the operator is stating, not a match.
 
@@ -540,7 +702,13 @@ class ClassroomPipeline:
         if current is None:
             taken = set(t.manual_student_id for tid, t in self._tracks.items() if tid != track_id)
             free = [s for s in ids if s not in taken]
-            nxt = free[0] if free else self._add_manual_slot(len(ids) + 1)
+            # A head in a remembered seat takes that student first: one press re-binds the
+            # child who left and came back, instead of walking the roster from slot one.
+            sug = self.seat_suggestion(track_id)
+            if sug is not None and sug in free:
+                nxt = sug
+            else:
+                nxt = free[0] if free else self._add_manual_slot(len(ids) + 1)
         elif current in ids:
             i = ids.index(current)
             nxt = ids[i + 1] if i + 1 < len(ids) else None
@@ -633,20 +801,90 @@ class ClassroomPipeline:
             return True
         return False
 
+    def _evaluate_attention(self, rt: TrackRuntime, res, wall_ms: int) -> None:
+        """Judge this head against the teacher's spoken context, for display only.
+
+        The context counts only when a real utterance or a manual pick produced it - the same
+        honesty rule as the room label. Before anyone speaks, a child reading a book must not
+        be told they are "not looking at the board": with no command there is no expectation,
+        so the evaluator's neutral branch runs instead.
+        """
+        if not res.measurable or res.yaw is None or res.pitch is None:
+            return
+        from .teacher_voice import StudentAttentionEvaluator, get_teacher_voice
+        if rt.attention_eval is None:
+            rt.attention_eval = StudentAttentionEvaluator(violation_threshold_s=self._off_task_s)
+        st = get_teacher_voice(self._cfg.get("teacher_voice")).get_status()
+        ctx = st["context"] if st.get("context_source") in ("voice", "manual") else ""
+        mar = float(res.features.get(HabitFeature.MAR, 0.0) or 0.0)
+        label, reason, _ = rt.attention_eval.evaluate(
+            float(res.yaw), float(res.pitch), mar, False, ctx, now=wall_ms / 1000.0)
+        rt.attention_label, rt.attention_reason = label, reason
+
     def _register_alert(self, rt: TrackRuntime, code: str, wall_ms: int) -> None:
+        # Cảnh báo tối đa 5 phút 1 lần (300 giây) để chống spam chuông/thông báo tuyệt đối
+        cooldown_ms = int((self._cfg.get("alerts") or {}).get("cooldown_seconds", 0)) * 1000
+        if cooldown_ms > 0:
+            room_last_alert = getattr(self, "_room_last_alert_ms", 0)
+            if wall_ms - room_last_alert < cooldown_ms:
+                return
+
+            last_alert_time = getattr(rt, "_last_alert_wall_ms", 0)
+            if wall_ms - last_alert_time < cooldown_ms:
+                return
+
+            self._room_last_alert_ms = wall_ms
+            rt._last_alert_wall_ms = wall_ms
+
         rt.alert_count += 1
         rt.alerts.append({"code": code, "wall_ms": wall_ms})
-        self._alerts.append({
+        alert_item = {
             "student_id": rt.student_id or ("guest-%d" % rt.track_id),
             "student_name": rt.student_name,
             "track_id": rt.track_id,
             "code": code,
             "wall_ms": wall_ms,
+        }
+        self._alerts.append(alert_item)
+        # Ghi ngay tức thì vào SQLite database bảng alerts để giao diện nhận được cảnh báo ngay trong lúc quay
+        if hasattr(self._writer, "write_instant_alert"):
+            try:
+                self._writer.write_instant_alert(
+                    student_id=alert_item["student_id"],
+                    student_name=rt.student_name or alert_item["student_id"],
+                    code=code,
+                    wall_ms=wall_ms,
+                )
+            except Exception:
+                pass
+
+    def _register_advisory(self, rt: TrackRuntime, kind: str, wall_ms: int, **fields) -> None:
+        """Một sự kiện KHUYẾN NGHỊ (off-task theo ngữ cảnh, mức dấu hiệu Tic tăng).
+
+        Không phải cảnh báo parity: không đếm vào alert_count, không ghi bảng alerts.
+        Đi vào luồng advisories của class_live JSON và (qua session_summary) notes JSON.
+        """
+        self._advisories.append({
+            "kind": kind,
+            "student_id": rt.student_id or ("guest-%d" % rt.track_id),
+            "student_name": rt.student_name,
+            "track_id": rt.track_id,
+            "wall_ms": wall_ms,
+            **fields,
         })
 
     # ------------------------------------------------------------------
     def _retire(self, rt: TrackRuntime, wall_ms: int) -> None:
         """Track died: close its session and (for bound students) commit + upload."""
+        if (rt.student_id and rt.identity_conf == "manual"
+                and rt.last_result is not None and rt.last_result.face_bbox is not None
+                and self._last_wh != (0, 0)):
+            w, h = self._last_wh
+            x0, y0, x1, y1 = rt.last_result.face_bbox
+            self._seat_memory[rt.student_id] = {
+                "cx": (x0 + x1) / 2.0 / w, "cy": (y0 + y1) / 2.0 / h,
+                "name": rt.student_name, "at_ms": wall_ms,
+            }
         s = rt.pipeline.commit_session()
         if s is None or rt.student_id is None:
             return
@@ -675,6 +913,11 @@ class ClassroomPipeline:
             # the row's notes because the two are not the same kind of measurement and a table has to
             # be able to say which names were recognised and which somebody stated.
             identity=rt.identity_conf,
+            # Tổng kết lớp khuyến nghị (không phải parity): off-task theo ngữ cảnh của phiên
+            # và mẫu hình dấu hiệu Tic. tic_summary luôn có khi đã quan sát được mặt - ngày
+            # level 0 là mẫu số của tỉ lệ "gần như mỗi ngày" khi đọc dọc 4 tuần (tic_history).
+            context_summary=rt.context_eval.session_summary(),
+            tic_summary=rt.tic.session_summary(),
         )
         if self._habit_learn:
             self._writer.write_band(rt.student_id, rt.student_name, profile, wall_ms, str(self._device))
@@ -702,8 +945,12 @@ class ClassroomPipeline:
                     entry["alert"] = r.alert
                 if r.quality is not None:
                     entry["quality"] = r.quality
+            # Lớp khuyến nghị sư phạm (tài liệu 1+2+3) đi cùng thẻ người trong class_live.
+            entry["context"] = rt.context_eval.view()
+            entry["tic"] = rt.tic.view()
             students[key] = entry
-        self._writer.write_class_live(self.class_id, students, list(self._alerts), wall_ms)
+        self._writer.write_class_live(self.class_id, students, list(self._alerts), wall_ms,
+                                      advisories=list(self._advisories))
 
     def _write_heartbeats(self, wall_ms: int) -> None:
         for rt in self._tracks.values():
@@ -788,6 +1035,8 @@ class ClassroomPipeline:
         margin_gate = float(getattr(self._resolver, "min_margin", 0.0) or 0.0)
         for rt in sorted(self._tracks.values(), key=lambda r: r.track_id):
             st = rt.identity
+            hint_id = self.seat_suggestion(rt.track_id) if rt.student_id is None else None
+            hint = self._seat_memory[hint_id]["name"] if hint_id else ""
             rows.append(PersonView(
                 track_id=rt.track_id, student_id=rt.student_id, student_name=rt.student_name,
                 identity_conf=rt.identity_conf,
@@ -796,7 +1045,10 @@ class ClassroomPipeline:
                 samples=int(getattr(st, "samples", 0) or 0),
                 runner_up=str(getattr(st, "runner_up", "") or ""),
                 gate=gate, margin_gate=margin_gate,
-                measurable=bool(rt.last_result is not None and rt.last_result.measurable)))
+                measurable=bool(rt.last_result is not None and rt.last_result.measurable),
+                seat_hint=hint,
+                attention_label=rt.attention_label,
+                attention_reason=rt.attention_reason))
         return rows
 
     def person_result(self, track_id: Optional[int]):
@@ -831,3 +1083,16 @@ class ClassroomPipeline:
     @property
     def recent_alerts(self) -> List[Dict]:
         return list(self._alerts)
+
+    # --- lớp khuyến nghị sư phạm cho dashboard (camera_runner._people đọc các view này) ---
+    def context_view(self, track_id: int) -> Optional[Dict]:
+        rt = self._tracks.get(track_id)
+        return rt.context_eval.view() if rt is not None else None
+
+    def tic_view(self, track_id: int) -> Optional[Dict]:
+        rt = self._tracks.get(track_id)
+        return rt.tic.view() if rt is not None else None
+
+    @property
+    def advisories(self) -> List[Dict]:
+        return list(self._advisories)

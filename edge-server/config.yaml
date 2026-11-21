@@ -12,17 +12,24 @@ class_label: "Lớp học"
 # --- Assets loaded from disk (paths are relative to the folder you run main.py from) ---
 # FaceLandmarker asset: the SAME file the APK ships (app/src/main/assets, sha256 64184e22...), so a
 # landmark means the same 478-point thing on both devices. No download needed - it is in git.
-face_landmarker_task: "../app/src/main/assets/face_landmarker.task"
+# Spelled as the copy tracked at the ROOT of this repo, not "../app/src/main/assets/...": that parent
+# folder only exists inside the full FocusChangeAIApp tree, so on a standalone clone of this leg the
+# old spelling resolved to nothing and MediaPipe failed deep inside its own loader. The root copy is
+# in git (git ls-files face_landmarker.task), so every clone has it and tests/test_assets.py can prove
+# the run starts from any working folder.
+face_landmarker_task: "face_landmarker.task"
 # ArcFace templates written by tools/enroll_roster.py. A missing or empty roster is not an error,
 # it just means nobody is bound automatically: every track stays a guest and no session row is
 # written for it until somebody names it (see the M key below, or enroll templates for ArcFace).
 roster: "roster.json"
-# Model weights are NOT in git; ultralytics downloads them on first use (yolo11n.pt = 5.6 MB,
-# yolo11m.pt = 40 MB, both measured here), and the insightface buffalo_l pack is about 280 MB.
-# The first run on a new machine therefore needs internet. insightface is deliberately absent on the
-# laptop used for this project: its onnxruntime backend crashes that process outright (measured again
-# here: import onnxruntime -> SIGSEGV, exit 139, three runs out of three, onnxruntime 1.31.1), and
-# identity is optional (see classroom.py "identity off").
+# Model weights ARE in git (yolo11n.pt = 5.6 MB, yolo11m.pt = 40 MB, both measured here);
+# the insightface buffalo_l pack (~280 MB) is not, and ultralytics would download a missing
+# checkpoint on first use.
+# Only the optional insightface pack needs internet on a new machine. insightface is deliberately absent on the
+# laptop used for this project: it has no cp312 Windows wheel and the source build needs MSVC, which this
+# box does not have. onnxruntime itself is fixed at 1.20.1 (requirements.txt): 1.31.1 segfaulted on import
+# here (exit 139, three runs out of three), 1.20.1 imports and runs inference. Identity is optional
+# (see classroom.py "identity off").
 # A guest can still be named without any of that: in the preview, 1-9 picks a head and M declares
 # which student it is. That is enough for _retire to store the session, and the row carries
 # identity "manual" in its notes, so a table of declared names never reads as a table of matches.
@@ -37,7 +44,7 @@ input:
   # open at all, so "0" is no longer a guess. If the picture is ever the wrong lens, re-enable the
   # built-in camera rather than swapping numbers: with two cameras present the index order is
   # decided by enumeration and is not predictable.
-  source: 0
+  source: 1
   # What to ASK the capture device for. main.py sets these with cap.set() and then prints what the
   # driver actually gave, because the two differ. Re-read from the C270 after the built-in was
   # disabled: 640x480 @ 30 fps delivered, and the driver stays in YUY2 (the MJPG request does not
@@ -52,25 +59,28 @@ input:
   # times the compute for pixels the lens never captured.
   process_width: 640
   # Cap the analysis frame rate (detection runs at most this many times per second).
-  # Measured ceiling on this box, not a wish: yolo11n at imgsz 640 takes 145 ms per call on the
-  # i5-5200U (2 cores, no GPU) = 6.9 steps/s, and at imgsz 480 it takes 100 ms = 10 steps/s.
-  # 8 sits between the two so a slower frame does not stall the loop.
-  detect_fps: 8
+  detect_fps: 20
+  # How often pipeline.step() runs (eye measurement cadence). With detection.yolo_every = 3
+  # only every third step pays a YOLO pass; the steps between measure eyes on the cached
+  # boxes, which is what lets a 100-400 ms blink land inside a measured frame more often.
+  measure_fps: 30
 
 # --- Layer 1: detection + tracking (YOLO + ByteTrack) ---
 detection:
-  # yolo11n (5.6 MB) instead of yolo11m (40 MB): measured on the same 30 webcam frames, m costs
-  # 852 ms per detection = 1.2 steps/s on this CPU, which is why a 300-frame run needed over ten
-  # minutes. n costs 145 ms. m is still the right answer on a machine with a real GPU.
   model: "yolo11n.pt"
-  # Inference size, decoupled from input.process_width (see the note there). 0 = follow
-  # process_width, which is what this key used to do implicitly.
-  imgsz: 640
+  # Inference size: 480x480 yields 2x faster inference on CPU while keeping accurate detections.
+  imgsz: 480
   person_class: 0            # COCO class id for "person"
-  conf: 0.35                 # minimum detection confidence
+  conf: 0.45                 # raised from 0.35 → helps reject low-conf detections (photo frames)
   tracker: "bytetrack.yaml"  # built into ultralytics
+  # Run YOLO on every 3rd step to maximize FPS and smooth video feed.
+  yolo_every: 3
   # A track whose last sighting is older than this is dropped (its PersonPipeline parks).
   track_ttl_ms: 15000
+  # Minimum person-box height in pixels. Photo frames / posters on the wall produce small boxes
+  # (60-100 px) while a real seated student fills at least 120 px on a 480-px frame.
+  # Raise this if phantom faces from posters/pictures are still detected.
+  min_person_height_px: 120
 
 # --- Layer 2: identity (ArcFace + roster) ---
 identity:
@@ -106,12 +116,34 @@ scheduler:
   # Suspicious (low SEI / dozing) faces get measured this many times more often.
   hot_multiplier: 3
 
+# --- Cấu hình cảnh báo định kỳ (5 phút 1 lần) ---
+alerts:
+  cooldown_seconds: 300       # Giãn cách giữa 2 lần cảnh báo cùng loại (5 phút)
+  break_reminder_minutes: 5    # Nhắc giải lao / đổi tư thế định kỳ 5 phút
+
 # --- Layer 4: per-person measurement ---
 person:
   # Sensitivity level 0..3 applied to every pipeline (see MuscleSensitivity).
   sensitivity: 1
   # Session is committed to the habit profile only when it clears HabitConfig bars.
   habit_learn: true
+
+# --- Teacher voice commands (OFFLINE, focusedge/teacher_voice.py) ---
+# Speech is decoded on this machine by Vosk with a Vietnamese model; no audio is uploaded
+# anywhere. The old recognize_google path was a cloud API, not a downloadable library, and is gone.
+# The model is NOT in git (32 MB zip, Apache 2.0). Fetch it once:
+#   https://alphacephei.com/vosk/models/vosk-model-small-vn-0.4.zip
+# and unzip into models/ so models/vosk-model-small-vn-0.4/ exists. Without it the listen
+# button reports "manual" and the context can still be picked by hand in the dashboard.
+# Measured on the project laptop (i5-5200U): model load 0.95 s, decode real-time factor ~1.18,
+# so a command lands a few seconds after it is spoken and speech during decode is missed.
+teacher_voice:
+  model_path: "models/vosk-model-small-vn-0.4"
+  # Silence this long after a command returns the context to LECTURE (vision label in charge).
+  auto_reset_seconds: 180
+  # The teacher's rule: a head looking elsewhere for 10 minutes counts as off-task. The verdict
+  # is display only (person card "Chu y"), never an alert and never a stored number.
+  off_task_seconds: 600
 
 # --- Layer 5: local storage (SQLite + out/) ---
 # Nothing leaves this machine any more. Measured sessions, their per-feature statistics, the

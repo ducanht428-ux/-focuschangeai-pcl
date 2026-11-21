@@ -1,0 +1,35 @@
+name: edge-server tests
+
+on:
+  push:
+    paths:
+      - "edge-server/**"
+      - ".github/workflows/edge-tests.yml"
+  pull_request:
+    paths:
+      - "edge-server/**"
+      - ".github/workflows/edge-tests.yml"
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PortAudio headers (PyAudio builds from source on Linux)
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
+      - name: Install CPU torch first (keeps CI off the multi-GB CUDA wheels)
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r edge-server/requirements.txt
+
+      - name: Run every suite through the single runner
+        working-directory: edge-server
+        run: python tests/run_all.py

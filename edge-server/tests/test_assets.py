@@ -4,11 +4,15 @@ Run from the edge-server folder:
 
     python tests/test_assets.py
 
-Why these exist: config.yaml spells the eye model as "../app/src/main/assets/face_landmarker.task"
-and the roster as "roster.json", both relative to this folder. The double-click launcher cds here, but
-"python edge-server/main.py" from the repo root does not, and the same config then points at files that
-are not there - MediaPipe fails deep inside its own loader with a path nobody typed. Each case below is
-one of those layouts.
+Why these exist: config.yaml spells the eye model and the roster ("roster.json") relative to this
+folder. The double-click launcher cds here, but "python edge-server/main.py" from the repo root does
+not, and the same config then points at files that are not there - MediaPipe fails deep inside its own
+loader with a path nobody typed. Each case below is one of those layouts.
+
+The eye-model spelling is READ FROM config.yaml, not hardcoded here. It used to be hardcoded as
+"../app/src/main/assets/face_landmarker.task", which only exists inside the full FocusChangeAIApp
+tree; on a standalone clone of this leg the test failed for a path the config no longer used. The
+config now names the copy tracked at the repo root, and this test checks whatever the config says.
 """
 import os
 import shutil
@@ -20,7 +24,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from focusedge.classroom import resolve_asset  # noqa: E402
 
 EDGE_SERVER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EYE_MODEL_CONFIG_VALUE = "../app/src/main/assets/face_landmarker.task"
+
+
+def _configured_eye_model() -> str:
+    """The face_landmarker_task value from config.yaml, without importing PyYAML.
+
+    These tests run on a machine with no third-party packages installed (house style: lazy imports),
+    so one key is read by scanning lines instead of parsing the whole document. Comments and quotes
+    are stripped the same way yaml would for a plain scalar.
+    """
+    path = os.path.join(EDGE_SERVER, "config.yaml")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("face_landmarker_task:"):
+                value = line.split(":", 1)[1].split("#", 1)[0].strip()
+                return value.strip("\"'")
+    raise AssertionError("config.yaml has no face_landmarker_task key")
+
+
+EYE_MODEL_CONFIG_VALUE = _configured_eye_model()
 
 
 def test_the_configured_eye_model_is_found_even_from_another_folder():
@@ -118,6 +140,15 @@ def main() -> int:
             print("FAIL %s: %s" % (fn.__name__, exc))
     print("%d passed, %d failed" % (len(tests) - failed, failed))
     return 1 if failed else 0
+
+
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    for k, v in sorted(globals().items()):
+        if k.startswith("test_") and callable(v):
+            suite.addTest(unittest.FunctionTestCase(v))
+    return suite
 
 
 if __name__ == "__main__":
