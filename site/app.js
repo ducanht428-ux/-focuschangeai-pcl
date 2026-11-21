@@ -416,6 +416,12 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeLanPop(); closeNav(); } });
 // Thẻ người vẽ lại mỗi nhịp nên uỷ quyền click ở document: nút Gắn tên / Đổi tên / Bỏ tên.
 document.addEventListener("click", (e) => {
+  const ht = e.target.closest && e.target.closest("[data-hud-track]");
+  if (ht) {
+    S.focusTrack = parseInt(ht.getAttribute("data-hud-track"), 10);
+    updateCameraParts();
+    return;
+  }
   const b = e.target.closest && e.target.closest("[data-bind]");
   if (b) { bindPerson(parseInt(b.getAttribute("data-bind"), 10)); return; }
   const u = e.target.closest && e.target.closest("[data-unbind]");
@@ -1570,7 +1576,11 @@ function renderCamera() {
     cameraButtons("cam") +
     '<div class="avg-note" id="cam-status-note"></div>' +
     '<div class="people-grid" id="cam-people"></div></div>' +
-    '<div><div class="card"><h3>' + ico("settings") + 'Cài đặt camera</h3>' +
+    '<div>' +
+    '<div class="card" id="cam-hud-card"><h3>' + ico("activity") + 'Bảng chỉ số chi tiết</h3>' +
+    '<div class="hud-target-bar" id="cam-hud-target"></div>' +
+    '<div class="hud-lines-box" id="cam-hud-lines"></div></div>' +
+    '<div class="card mt"><h3>' + ico("settings") + 'Cài đặt camera</h3>' +
     '<div class="field"><label>Nguồn camera</label>' + sel("cam-source", [[0, "Cam máy tính (Built-in, index 0)"], [1, "Webcam rời USB (Logitech C270, index 1)"], [2, "Camera phụ (index 2)"]], cc.source != null ? cc.source : 1) + "</div>" +
     '<div class="field"><label>Độ phân giải xử lý</label>' + sel("cam-width", [[640, "640×480"], [480, "480×360"], [320, "320×240"]], cc.process_width) + "</div>" +
     '<div class="field"><label>Số mặt đo cùng lúc</label>' + sel("cam-faces", [[1, "1"], [2, "2"], [3, "3"], [4, "4"], [10, "10 (tối đa)"]], cc.max_active_faces) + "</div>" +
@@ -1851,6 +1861,7 @@ function updateCameraParts() {
         ? "Đang chạy · " + cam.frames + " khung đã xử lý · " + num(cam.processing_ms, 0) + " ms/khung · " + cam.people + " người trong khung."
         : (cam.error ? "Lỗi: " + cam.error : "Camera chưa bật.");
   }
+  if ($("cam-hud-lines")) updateHudPanel();
   if (!$("cam-people")) return;
   const people = (S.live && S.live.people) || [];
   if (S.hidePeople) { $("cam-people").innerHTML = ""; return; }
@@ -1893,6 +1904,59 @@ function updateCameraParts() {
       contextRows(p) + ticBadge(p) +
       bindRow +
       "</div>";
+  }).join("");
+}
+
+function updateHudPanel() {
+  const el = $("cam-hud-lines");
+  if (!el) return;
+  const people = (S.live && S.live.people) || [];
+  let targetPerson = null;
+  if (S.focusTrack != null) {
+    targetPerson = people.find((p) => p.track_id === S.focusTrack);
+  }
+  if (!targetPerson && people.length > 0) {
+    targetPerson = people[0];
+  }
+
+  const targetBar = $("cam-hud-target");
+  if (targetBar) {
+    if (people.length > 1) {
+      targetBar.innerHTML = '<div class="hud-target-chips"><span class="muted small">Đang xem:</span>' +
+        people.map((p) => {
+          const active = (targetPerson && targetPerson.track_id === p.track_id);
+          return '<button class="btn btn-sm' + (active ? ' btn-primary' : '') + '" data-hud-track="' + p.track_id + '">' +
+            esc(p.name || ('guest-' + p.track_id)) + '</button>';
+        }).join(" ") + '</div>';
+      targetBar.hidden = false;
+    } else if (targetPerson) {
+      targetBar.innerHTML = '<span class="muted small">Đang đo: <b>' + esc(targetPerson.name) + '</b></span>';
+      targetBar.hidden = false;
+    } else {
+      targetBar.hidden = true;
+    }
+  }
+
+  let lines = (targetPerson && targetPerson.hud_lines && targetPerson.hud_lines.length)
+    ? targetPerson.hud_lines
+    : ((S.live && S.live.hud_lines && S.live.hud_lines.length) ? S.live.hud_lines : null);
+
+  if (!lines || !lines.length) {
+    el.innerHTML = '<div class="muted small" style="padding:12px;">Đang tải chỉ số chi tiết...</div>';
+    return;
+  }
+
+  el.innerHTML = lines.map((l) => {
+    if (l.text === "\x00sei_chart") {
+      return '<div class="hud-chart-divider"></div>';
+    }
+    if (!l.text) {
+      return '<div class="hud-line-spacer"></div>';
+    }
+    const color = l.colour ? `rgb(${l.colour[0]},${l.colour[1]},${l.colour[2]})` : "inherit";
+    const weight = l.bold ? "600" : "400";
+    const fontSize = l.size ? (l.size + "px") : "13px";
+    return '<div class="hud-line-row" style="color:' + color + ';font-size:' + fontSize + ';font-weight:' + weight + ';">' + esc(l.text) + '</div>';
   }).join("");
 }
 

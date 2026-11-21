@@ -195,9 +195,18 @@ def live_payload(cfg, runner) -> dict:
                 except Exception:
                     pass
     _, info = runner.snapshot()
+    hud_lines_out = info.get("hud_lines", [])
+    if not hud_lines_out:
+        try:
+            from focusedge.hud import hud_lines
+            raw = hud_lines(None, 0, 0.0, 0.0)
+            hud_lines_out = [{"text": l.text, "size": l.size, "colour": list(l.colour), "bold": l.bold} for l in raw]
+        except Exception:
+            hud_lines_out = []
     return {"board": board, "age_s": age, "presence": presence,
-            "camera": runner.status(), "people": info["people"],
-            "fps": round(info["fps"], 1), "activity": info["activity"]}
+            "camera": runner.status(), "people": info.get("people", []),
+            "fps": round(info.get("fps", 0), 1), "activity": info.get("activity", ""),
+            "hud_lines": hud_lines_out}
 
 
 def trend(conn, minutes: int = 30) -> list:

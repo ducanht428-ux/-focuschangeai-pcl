@@ -216,12 +216,22 @@ class CameraRunner:
 
                 view = self._draw(frame, pipeline, latest_results)
                 ok2, buf = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                people = self._people(pipeline)
+                people = self._people(pipeline, ai_proc, fps)
                 activity = getattr(pipeline.last_activity, "label", "") or ""
+                top_hud = []
+                try:
+                    from focusedge.hud import hud_lines
+                    primary_r = latest_results[0] if latest_results else None
+                    raw_hud = hud_lines(primary_r, len(people), ai_proc, fps, activity=pipeline.last_activity)
+                    top_hud = [{"text": l.text, "size": l.size, "colour": list(l.colour), "bold": l.bold} for l in raw_hud]
+                except Exception:
+                    pass
+
                 with self._lock:
                     self._jpeg = buf.tobytes() if ok2 else None
                     self._info = {"people": people, "fps": fps, "processing_ms": ai_proc,
-                                  "activity": activity, "started_ms": started, "frames": frames}
+                                  "activity": activity, "started_ms": started, "frames": frames,
+                                  "hud_lines": top_hud}
 
             ai_event.set()
             ai_thread.join(timeout=1.0)
@@ -290,12 +300,48 @@ class CameraRunner:
             cv2.rectangle(view, (x0, y0), (x1, y1), (0, 220, 220), 1)
         return view
 
-    def _people(self, pipeline) -> List[Dict]:
+    def _people(self, pipeline, processing_ms: float = 0.0, fps: float = 0.0) -> List[Dict]:
         from focusedge.constants import HabitFeature
+        from focusedge.hud import hud_lines
+        from focusedge.person_pipeline import HudState
         out = []
-        for v in pipeline.people():
+        people_views = list(pipeline.people())
+        face_count = len(people_views)
+        for v in people_views:
             r = pipeline.person_result(v.track_id)
             feats = r.features if r is not None else {}
+            if r is not None:
+                if r.hud is None:
+                    r.hud = HudState()
+                ear_val = feats.get(HabitFeature.EAR)
+                if ear_val is not None and (r.hud.ear1 is None or math.isnan(r.hud.ear1)):
+                    r.hud.ear1 = float(ear_val)
+                    r.hud.ear2 = float(ear_val)
+                mar_val = feats.get(HabitFeature.MAR)
+                if mar_val is not None and (r.hud.mar is None or math.isnan(r.hud.mar)):
+                    r.hud.mar = float(mar_val)
+                    if r.hud.bfr is None or math.isnan(r.hud.bfr):
+                        r.hud.bfr = 0.0
+                if r.pitch is not None and r.hud.pitch is None:
+                    r.hud.pitch = r.pitch
+                if r.yaw is not None and r.hud.yaw is None:
+                    r.hud.yaw = r.yaw
+                if r.distance_cm is not None and r.hud.distance_cm is None:
+                    r.hud.distance_cm = r.distance_cm
+                if r.sei is not None and r.hud.sei is None:
+                    r.hud.sei = r.sei
+                if r.perclos is not None and r.hud.perclos is None:
+                    r.hud.perclos = r.perclos
+                if r.quality is not None and r.hud.quality is None:
+                    r.hud.quality = r.quality
+
+            p_hud = []
+            try:
+                raw = hud_lines(r, face_count, processing_ms, fps, activity=pipeline.last_activity)
+                p_hud = [{"text": l.text, "size": l.size, "colour": list(l.colour), "bold": l.bold} for l in raw]
+            except Exception:
+                pass
+
             out.append({
                 "track_id": v.track_id,
                 "student_id": v.student_id,
@@ -323,6 +369,7 @@ class CameraRunner:
                 # lệnh GV + theo dõi dấu hiệu giật lặp lại. None khi track không tồn tại.
                 "context": pipeline.context_view(v.track_id),
                 "tic": pipeline.tic_view(v.track_id),
+                "hud_lines": p_hud,
             })
         return out
 
