@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The seven template colors this file used to hold (purple/teal/black/white) had no
+         reference anywhere in the app, so they are gone rather than kept "just in case". -->
+</resources>

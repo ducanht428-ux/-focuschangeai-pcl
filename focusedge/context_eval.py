@@ -51,7 +51,8 @@ CRITERIA: Dict[str, Dict] = {
         "vi": "nghe giảng",
     },
     TeacherContextAI.CONTEXT_STUDY_NOTE: {
-        "yaw_max": 30.0, "pitch_min": -42.0, "pitch_max": -10.0, "window_s": 15.0,
+        # Khi ghi bài: học sinh cúi nhìn vở (-42° đến -10°) HOẶC nhìn lên bảng (-10° đến 20°) đều hợp lệ.
+        "yaw_max": 30.0, "pitch_min": -42.0, "pitch_max": 20.0, "window_s": 15.0,
         "on_reason": "Đang ghi/học bài", "off_reason": "Không chép bài / nhìn linh tinh",
         "vi": "ghi bài",
     },

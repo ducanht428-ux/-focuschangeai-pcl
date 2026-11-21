@@ -1567,9 +1567,7 @@ function renderCamera() {
     '<div class="avg-note" id="cam-status-note"></div>' +
     '<div class="people-grid" id="cam-people"></div></div>' +
     '<div><div class="card"><h3>' + ico("settings") + 'Cài đặt camera</h3>' +
-    '<div class="field"><label>Nguồn camera</label><select id="cam-source">' +
-    '<option value="0" selected>Webcam máy này (index 0)</option>' +
-    '<option value="phone" disabled>Điện thoại ghép nối — giai đoạn 3</option></select></div>' +
+    '<div class="field"><label>Nguồn camera</label>' + sel("cam-source", [[0, "Cam máy tính (Built-in, index 0)"], [1, "Webcam rời USB (Logitech C270, index 1)"], [2, "Camera phụ (index 2)"]], cc.source != null ? cc.source : 1) + "</div>" +
     '<div class="field"><label>Độ phân giải xử lý</label>' + sel("cam-width", [[640, "640×480"], [480, "480×360"], [320, "320×240"]], cc.process_width) + "</div>" +
     '<div class="field"><label>Số mặt đo cùng lúc</label>' + sel("cam-faces", [[1, "1"], [2, "2"], [3, "3"], [4, "4"], [10, "10 (tối đa)"]], cc.max_active_faces) + "</div>" +
     '<div class="field"><label>Tần suất quét (khung/giây)</label>' + sel("cam-fps-set", [[8, "8 (Tiết kiệm)"], [12, "12"], [15, "15"], [20, "20 (Mượt)"], [25, "25"], [30, "30 (Tối đa)"]], cc.detect_fps || 20) + "</div>" +
@@ -1942,6 +1940,7 @@ async function setVoiceContext(ctx) {
 
 async function saveCameraSettings() {
   const body = {camera: {
+    source: parseInt($("cam-source").value, 10),
     process_width: parseInt($("cam-width").value, 10),
     max_active_faces: parseInt($("cam-faces").value, 10),
     detect_fps: parseInt($("cam-fps-set").value, 10),

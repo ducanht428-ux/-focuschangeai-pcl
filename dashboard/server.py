@@ -223,6 +223,7 @@ def system_status(cfg, runner) -> dict:
         # Giá trị camera đang nằm trong config.yaml, để màn Camera hiện đúng thứ sẽ chạy
         # lần bật tới thay vì đoán mò. Ghi thì qua POST /api/settings (body.camera).
         "camera_cfg": {
+            "source": (cfg.get("input") or {}).get("source", 0),
             "sensitivity": (cfg.get("person") or {}).get("sensitivity", 1),
             "max_active_faces": (cfg.get("scheduler") or {}).get("max_active_faces", 10),
             "process_width": (cfg.get("input") or {}).get("process_width", 640),
@@ -955,6 +956,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/restore":
                 return self._json(do_restore(conn, self.runner, body.get("file", "")))
             if path == "/api/camera/start":
+                cfg = load_cfg()
                 res = self.runner.start(cfg)
                 if res.get("ok"):
                     conn.execute("INSERT INTO cameras (camera_id, kind, label, status, last_seen_ms)"
@@ -1028,6 +1030,13 @@ class Handler(BaseHTTPRequestHandler):
         # Vài cài đặt là của lõi camera: ghi thẳng vào config.yaml để lần chạy sau giữ nguyên.
         cam = body.get("camera") or {}
         if cam:
+            if "source" in cam:
+                src = cam["source"]
+                try:
+                    src = int(src)
+                except (ValueError, TypeError):
+                    pass
+                cfg.setdefault("input", {})["source"] = src
             if "sensitivity" in cam:
                 cfg.setdefault("person", {})["sensitivity"] = int(cam["sensitivity"])
             if "max_active_faces" in cam:
