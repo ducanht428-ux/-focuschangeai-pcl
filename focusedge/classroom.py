@@ -462,6 +462,8 @@ class ClassroomPipeline:
             measured.append((res.landmarks, res.face_bbox, rt.nearby))
             if res.alert:
                 self._register_alert(rt, res.alert, wall_ms)
+            elif rt.attention_label and rt.attention_label.startswith("MAT TAP TRUNG"):
+                self._register_alert(rt, "LOOK_AWAY", wall_ms)
 
         # -- Lớp khuyến nghị sư phạm: đánh giá từng em THEO NGỮ CẢNH khẩu lệnh GV -----
         # (context_eval.py - tài liệu 2+3) và theo dõi dấu hiệu giật lặp lại kiểu Tic
@@ -829,13 +831,25 @@ class ClassroomPipeline:
 
         rt.alert_count += 1
         rt.alerts.append({"code": code, "wall_ms": wall_ms})
-        self._alerts.append({
+        alert_item = {
             "student_id": rt.student_id or ("guest-%d" % rt.track_id),
             "student_name": rt.student_name,
             "track_id": rt.track_id,
             "code": code,
             "wall_ms": wall_ms,
-        })
+        }
+        self._alerts.append(alert_item)
+        # Ghi ngay tức thì vào SQLite database bảng alerts để giao diện nhận được cảnh báo ngay trong lúc quay
+        if hasattr(self._writer, "write_instant_alert"):
+            try:
+                self._writer.write_instant_alert(
+                    student_id=alert_item["student_id"],
+                    student_name=rt.student_name or alert_item["student_id"],
+                    code=code,
+                    wall_ms=wall_ms,
+                )
+            except Exception:
+                pass
 
     def _register_advisory(self, rt: TrackRuntime, kind: str, wall_ms: int, **fields) -> None:
         """Một sự kiện KHUYẾN NGHỊ (off-task theo ngữ cảnh, mức dấu hiệu Tic tăng).

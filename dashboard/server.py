@@ -206,7 +206,7 @@ def live_payload(cfg, runner) -> dict:
     return {"board": board, "age_s": age, "presence": presence,
             "camera": runner.status(), "people": info.get("people", []),
             "fps": round(info.get("fps", 0), 1), "activity": info.get("activity", ""),
-            "hud_lines": hud_lines_out}
+            "hud_lines": hud_lines_out, "recent_alerts": info.get("recent_alerts", [])}
 
 
 def trend(conn, minutes: int = 30) -> list:

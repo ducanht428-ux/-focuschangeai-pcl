@@ -553,7 +553,37 @@ async function tickFast() {
     const [ov, live, voice] = await Promise.all(jobs);
     S.overview = ov; S.live = live;
     if (voice) S.voice = voice;
-    // Âm báo khi có cảnh báo CHƯA XEM mới (đặc tả 5.7). Lần đầu chỉ ghi mốc, không kêu.
+
+    // 1. Cảnh báo thời gian thực NGAY TRONG LÚC QUAY CAMERA từ live.people & live.recent_alerts
+    if (live) {
+      const activeAlerts = [];
+      if (live.people) {
+        for (const p of live.people) {
+          if (p.alert) {
+            activeAlerts.push({id: p.track_id, name: p.name || ("Em #" + p.track_id), code: p.alert});
+          }
+        }
+      }
+      if (live.recent_alerts && live.recent_alerts.length) {
+        for (const ra of live.recent_alerts) {
+          activeAlerts.push({id: ra.track_id || ra.student_id, name: ra.student_name || ra.student_id || "Học sinh", code: ra.code, wall_ms: ra.wall_ms});
+        }
+      }
+      for (const a of activeAlerts) {
+        const now = Date.now();
+        const aKey = a.id + "_" + a.code;
+        if (!window._realtimeAlerts) window._realtimeAlerts = {};
+        // Cooldown 5 phút (300.000 ms) cho mỗi học sinh để chống spam chuông/thông báo
+        if (!window._realtimeAlerts[aKey] || (now - window._realtimeAlerts[aKey] >= 300000)) {
+          window._realtimeAlerts[aKey] = now;
+          beep();
+          const label = KIND_LABEL[a.code] || a.code;
+          toast("⚠️ CẢNH BÁO: " + a.name + " — " + label, "err");
+        }
+      }
+    }
+
+    // 2. Âm báo khi có cảnh báo CHƯA XEM mới (đặc tả 5.7). Lần đầu chỉ ghi mốc, không kêu.
     if (S.lastUnseen != null && ov.alerts_unseen > S.lastUnseen) {
       const now = Date.now();
       if (!window._lastAlertToastTime || now - window._lastAlertToastTime >= 300000) {
@@ -2549,7 +2579,7 @@ let _lastBeepWallMs = 0;
 function beep() {
   if (!S.soundOn) return;
   const now = Date.now();
-  if (now - _lastBeepWallMs < 300000) return; // Giãn cách tối thiểu 5 phút 1 lần để chống spam chuông
+  if (now - _lastBeepWallMs < 10000) return; // Giãn cách 10s giữa 2 lần phát âm thanh tránh đè âm thanh
   _lastBeepWallMs = now;
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();

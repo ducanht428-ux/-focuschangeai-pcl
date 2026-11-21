@@ -365,17 +365,37 @@ class LocalStore:
                 "INSERT OR REPLACE INTO feature_records (session_row, feature, mean, std, n,"
                 " extractor) VALUES (?, ?, ?, ?, ?, ?)", rows)
 
+    def write_instant_alert(self, student_id: str, student_name: str, code: str,
+                            wall_ms: int) -> None:
+        """Ghi ngay cảnh báo vào SQLite ngay trong lúc quay (không chờ phiên kết thúc)."""
+        if not self._conn:
+            return
+        msg = alert_sentence(code, None, None) or code
+        try:
+            self._conn.execute(
+                "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms, seen_at_ms)"
+                " VALUES (0, ?, ?, ?, ?, NULL)",
+                (student_id, code, msg, int(wall_ms)))
+            self._conn.commit()
+        except Exception:
+            pass
+
     def _insert_alerts(self, session_row: int, student_id: str,
                        alerts: Sequence[Dict]) -> None:
         for a in alerts:
             code = str(a.get("code") or "")
             if not code:
                 continue
-            self._conn.execute(
-                "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (session_row, student_id, code,
-                 alert_sentence(code, None, None) or code, int(a.get("wall_ms") or 0)))
+            wall_ms = int(a.get("wall_ms") or 0)
+            cur = self._conn.execute(
+                "UPDATE alerts SET session_row = ? WHERE session_row = 0 AND student_id = ? AND raised_at_wall_ms = ?",
+                (session_row, student_id, wall_ms))
+            if cur.rowcount == 0:
+                self._conn.execute(
+                    "INSERT INTO alerts (session_row, student_id, kind, message, raised_at_wall_ms, seen_at_ms)"
+                    " VALUES (?, ?, ?, ?, ?, NULL)",
+                    (session_row, student_id, code,
+                     alert_sentence(code, None, None) or code, wall_ms))
 
     # ==================================================================
     # learned bands

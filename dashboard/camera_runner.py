@@ -227,11 +227,12 @@ class CameraRunner:
                 except Exception:
                     pass
 
+                recent_alerts = list(getattr(pipeline, "_alerts", []))[-10:]
                 with self._lock:
                     self._jpeg = buf.tobytes() if ok2 else None
                     self._info = {"people": people, "fps": fps, "processing_ms": ai_proc,
                                   "activity": activity, "started_ms": started, "frames": frames,
-                                  "hud_lines": top_hud}
+                                  "hud_lines": top_hud, "recent_alerts": recent_alerts}
 
             ai_event.set()
             ai_thread.join(timeout=1.0)
