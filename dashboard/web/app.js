@@ -554,40 +554,43 @@ async function tickFast() {
     S.overview = ov; S.live = live;
     if (voice) S.voice = voice;
 
-    // 1. Cảnh báo thời gian thực NGAY TRONG LÚC QUAY CAMERA từ live.people & live.recent_alerts
+    // 1. Cảnh báo thời gian thực NGAY TRONG LÚC QUAY CAMERA (nghiêm ngặt 5 phút 1 lần = 300.000 ms chống spam)
+    const ALERT_COOLDOWN_MS = 300000;
+    const now = Date.now();
     if (live) {
-      const activeAlerts = [];
-      if (live.people) {
+      let candidateAlert = null;
+      if (live.recent_alerts && live.recent_alerts.length) {
+        candidateAlert = live.recent_alerts[live.recent_alerts.length - 1];
+      } else if (live.people) {
         for (const p of live.people) {
           if (p.alert) {
-            activeAlerts.push({id: p.track_id, name: p.name || ("Em #" + p.track_id), code: p.alert});
+            candidateAlert = {student_id: p.student_id || p.track_id, student_name: p.name || ("Em #" + p.track_id), code: p.alert};
+            break;
           }
         }
       }
-      if (live.recent_alerts && live.recent_alerts.length) {
-        for (const ra of live.recent_alerts) {
-          activeAlerts.push({id: ra.track_id || ra.student_id, name: ra.student_name || ra.student_id || "Học sinh", code: ra.code, wall_ms: ra.wall_ms});
-        }
-      }
-      for (const a of activeAlerts) {
-        const now = Date.now();
-        const aKey = a.id + "_" + a.code;
-        if (!window._realtimeAlerts) window._realtimeAlerts = {};
-        // Cooldown 5 phút (300.000 ms) cho mỗi học sinh để chống spam chuông/thông báo
-        if (!window._realtimeAlerts[aKey] || (now - window._realtimeAlerts[aKey] >= 300000)) {
-          window._realtimeAlerts[aKey] = now;
+      if (candidateAlert) {
+        const sid = candidateAlert.student_id || candidateAlert.track_id;
+        if (!window._studentAlertTimes) window._studentAlertTimes = {};
+        const lastStudentTime = window._studentAlertTimes[sid] || 0;
+        const lastGlobalTime = window._globalLastAlertTime || 0;
+
+        // Cảnh báo 5 phút 1 lần để chống spam chuông/thông báo
+        if (now - lastStudentTime >= ALERT_COOLDOWN_MS && now - lastGlobalTime >= ALERT_COOLDOWN_MS) {
+          window._studentAlertTimes[sid] = now;
+          window._globalLastAlertTime = now;
           beep();
-          const label = KIND_LABEL[a.code] || a.code;
-          toast("⚠️ CẢNH BÁO: " + a.name + " — " + label, "err");
+          const label = KIND_LABEL[candidateAlert.code] || candidateAlert.code;
+          const sName = candidateAlert.student_name || ("Học sinh #" + (candidateAlert.track_id || sid));
+          toast("⚠️ CẢNH BÁO: " + sName + " — " + label, "err");
         }
       }
     }
 
-    // 2. Âm báo khi có cảnh báo CHƯA XEM mới (đặc tả 5.7). Lần đầu chỉ ghi mốc, không kêu.
+    // 2. Âm báo khi có cảnh báo CHƯA XEM mới (đặc tả 5.7). Giãn cách tối thiểu 5 phút 1 lần.
     if (S.lastUnseen != null && ov.alerts_unseen > S.lastUnseen) {
-      const now = Date.now();
-      if (!window._lastAlertToastTime || now - window._lastAlertToastTime >= 300000) {
-        window._lastAlertToastTime = now;
+      if (!window._globalLastAlertTime || now - window._globalLastAlertTime >= ALERT_COOLDOWN_MS) {
+        window._globalLastAlertTime = now;
         beep();
         toast("Có cảnh báo mới (" + (ov.alerts_unseen - S.lastUnseen) + ")", "err");
       }
@@ -2579,7 +2582,7 @@ let _lastBeepWallMs = 0;
 function beep() {
   if (!S.soundOn) return;
   const now = Date.now();
-  if (now - _lastBeepWallMs < 10000) return; // Giãn cách 10s giữa 2 lần phát âm thanh tránh đè âm thanh
+  if (_lastBeepWallMs && now - _lastBeepWallMs < 300000) return; // Tuyệt đối 5 phút mới được kêu 1 lần (chống spam)
   _lastBeepWallMs = now;
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
