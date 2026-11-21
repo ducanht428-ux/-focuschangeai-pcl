@@ -1,0 +1,68 @@
+package com.focuschange.ai.domain.engine
+
+import com.focuschange.ai.domain.model.Feature
+import com.focuschange.ai.domain.model.FeatureEvaluation
+import com.focuschange.ai.domain.model.FeatureStatus
+import com.focuschange.ai.domain.model.ToleranceBound
+
+/**
+ * Tier 1: feature-wise decoupled metrics (distance d, blink rate b, SEI e).
+ * Every feature runs through its own isolated pipeline: its own validity filter, IQR filter,
+ * bound and status. No feature's data or result ever influences another's.
+ *
+ * Thread-safe: bounds are an immutable map swapped atomically through a volatile reference.
+ */
+class IndependentFeatureEngine(
+    private val k: Double = RobustStats.DEFAULT_K,
+    private val minStableSamples: Int = 30
+) {
+    @Volatile
+    private var bounds: Map<Feature, ToleranceBound> = emptyMap()
+
+    /** Recomputes the personal bounds of every feature from historical samples. */
+    fun calibrate(samples: Map<Feature, DoubleArray>): Map<Feature, ToleranceBound> {
+        val result = HashMap<Feature, ToleranceBound>()
+        for (feature in Feature.values()) {
+            val raw = samples[feature] ?: continue
+            val valid = raw.filter { it.isFinite() && it >= feature.validMin && it <= feature.validMax }.toDoubleArray()
+            val bound = RobustStats.personalBound(
+                values = valid,
+                k = k,
+                minHalfWidth = feature.minHalfWidth,
+                minStableSamples = minStableSamples,
+                hardMin = feature.validMin,
+                hardMax = feature.validMax
+            )
+            if (bound != null) result[feature] = bound
+        }
+        bounds = result.toMap()
+        return bounds
+    }
+
+    fun reset() {
+        bounds = emptyMap()
+    }
+
+    fun currentBounds(): Map<Feature, ToleranceBound> = bounds
+
+    fun evaluate(feature: Feature, value: Double?): FeatureEvaluation {
+        val bound = bounds[feature]
+        val finite = value?.takeIf { it.isFinite() }
+        // The physical-range gate must be applied while measuring too, not only while learning.
+        // calibrate() above drops samples outside validMin/validMax, while evaluate previously
+        // only checked isFinite: a garbage distance frame (3 cm or 250 cm from landmark jumps)
+        // became BELOW/ABOVE_BOUND instead of INSUFFICIENT_DATA, i.e. false alerts from bad measurement.
+        val plausible = finite?.takeIf { it >= feature.validMin && it <= feature.validMax }
+        if (plausible == null || bound == null) {
+            return FeatureEvaluation(feature, finite, bound, FeatureStatus.INSUFFICIENT_DATA)
+        }
+        return FeatureEvaluation(feature, finite, bound, bound.classify(finite))
+    }
+
+    fun evaluateAll(distanceCm: Double?, blinkRateBpm: Double?, seiScore: Double?): Map<Feature, FeatureEvaluation> =
+        mapOf(
+            Feature.DISTANCE to evaluate(Feature.DISTANCE, distanceCm),
+            Feature.BLINK_RATE to evaluate(Feature.BLINK_RATE, blinkRateBpm),
+            Feature.ENGAGEMENT to evaluate(Feature.ENGAGEMENT, seiScore)
+        )
+}

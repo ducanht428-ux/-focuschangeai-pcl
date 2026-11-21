@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Bytecode Python - sinh lại mỗi lần chạy, không phải mã nguồn
 __pycache__/
 *.pyc
@@ -7,3 +8,51 @@ data/
 backups/
 out/
 roster.json
+=======
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+desktop/
+hs_err_pid*.log
+__pycache__/
+*.pyc
+
+# edge-server run artifacts. Everything below is produced by a camera session on the operator's
+# machine and must never be committed: roster.json holds ArcFace face templates (biometric data,
+# one row per named student), out/ holds the document dumps, and the two weights files are
+# downloads that belong to the library cache, not to git.
+edge-server/roster.json
+edge-server/out/
+edge-server/pending_upload.jsonl
+edge-server/config.local.yaml
+edge-server/*.pt
+edge-server/*.task
+edge-server/service_account.json
+edge-server/*.key
+# Any weight file, wherever it lands. ultralytics writes the model into the CURRENT folder, so running
+# main.py from the repo root used to drop a second 5.4 MB yolo11n.pt there and leave it in git status
+# as an untracked binary someone might add. No .pt is tracked in this repo, so this costs nothing.
+# .onnx joins for the same reason: `yolo11n.pt.export(format='onnx')` writes it next to the .pt, and an
+# 11 MB export sitting in git status is exactly the trap the line above was written for.
+*.pt
+*.onnx
+# focuschange.db is written by database/database.py the first time the program runs, and every
+# session adds rows to it. It is measured data about named children, not source, so it must never
+# be added. No .db is tracked in this repo, so this costs nothing.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+>>>>>>> 9d37a125d28f31c701a8e233704d96c08ec97bdd
