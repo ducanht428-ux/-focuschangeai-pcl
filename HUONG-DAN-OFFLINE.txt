@@ -1,0 +1,60 @@
+FOCUSCHANGE AI — CHẠY OFFLINE / RUN OFFLINE
+==========================================
+
+Thư mục này CHÍNH LÀ ứng dụng web, đủ cả mô hình AI. Chạy bằng đúng cùng mã với bản trên mạng, nên mọi tính năng
+(sơ đồ lớp, buổi học, phiếu phụ huynh, tiếng Việt – English...) giống hệt. Không cần internet.
+This folder IS the web app, models included. It runs the exact same code as the online version, so every feature is
+identical. No internet needed.
+
+
+CÁCH CHẠY / HOW TO RUN
+----------------------
+Windows : bấm đúp  Chay-offline.bat        (double-click)
+macOS / Linux : mở Terminal trong thư mục này, gõ:  ./chay-offline.sh
+
+Trình duyệt sẽ tự mở http://localhost:8765/dashboard/. Hãy dùng Google Chrome hoặc Microsoft Edge.
+Khi trình duyệt hỏi quyền camera, bấm "Cho phép / Allow".
+Giữ cửa sổ đen (dòng lệnh) mở trong lúc dùng; đóng nó là tắt ứng dụng.
+
+Máy cần Python 3 (khuyên dùng). Nếu không có Python, trên Windows file .bat tự dùng PowerShell có sẵn của máy.
+Python 3 is recommended. Without it, on Windows the .bat falls back to the PowerShell built into Windows.
+
+
+LẦN ĐẦU DÙNG / FIRST USE
+------------------------
+1. Chạy Chay-offline.bat, mở màn Camera, bấm "Bắt đầu đo".
+2. Để cho máy chọn độ phân giải tốt nhất: mở  http://localhost:8765/benchmark.html  rồi chạy kiểm thử một lần.
+   (Chạy trên chính máy và webcam sẽ dùng.)
+3. Có thể bấm "Cài đặt ứng dụng" trên thanh địa chỉ của Chrome/Edge để có cửa sổ ứng dụng riêng.
+
+
+DỮ LIỆU & QUYỀN RIÊNG TƯ / DATA & PRIVACY
+-----------------------------------------
+- Máy chủ chỉ nghe trên máy này (127.0.0.1). Máy khác trong mạng KHÔNG truy cập được.
+  The server listens on this computer only; other computers on the network cannot reach it.
+- Hình ảnh chỉ được xử lý trong trình duyệt, không lưu ảnh, không gửi đi đâu.
+  Images are processed inside the browser only: nothing is stored or sent anywhere.
+- Số đo, buổi học, sơ đồ chỗ ngồi lưu trong trình duyệt của MÁY NÀY (bộ nhớ cục bộ). Đổi máy hoặc đổi trình duyệt
+  là không thấy dữ liệu cũ. Hãy vào màn "Sao lưu" tải tệp .db để mang sang máy khác rồi "Khôi phục".
+  Data lives in THIS browser on THIS computer. To move it, download a .db file on the Backup screen and restore it.
+- Phiếu nhận xét gửi phụ huynh chỉ nên dùng khi đã có sự đồng ý của phụ huynh và nhà trường.
+
+
+CẬP NHẬT / UPDATING
+-------------------
+Thay cả thư mục bằng bản mới, rồi mở lại. Nếu vẫn thấy bản cũ: trong Chrome nhấn Ctrl+Shift+R.
+Replace the whole folder with the new version and reopen. If you still see the old one, press Ctrl+Shift+R.
+
+
+GỠ BỎ / REMOVING
+----------------
+Đóng cửa sổ dòng lệnh, xóa thư mục. Muốn xóa luôn dữ liệu đo: trong Chrome vào Cài đặt > Quyền riêng tư > Xóa dữ liệu
+duyệt web, hoặc dùng F12 > Application > Clear site data cho địa chỉ localhost:8765.
+
+
+LƯU Ý / NOTES
+-------------
+- Cổng 8765 bị dùng rồi: chạy  python serve.py 8766  rồi mở http://localhost:8766/dashboard/
+- Nút "Tải App PC" trong thanh bên chỉ hiện khi có gói /download/FocusChangeAI-PC-app.zip; bản này không cần nó.
+- Tình trạng kiểm thử: serve.py đã thử trên Linux; serve.ps1 (nhánh PowerShell của Windows) chưa được thử trên máy Windows thật.
+  Tested: serve.py on Linux. NOT yet tested on a real Windows machine: the serve.ps1 PowerShell fallback.

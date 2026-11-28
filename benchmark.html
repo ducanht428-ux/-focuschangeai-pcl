@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FocusChange AI · Kiểm thử hiệu năng và độ chính xác</title>
+<style>
+:root { --bg:#f4f6fb; --card:#fff; --ink:#16233b; --soft:#5b6b86; --line:#dde3ee; --blue:#1f6feb; --green:#16a34a; --orange:#d97706; --red:#dc2626; color-scheme: light dark; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0e1626; --card:#16213a; --ink:#e8eefc; --soft:#9fb0cf; --line:#2a3a5c; } }
+* { box-sizing: border-box; }
+body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+main { max-width: 980px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 22px; margin: 8px 0 2px; } h2 { font-size: 17px; margin: 0 0 8px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin:14px 0; }
+.soft { color:var(--soft); font-size:13px; }
+.row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:8px 0; }
+label { font-size:13px; color:var(--soft); display:flex; flex-direction:column; gap:3px; }
+select, input[type=number] { padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); font:inherit; }
+button { padding:10px 16px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--ink); font:inherit; font-weight:600; cursor:pointer; }
+button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+button:disabled { opacity:.5; cursor:not-allowed; }
+.hold { min-width:120px; user-select:none; touch-action:none; }
+.hold.on { background:var(--orange); color:#fff; border-color:var(--orange); }
+video { width:100%; max-width:420px; border-radius:10px; background:#000; display:block; }
+.tablewrap { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; font-size:13px; }
+th, td { padding:7px 9px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+th:first-child, td:first-child { text-align:left; }
+.good { color:var(--green); font-weight:700; } .warn { color:var(--orange); font-weight:700; } .bad { color:var(--red); font-weight:700; }
+.verdict { padding:10px 12px; border-radius:10px; background:color-mix(in srgb, var(--green) 14%, transparent); margin-top:10px; }
+pre { background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:10px; max-height:200px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+progress { width:100%; height:10px; }
+</style>
+<script src="./i18n-en.js"></script><script src="./i18n.js"></script>
+</head>
+<body>
+<main>
+<h1>Kiểm thử hiệu năng và độ chính xác</h1>
+<div class="soft">Chạy ngay trên máy và camera đang dùng. Mọi hình ảnh xử lý tại máy, không gửi đi đâu. Dùng số liệu bên dưới làm bằng chứng cho bài thi.</div>
+
+<div class="card">
+  <h2>1. Cấu hình</h2>
+  <div class="row">
+    <label>Bộ xử lý
+      <select id="delegate"><option value="GPU">GPU (WebGL)</option><option value="CPU">CPU</option></select></label>
+    <label>Số mặt tối đa
+      <select id="nfaces"><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+    <label>Giây mỗi mức
+      <input type="number" id="secs" value="8" min="4" max="30"></label>
+  </div>
+  <div class="soft" id="sys"></div>
+</div>
+
+<div class="card">
+  <h2>2. Hiệu năng theo độ phân giải</h2>
+  <div class="soft">Ngồi yên nhìn thẳng vào camera trong lúc chạy: ngoài tốc độ, trang còn đo độ rung của điểm mốc khuôn mặt (càng thấp càng ổn định).</div>
+  <div class="row"><button class="primary" id="runPerf">Chạy kiểm thử (5 mức)</button><span class="soft" id="perfStatus"></span></div>
+  <progress id="perfBar" value="0" max="1" hidden></progress>
+  <video id="vid" playsinline muted></video>
+  <div class="tablewrap"><table id="perfTable" hidden>
+    <thead><tr><th>Yêu cầu</th><th>Thực tế</th><th>Camera fps</th><th>Xử lý fps</th><th>Trễ p50 (ms)</th><th>Trễ p95 (ms)</th><th>Thấy mặt</th><th>Rung (% 2 mắt)</th><th>Đánh giá</th></tr></thead>
+    <tbody></tbody></table></div>
+  <div class="verdict" id="verdict" hidden></div>
+</div>
+
+<div class="card">
+  <h2>3. Độ chính xác (đối chiếu nhãn tay)</h2>
+  <div class="soft">Giữ <b>phím E</b> (hoặc nút bên dưới) trong lúc <b>nhắm mắt</b>; giữ <b>phím Y</b> trong lúc <b>há miệng to/ngáp</b>. Nhắm và ngáp nhiều lần, thả phím khi mở mắt/ngậm miệng. Các khung ngay sau mỗi lần đổi nhãn (250 ms) bị bỏ qua để bù độ trễ của tay người bấm.</div>
+  <div class="row">
+    <label>Độ phân giải
+      <select id="accRes"><option value="640">640x480</option><option value="960">960x720</option><option value="1280">1280x960</option><option value="480">480x360</option></select></label>
+    <label>Giây
+      <input type="number" id="accSecs" value="40" min="15" max="180"></label>
+    <button class="primary" id="runAcc">Bắt đầu kiểm thử</button>
+  </div>
+  <div class="row">
+    <button class="hold" id="holdE">Giữ: nhắm mắt (E)</button>
+    <button class="hold" id="holdY">Giữ: há miệng (Y)</button>
+    <span class="soft" id="accStatus"></span>
+  </div>
+  <div class="tablewrap"><table id="accTable" hidden>
+    <thead><tr><th>Nhãn</th><th>TP</th><th>FP</th><th>FN</th><th>TN</th><th>Chính xác</th><th>Precision</th><th>Recall</th><th>F1</th></tr></thead>
+    <tbody></tbody></table></div>
+  <div class="soft" id="accNote" hidden>Dự đoán lấy từ blendshape của FaceLandmarker (nhắm mắt: trung bình eyeBlink trái/phải &gt; 0,5; há miệng: jawOpen &gt; 0,5). Đây là độ chính xác của tầng đo mắt/miệng, chưa gồm toàn bộ quy tắc hiệu chuẩn cá nhân của app.</div>
+</div>
+
+<div class="card">
+  <h2>4. Xuất kết quả</h2>
+  <div class="row"><button id="dlJson" disabled>Tải JSON</button><button id="dlCsv" disabled>Tải CSV hiệu năng</button></div>
+  <pre id="log">Chưa chạy.</pre>
+</div>
+</main>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from './js/vision_bundle.mjs';
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { const el = $('log'); el.textContent += '\n' + m; el.scrollTop = 1e9; };
+const results = { meta: null, performance: [], accuracy: null };
+
+/* ---------- thống kê ---------- */
+function pct(arr, p) {
+  if (!arr.length) return NaN;
+  const s = arr.slice().sort((a, b) => a - b);
+  const k = (s.length - 1) * p, f = Math.floor(k), c = Math.ceil(k);
+  return s[f] + (s[c] - s[f]) * (k - f);
+}
+const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN;
+const f1 = (v, d = 1) => Number.isFinite(v) ? v.toFixed(d) : '--';
+function confusionMetrics(c) {
+  const tot = c.tp + c.fp + c.fn + c.tn;
+  const prec = c.tp + c.fp ? c.tp / (c.tp + c.fp) : NaN;
+  const rec = c.tp + c.fn ? c.tp / (c.tp + c.fn) : NaN;
+  const f = prec + rec ? 2 * prec * rec / (prec + rec) : NaN;
+  return { accuracy: tot ? (c.tp + c.tn) / tot : NaN, precision: prec, recall: rec, f1: f };
+}
+
+/* ---------- thông tin máy ---------- */
+function gpuName() {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'không rõ';
+  } catch (e) { return 'không có WebGL'; }
+}
+const sysInfo = {
+  userAgent: navigator.userAgent, cores: navigator.hardwareConcurrency || null,
+  memoryGB: navigator.deviceMemory || null, gpu: gpuName(), screen: screen.width + 'x' + screen.height,
+};
+$('sys').textContent = 'Máy: ' + (sysInfo.cores || '?') + ' luồng CPU · RAM ~' + (sysInfo.memoryGB || '?') + ' GB · GPU: ' + sysInfo.gpu;
+
+/* ---------- model ---------- */
+let files = null, landmarker = null, builtKey = '';
+async function getLandmarker() {
+  let delegate = $('delegate').value;
+  const nf = parseInt($('nfaces').value, 10) || 1;
+  const key = delegate + nf;
+  if (landmarker && builtKey === key) return landmarker;
+  if (landmarker) { try { landmarker.close(); } catch (e) { /* đã đóng */ } landmarker = null; }
+  if (!files) files = await FilesetResolver.forVisionTasks('./wasm');
+  const make = (d) => FaceLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: './face_landmarker.task', delegate: d },
+    runningMode: 'VIDEO', numFaces: nf, outputFaceBlendshapes: true,
+  });
+  try { landmarker = await make(delegate); }
+  catch (e) {
+    if (delegate === 'CPU') throw e;
+    log('GPU thất bại (' + String(e.message).slice(0, 60) + '), chuyển sang CPU.');
+    delegate = 'CPU'; $('delegate').value = 'CPU'; landmarker = await make('CPU');
+  }
+  builtKey = delegate + nf;
+  return landmarker;
+}
+
+/* ---------- camera ---------- */
+const vid = $('vid');
+let stream = null;
+function stopCam() { if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; } }
+async function openCam(w) {
+  stopCam();
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: w }, height: { ideal: Math.round(w * 0.75) }, frameRate: { ideal: 30 } },
+    audio: false,
+  });
+  vid.srcObject = stream; vid.muted = true;
+  await vid.play();
+  const t0 = performance.now();
+  while (!vid.videoWidth && performance.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 50));
+  if (!vid.videoWidth) throw new Error('Camera không có khung hình');
+  const st = stream.getVideoTracks()[0].getSettings();
+  return { w: vid.videoWidth, h: vid.videoHeight, label: stream.getVideoTracks()[0].label, fps: st.frameRate || null };
+}
+
+/* ---------- vòng đo ---------- */
+// Chạy detectForVideo trên từng khung mới trong `ms`, gọi onFrame(result, dtMs, nowMs) cho mỗi khung đã xử lý.
+function runLoop(lm, ms, onFrame, onTick) {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    let lastTime = -1, presented0 = null, presented1 = 0, cbFirst = 0, cbLast = 0;
+    const useRvfc = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+    const step = (now, meta) => {
+      const t = performance.now();
+      if (meta && typeof meta.presentedFrames === 'number') {
+        if (presented0 === null) { presented0 = meta.presentedFrames; cbFirst = t; }
+        presented1 = meta.presentedFrames; cbLast = t;
+      }
+      if (vid.currentTime !== lastTime) {
+        lastTime = vid.currentTime;
+        const t0 = performance.now();
+        let res = null;
+        try { res = lm.detectForVideo(vid, t0); } catch (e) { /* khung lỗi thì bỏ */ }
+        onFrame(res, performance.now() - t0, t0);
+      }
+      if (onTick) onTick(Math.min(1, (t - start) / ms));
+      if (t - start >= ms) {
+        const span = (cbLast - cbFirst) / 1000;
+        resolve({ elapsedMs: t - start, camFps: span > 0 && presented0 !== null ? (presented1 - presented0) / span : NaN });
+        return;
+      }
+      if (useRvfc) vid.requestVideoFrameCallback(step); else requestAnimationFrame(step);
+    };
+    if (useRvfc) vid.requestVideoFrameCallback(step); else requestAnimationFrame(step);
+  });
+}
+
+function judge(row) {
+  if (row.detRate < 0.5) return 'noface'; // không thấy mặt thì không đánh giá được tốc độ thật (model chạy nhẹ hơn khi không có mặt)
+  const ok = row.p95 <= 50 && row.procFps >= 15 && row.detRate >= 0.9;
+  const mid = row.p95 <= 80 && row.procFps >= 10 && row.detRate >= 0.8;
+  return ok ? 'good' : mid ? 'warn' : 'bad';
+}
+const JUDGE_TEXT = { good: 'Tốt', warn: 'Chấp nhận', bad: 'Quá nặng', noface: 'Không thấy mặt' };
+
+/* ---------- kiểm thử hiệu năng ---------- */
+const LEVELS = [320, 480, 640, 960, 1280];
+async function runPerf() {
+  $('runPerf').disabled = true; $('perfTable').hidden = false; $('perfBar').hidden = false;
+  const tbody = $('perfTable').querySelector('tbody'); tbody.innerHTML = '';
+  results.performance = [];
+  const secs = Math.max(4, Math.min(30, parseInt($('secs').value, 10) || 8));
+  try {
+    $('perfStatus').textContent = 'Đang nạp model…';
+    const lm = await getLandmarker();
+    for (let i = 0; i < LEVELS.length; i++) {
+      const want = LEVELS[i];
+      $('perfStatus').textContent = 'Mức ' + (i + 1) + '/' + LEVELS.length + ': ' + want + ' px, ngồi yên nhìn camera…';
+      let cam;
+      try { cam = await openCam(want); } catch (e) { log('Mức ' + want + ': không mở được (' + e.message + ')'); continue; }
+      await new Promise((r) => setTimeout(r, 800)); // chờ camera ổn định
+      const lat = []; let faces = 0, frames = 0, prev = null; const jit = [];
+      const loop = await runLoop(lm, secs * 1000, (res, dt) => {
+        frames++; lat.push(dt);
+        const lmk = res && res.faceLandmarks && res.faceLandmarks[0];
+        if (lmk) {
+          faces++;
+          const W = vid.videoWidth, H = vid.videoHeight;
+          const nose = lmk[1], a = lmk[33], b = lmk[263];
+          const iod = Math.hypot((a.x - b.x) * W, (a.y - b.y) * H) || 1;
+          if (prev) jit.push(Math.hypot((nose.x - prev.x) * W, (nose.y - prev.y) * H) / iod * 100);
+          prev = nose;
+        } else prev = null;
+      }, (p) => { $('perfBar').value = (i + p) / LEVELS.length; });
+      const row = {
+        requested: want, actual: cam.w + 'x' + cam.h, camFps: loop.camFps,
+        procFps: frames / (loop.elapsedMs / 1000), p50: pct(lat, 0.5), p95: pct(lat, 0.95), max: Math.max(...lat),
+        detRate: frames ? faces / frames : 0, jitter: mean(jit), frames, camera: cam.label,
+      };
+      row.verdict = judge(row);
+      results.performance.push(row);
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + want + ' px</td><td>' + row.actual + '</td><td>' + f1(row.camFps) + '</td><td>' + f1(row.procFps) +
+        '</td><td>' + f1(row.p50) + '</td><td>' + f1(row.p95) + '</td><td>' + f1(row.detRate * 100, 0) + '%</td><td>' + f1(row.jitter, 2) +
+        '</td><td class="' + row.verdict + '">' + JUDGE_TEXT[row.verdict] + '</td>';
+      tbody.appendChild(tr);
+      log('Mức ' + want + ' → ' + row.actual + ': ' + f1(row.procFps) + ' fps, p95 ' + f1(row.p95) + ' ms, thấy mặt ' + f1(row.detRate * 100, 0) + '%.');
+    }
+    stopCam();
+    // Khuyến nghị: mức thực tế cao nhất (theo số điểm ảnh) vẫn đạt "Tốt".
+    const good = results.performance.filter((r) => r.verdict === 'good')
+      .sort((x, y) => parseInt(y.actual, 10) - parseInt(x.actual, 10));
+    const v = $('verdict'); v.hidden = false;
+    if (good.length) {
+      const g = good[0]; $('accRes').value = String(g.requested);
+      v.innerHTML = '<b>Khuyến nghị cho máy này: ' + g.requested + ' px (thực tế ' + g.actual + ')</b> — ' + f1(g.procFps) +
+        ' fps, độ trễ p95 ' + f1(g.p95) + ' ms, thấy mặt ' + f1(g.detRate * 100, 0) + '%. Mức cao hơn bị chậm hoặc camera không hỗ trợ.';
+      results.recommendation = { requested: g.requested, actual: g.actual };
+      try {
+        localStorage.setItem('fc_bench_reco', JSON.stringify({ requested: g.requested, actual: g.actual, delegate: $('delegate').value, at: Date.now() }));
+        v.innerHTML += '<br><span class="soft">Đã lưu: ở app, chọn "Tự động" ở ô độ phân giải để dùng mức này (chỉ có tác dụng trên trình duyệt và máy này).</span>';
+      } catch (e) { /* bị chặn lưu thì bỏ qua */ }
+    } else {
+      try { localStorage.removeItem('fc_bench_reco'); } catch (e) { /* bỏ qua */ }
+      const faceless = results.performance.length && results.performance.every((r) => r.verdict === 'noface');
+      if (faceless) {
+        v.innerHTML = '<b>Camera không thấy khuôn mặt trong lúc đo, nên kết quả chưa có giá trị.</b> Ngồi chính diện trước camera, đủ sáng, rồi chạy lại.';
+      } else
+      v.innerHTML = '<b>Chưa có mức nào đạt "Tốt".</b> Thử chuyển sang GPU, giảm số mặt tối đa, đóng các tab khác, hoặc cắm điện.';
+      results.recommendation = null;
+    }
+    $('dlJson').disabled = false; $('dlCsv').disabled = false;
+    $('perfStatus').textContent = 'Xong.';
+  } catch (e) {
+    $('perfStatus').textContent = 'Lỗi: ' + e.message; log('Lỗi: ' + (e.stack || e.message));
+  } finally { $('runPerf').disabled = false; $('perfBar').hidden = true; }
+}
+
+/* ---------- kiểm thử độ chính xác ---------- */
+const held = { e: false, y: false };
+const changeAt = { e: 0, y: 0 };
+function setHeld(k, v) { if (held[k] !== v) { held[k] = v; changeAt[k] = performance.now(); } $(k === 'e' ? 'holdE' : 'holdY').classList.toggle('on', v); }
+addEventListener('keydown', (ev) => { const k = ev.key.toLowerCase(); if ((k === 'e' || k === 'y') && !ev.repeat) { ev.preventDefault(); setHeld(k, true); } });
+addEventListener('keyup', (ev) => { const k = ev.key.toLowerCase(); if (k === 'e' || k === 'y') setHeld(k, false); });
+for (const [id, k] of [['holdE', 'e'], ['holdY', 'y']]) {
+  const el = $(id);
+  el.addEventListener('pointerdown', (ev) => { ev.preventDefault(); el.setPointerCapture(ev.pointerId); setHeld(k, true); });
+  el.addEventListener('pointerup', () => setHeld(k, false));
+  el.addEventListener('pointercancel', () => setHeld(k, false));
+}
+function score(res, name) { // trả về giá trị blendshape theo tên
+  const bs = res && res.faceBlendshapes && res.faceBlendshapes[0];
+  if (!bs) return null;
+  const c = bs.categories.find((x) => x.categoryName === name);
+  return c ? c.score : null;
+}
+async function runAcc() {
+  $('runAcc').disabled = true;
+  const secs = Math.max(15, Math.min(180, parseInt($('accSecs').value, 10) || 40));
+  const C = { eye: { tp: 0, fp: 0, fn: 0, tn: 0 }, mouth: { tp: 0, fp: 0, fn: 0, tn: 0 } };
+  let used = 0, skipped = 0, noFace = 0;
+  try {
+    $('accStatus').textContent = 'Đang nạp model…';
+    const lm = await getLandmarker();
+    const cam = await openCam(parseInt($('accRes').value, 10));
+    $('accStatus').textContent = 'Đang đo ' + secs + ' giây — giữ E khi nhắm mắt, Y khi há miệng…';
+    const GRACE = 250;
+    await runLoop(lm, secs * 1000, (res, dt, t0) => {
+      const bL = score(res, 'eyeBlinkLeft'), bR = score(res, 'eyeBlinkRight'), jaw = score(res, 'jawOpen');
+      if (bL === null || bR === null || jaw === null) { noFace++; return; }
+      const bl = (bL + bR) / 2;
+      if (t0 - changeAt.e < GRACE || t0 - changeAt.y < GRACE) { skipped++; return; }
+      used++;
+      const upd = (c, truth, pred) => { if (truth && pred) c.tp++; else if (!truth && pred) c.fp++; else if (truth && !pred) c.fn++; else c.tn++; };
+      upd(C.eye, held.e, bl > 0.5);
+      upd(C.mouth, held.y, jaw > 0.5);
+    }, (p) => { $('accStatus').textContent = 'Đang đo… còn ' + Math.ceil(secs * (1 - p)) + ' giây (E: nhắm mắt, Y: há miệng)'; });
+    stopCam(); setHeld('e', false); setHeld('y', false);
+    const tbody = $('accTable').querySelector('tbody'); tbody.innerHTML = '';
+    const out = {};
+    for (const [key, label] of [['eye', 'Nhắm mắt'], ['mouth', 'Há miệng / ngáp']]) {
+      const c = C[key], m = confusionMetrics(c);
+      out[key] = { ...c, ...m };
+      const pos = c.tp + c.fn;
+      tbody.insertAdjacentHTML('beforeend', '<tr><td>' + label + (pos < 20 ? ' <span class="warn">(ít mẫu dương: ' + pos + ')</span>' : '') + '</td><td>' + c.tp + '</td><td>' + c.fp + '</td><td>' + c.fn + '</td><td>' + c.tn +
+        '</td><td>' + f1(m.accuracy * 100) + '%</td><td>' + f1(m.precision * 100) + '%</td><td>' + f1(m.recall * 100) + '%</td><td>' + f1(m.f1 * 100) + '%</td></tr>');
+    }
+    $('accTable').hidden = false; $('accNote').hidden = false;
+    results.accuracy = { resolution: cam.w + 'x' + cam.h, seconds: secs, framesUsed: used, framesSkippedNearLabelChange: skipped, framesNoFace: noFace, ...out };
+    $('accStatus').textContent = 'Xong: ' + used + ' khung được chấm, ' + skipped + ' khung bỏ qua gần lúc đổi nhãn, ' + noFace + ' khung không thấy mặt.';
+    $('dlJson').disabled = false;
+    log('Độ chính xác: mắt F1 ' + f1(out.eye.f1 * 100) + '%, miệng F1 ' + f1(out.mouth.f1 * 100) + '%.');
+  } catch (e) {
+    $('accStatus').textContent = 'Lỗi: ' + e.message; log('Lỗi: ' + (e.stack || e.message));
+  } finally { $('runAcc').disabled = false; }
+}
+
+/* ---------- xuất ---------- */
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+$('dlJson').onclick = () => {
+  results.meta = { time: new Date().toISOString(), delegate: $('delegate').value, numFaces: parseInt($('nfaces').value, 10), ...sysInfo };
+  download('focuschange_benchmark_' + Date.now() + '.json', JSON.stringify(results, null, 2), 'application/json');
+};
+$('dlCsv').onclick = () => {
+  const head = ['yeu_cau_px', 'thuc_te', 'camera_fps', 'xu_ly_fps', 'tre_p50_ms', 'tre_p95_ms', 'tre_max_ms', 'ty_le_thay_mat', 'rung_pct_2mat', 'so_khung', 'danh_gia', 'camera'];
+  const rows = results.performance.map((r) => [r.requested, r.actual, f1(r.camFps, 2), f1(r.procFps, 2), f1(r.p50, 2), f1(r.p95, 2), f1(r.max, 2),
+    f1(r.detRate, 3), f1(r.jitter, 3), r.frames, r.verdict, '"' + String(r.camera).replace(/"/g, '""') + '"'].join(','));
+  download('focuschange_hieunang_' + Date.now() + '.csv', '\ufeff' + head.join(',') + '\n' + rows.join('\n'), 'text/csv;charset=utf-8');
+};
+$('runPerf').onclick = runPerf;
+$('runAcc').onclick = runAcc;
+</script>
+</body>
+</html>
